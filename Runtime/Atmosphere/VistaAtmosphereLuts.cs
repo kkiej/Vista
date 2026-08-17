@@ -565,20 +565,35 @@ namespace Vista
         /// <paramref name="mode"/> 必须是 <see cref="PrepareSkyReflection"/> 返回的那个值 ——
         /// 传原始请求值会在 SH 不可用时去读一个未绑定的 buffer。
         /// </summary>
-        /// <param name="bindsOnly">
-        /// 仅供 Editor 耗时诊断：照常推参数与绑 UAV，但**不** dispatch。
-        /// 用来把这个 pass 的开销切成「CPU 侧命令」与「GPU 侧积分」两半 ——
-        /// 实测这个 pass 是整条稳态链路的 83%，而 0.4M 次 LUT 取样按 3060 的取样率
-        /// 只该是几十微秒，两者差一个数量级，所以必须能分开量而不是靠推断。
+        /// <param name="mipMask">
+        /// 仅供 Editor 耗时诊断：第 m 位为 0 时**跳过该 mip 的 dispatch**，但参数与 UAV
+        /// 照常绑。默认 <c>~0</c>（全派），生产路径永远不传这个参数。
         ///
-        /// 用默认参数而不是复制一份"只绑不派"的方法：那两份的绑定序列必须永远一致，
+        /// 绑定刻意留在掩码**外面**，这是这个旋钮能用来做归因的前提：无论掩码是什么，
+        /// CPU 侧发出的命令数完全相同（7 次 SetGlobalVector + 7 次 SetTextureMip），
+        /// 于是两次测量相减得到的是纯 GPU 差值，不掺命令提交的抖动。
+        /// 顺带把原来那个 <c>bindsOnly</c> 收成了本掩码的 <c>0</c> 这一个取值 ——
+        /// 两个正交开关退化成一个，少一处组合状态要维护。
+        ///
+        /// 为什么需要它：实测这个 pass 占稳态链路的 79%（0.391 ms），而
+        /// <c>mipMask: 0</c> 量到 0.000 ms —— 也就是说开销 100% 在 GPU 积分侧。
+        /// 我原先猜是 CPU 侧命令重放（7 次 SetTextureMip 意味着逐 mip 建 UAV view），
+        /// 这个诊断把那个假设否掉了。剩下的问题是「哪几级 mip 吃掉了这 0.391 ms」，
+        /// 而按 dispatch 形状推是不够的：粗 mip 的线程组数掉到 1（只占 28 个 SM 里的 6 个）
+        /// 且 K 涨到 256 次**串行相关**的 LUT 取样，两个方向的效应叠在一起，
+        /// 谁主导只能量。位掩码而不是单个 mip 序号，是因为归因需要两种口径 ——
+        /// 单级隔离（<c>1 &lt;&lt; m</c>）与前缀累积（<c>(1 &lt;&lt; m+1) - 1</c>）——
+        /// 前者干净但每次重复都打同一级，后者每次重复是真实的混合序列且
+        /// 满掩码那一档必须回到 0.391 ms（一条自洽校验）。一个掩码把两种都表达了。
+        ///
+        /// 用默认参数而不是复制一份诊断专用的方法：那两份的绑定序列必须永远一致，
         /// 而复制体一旦漏跟一次改动，诊断给出的分解就是错的 ——
         /// 且错的方向是"CPU 侧看起来更便宜"，恰好会把结论带反。
-        /// 这个 bool 是编译期常量传入，热路径上会被折掉。
+        /// 掩码是编译期常量传入，热路径上这个 <c>&amp;</c> 会被折掉。
         /// </param>
         public void RenderSkyReflection<T>(
             T d, in VistaAtmosphereViewData view, VistaSkyReflectionMode mode,
-            bool bindsOnly = false)
+            int mipMask = ~0)
             where T : struct, IVistaLutDispatcher
         {
             if (!isSkyReflectionValid || m_SkyReflection == null || m_SkyReflectionArray == null) return;
@@ -621,8 +636,10 @@ namespace Vista
                     VistaShaderIDs._VistaSkyReflectionRW, VistaLutSlot.SkyReflectionArray, mip);
 
                 // z = 6 面。最粗的三级（4²/2²/1²）线程组数都是 1，大量线程被核内的
-                // size 判据挡掉 —— 那三级总共 6×21 个纹素，不值得换 dispatch 形状。
-                if (!bindsOnly)
+                // size 判据挡掉 —— 那三级总共 6×21 个纹素。这句注释原本接着写
+                // "不值得换 dispatch 形状"，现在把那个论断降级为待验证的假设：
+                // 它是**猜**的，而 #10 的归因就是去量它。
+                if ((mipMask & (1 << mip)) != 0)
                     d.Dispatch(m_ReflectionCS, m_KernelSkyReflectionIdx,
                         VistaComputeUtils.DivRoundUp(size, 8),
                         VistaComputeUtils.DivRoundUp(size, 8), 6);

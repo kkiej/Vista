@@ -285,7 +285,7 @@ namespace Vista.Editor
                 Row(sb, "AP",              tAp,    null);
 
                 // ---- 反射 pass 的 CPU/GPU 拆分 ----
-                // 为什么单独给这一项做拆分：它占稳态链路 83%，而它的 GPU 工作量是
+                // 为什么单独给这一项做拆分：它占稳态链路 79%，而它的 GPU 工作量是
                 // 已知的 —— 401k 次 LUT 双线性取样（mip0 24.6k + mip1~6 376k，
                 // 见 SkyReflection.compute 头注）。3060 的取样率是每秒几百亿次量级，
                 // 这点工作只该值几十微秒，与实测差一个数量级。
@@ -295,12 +295,13 @@ namespace Vista.Editor
                 // 而其余每个 pass 只有 3 条上下 —— 其中 SetTextureMip 指定 mip 级别，
                 // 在 D3D11 上意味着要拿到该 mip 的 UAV view。
                 //
-                // 所以量一遍"只绑不派"：它与完整版的差就是 GPU 积分的部分。
-                // 注意这个模型对这一项是**公平**的：一次 rep 就是真实一帧的命令数
-                // （都是 7 次绑定），N 次重复只用来摊掉提交+同步，不会放大逐帧命令成本。
+                // 所以量一遍"一个 mip 都不派"（mipMask: 0，绑定照发）：它与完整版的差
+                // 就是 GPU 积分的部分。注意这个模型对这一项是**公平**的：一次 rep 就是
+                // 真实一帧的命令数（都是 7 次绑定），N 次重复只用来摊掉提交+同步，
+                // 不会放大逐帧命令成本。
                 var tReflBinds = reflOk
                     ? Per(syncMode, baseline,
-                          cmd => luts.RenderSkyReflection(D(cmd, luts), view, mode, bindsOnly: true))
+                          cmd => luts.RenderSkyReflection(D(cmd, luts), view, mode, mipMask: 0))
                     : Sample.Invalid;
                 if (reflOk && tReflBinds.valid && tRefl.valid)
                 {
@@ -314,6 +315,9 @@ namespace Vista.Editor
                             + "单条约 ").Append((tReflBinds.min / 14.0 * 1000.0).ToString("F1"))
                       .AppendLine(" µs（按 14 条绑定算）");
                 }
+
+                if (reflOk && tRefl.valid)
+                    ReportMipAttribution(sb, syncMode, baseline, luts, view, mode, tRefl);
 
                 // ---- 稳态五 pass 整链 ----
                 // 直接测五个串起来，而不是把五个单测加起来：加法会把单测里吃到的
@@ -497,8 +501,166 @@ namespace Vista.Editor
         }
 
         /// <summary>
-        /// 把 <paramref name="record"/> 录 <paramref name="reps"/> 遍进**同一条**
-        /// CommandBuffer，提交一次、同步一次，返回墙钟毫秒。
+        /// 反射 pass 的逐 mip 归因。回答的问题是「0.391 ms 花在哪几级上」，
+        /// 而这个问题不能靠推 dispatch 形状回答：粗 mip 上有两个方向相反的效应叠着 ——
+        /// 线程组数掉到 1（3060 有 28 个 SM，只占得住 6 个）、且 4²/2²/1² 三级分别
+        /// 浪费 75%/94%/98% 的 lane，但同时 K 涨到 256 次**串行相关**的 LUT 取样，
+        /// 每次取样的地址依赖上一次的结果，延迟藏不住。占比只能量。
+        ///
+        /// 两种口径都测，因为两者的差本身携带信息：
+        ///   isolated（<c>1&lt;&lt;m</c>）  只派该级，干净，但 N 次重复都打同一级；
+        ///   prefix  （<c>(1&lt;&lt;m+1)−1</c>）派 0..m 级，每次重复是真实的混合序列。
+        /// prefix 的差分 <c>pre[m] − pre[m−1]</c> 与 isolated[m] 若一致，说明相邻级之间
+        /// 没有可观的重叠（各自都能把 GPU 填满或各自都填不满）；若 isolated 明显更大，
+        /// 说明混排时相邻 dispatch 被重叠掉了 —— 而这正好决定「重排 dispatch」值不值得：
+        /// 若粗 mip 已经在与前一级重叠，把它们合并成一趟就赚不到多少。
+        /// 另外 prefix 的满掩码那一档必须回到 tRefl，这是一条自洽校验。
+        /// </summary>
+        static void ReportMipAttribution(StringBuilder sb, SyncMode syncMode, Sample baseline,
+                                         VistaAtmosphereLuts luts, in VistaAtmosphereViewData view,
+                                         VistaSkyReflectionMode mode, Sample tRefl)
+        {
+            const int mips = VistaAtmosphereLuts.k_SkyReflectionMipCount;
+            var iso = new Sample[mips];
+            var pre = new Sample[mips];
+
+            // in 参数不能被 lambda 捕获，先拷一份到局部。
+            var v = view;
+            for (int m = 0; m < mips; ++m)
+            {
+                int isoMask = 1 << m;
+                int preMask = (1 << (m + 1)) - 1;
+                iso[m] = Per(syncMode, baseline,
+                             cmd => luts.RenderSkyReflection(D(cmd, luts), v, mode, isoMask));
+                pre[m] = Per(syncMode, baseline,
+                             cmd => luts.RenderSkyReflection(D(cmd, luts), v, mode, preMask));
+            }
+
+            sb.AppendLine("　 逐 mip 归因　iso=只派该级　Δpre=前缀差分　占比按 iso");
+            double sumIso = 0.0;
+            for (int m = 0; m < mips; ++m) sumIso += iso[m].Or0();
+
+            long totalSamples = 0;
+            double coarseMs = 0.0;   // mip3..6：线程组数已经掉到 1 的那几级
+            long coarseTexels = 0;   // 同上几级产出的纹素数
+            long allTexels = 0;
+            for (int m = 0; m < mips; ++m)
+            {
+                int size = VistaAtmosphereLuts.k_SkyReflectionSize >> m;
+                int gridXY = (size + 7) / 8;
+                int groups = gridXY * gridXY * 6;
+                long texels = 6L * size * size;
+                int k = NominalSampleCount(m, mode);
+                long samples = texels * k;
+                totalSamples += samples;
+                allTexels += texels;
+                // 不写死 126/8190：mip 数或 64² 一改，字面量就静默变错，
+                // 而"占 1.5% 纹素却吃 86% 时间"正是整个归因的论点所在。
+                if (m >= 3) { coarseMs += iso[m].Or0(); coarseTexels += texels; }
+
+                double dPre = m == 0 ? pre[0].Or0() : pre[m].Or0() - pre[m - 1].Or0();
+                double share = sumIso > 1e-6 ? iso[m].Or0() / sumIso : 0.0;
+                // 达成的取样吞吐。这一列是判据的核心：若某级的 G样本/s 比 mip0 低一两个
+                // 数量级，那一级就是被占用率/延迟卡住的，不是被取样总量卡住的。
+                // 注意别据此推出"于是该重排而不该限 K"：延迟受限时耗时 ≈ K × 单次暴露延迟，
+                // 限 K 同样能压下去（少要隐藏的延迟），重排是另一条（多点并行来隐藏）。
+                // 这一列只判**病因**，不判**药方**。
+                double gps = iso[m].min > 1e-4 ? samples / iso[m].min / 1e6 : 0.0;
+
+                sb.Append("　　 mip").Append(m)
+                  .Append("  ").Append((size + "²").PadRight(5))
+                  .Append("组 ").Append(groups.ToString().PadLeft(3))
+                  .Append("  纹素 ").Append(texels.ToString().PadLeft(5))
+                  .Append("  K=").Append(k.ToString().PadLeft(3))
+                  .Append("  取样 ").Append((samples / 1000.0).ToString("F1").PadLeft(6)).Append('k')
+                  .Append("　iso ").Append(iso[m].Or0().ToString("F3"))
+                  .Append("  Δpre ").Append(dPre.ToString("+0.000;-0.000"))
+                  .Append("　占 ").Append(share.ToString("P0").PadLeft(4))
+                  .Append("　").Append(gps.ToString("F2")).Append(" G样本/s");
+                if (iso[m].valid && iso[m].spread > 0.25)
+                    sb.Append("　⚠±").Append(iso[m].spread.ToString("P0"));
+                sb.AppendLine();
+            }
+
+            // ---- 自洽校验：满掩码的 prefix 必须回到独立测的 tRefl ----
+            // 这一条不测被测对象，测的是掩码这条路本身有没有改变被测的工作量。
+            // 它一红就说明掩码实现有问题（比如把绑定也跳掉了），此时上面整张表都不能用。
+            double full = pre[mips - 1].Or0();
+            bool closes = tRefl.min > 1e-3 && full > 1e-3
+                          && Mathf.Abs((float)((full - tRefl.min) / tRefl.min)) < 0.15f;
+            sb.Append("　　 自洽：满掩码 prefix ").Append(full.ToString("F3"))
+              .Append(" ms vs 独立测 ").Append(tRefl.min.ToString("F3")).Append(" ms　")
+              .Append(closes ? "一致 OK" : "**不一致，上表不可用**").AppendLine();
+            sb.Append("　　 单级之和 ").Append(sumIso.ToString("F3"))
+              .Append(" ms　差 ").Append((full - sumIso).ToString("+0.000;-0.000"))
+              .AppendLine(" ms（正=混排时并未重叠；负=单测各自吃到了重叠）");
+
+            // ---- 结论：让数据自己回答，不复述预设的二分 ----
+            // 第一版这里印的是"mip3~6 与 mip1 谁大决定修法：前者→重排、后者→限 K"。
+            // 那是个**假二分**：实测粗 mip 的耗时正比于 K（见下面 K 比例那一行），
+            // 所以限 K 同样作用在粗 mip 上 —— 两条修法治的是同一批 mip，
+            // 差别在机理（一个减少要隐藏的延迟量，一个增加隐藏延迟的并行度），
+            // 不在作用对象。把预设的分类印成结论，就是让工具替我确认偏见。
+            double coarseShare = sumIso > 1e-6 ? coarseMs / sumIso : 0.0;
+            sb.Append("　　 mip3~6（组数=1 的那几级）合计 ").Append(coarseMs.ToString("F3"))
+              .Append(" ms，占 ").Append(coarseShare.ToString("P0"))
+              .Append("，而它们只产出 ").Append(coarseTexels).Append('/').Append(allTexels)
+              .Append(" 个纹素（").Append((coarseTexels / (double)allTexels).ToString("P1")).Append("）")
+              .AppendLine();
+
+            // 证据一：组数相同（都是 6）时耗时随 K 走。mip3 与 mip4 的组数、
+            // dispatch 形状完全一致，唯一差别是 K 翻倍 —— 若耗时也接近翻倍，
+            // 说明这几级是被**取样循环的延迟**卡住，而不是被取样总量或调度卡住。
+            if (iso[3].Or0() > 1e-4)
+            {
+                double kRatio = iso[4].Or0() / iso[3].Or0();
+                sb.Append("　　 证据 1｜组数同为 6，K 从 128→256：耗时 ")
+                  .Append(iso[3].Or0().ToString("F3")).Append("→").Append(iso[4].Or0().ToString("F3"))
+                  .Append(" ms，比 ").Append(kRatio.ToString("F2"))
+                  .AppendLine("（≈2 则耗时正比于 K）");
+            }
+            // 证据二：反过来，工作量降 16 倍而耗时几乎不动 —— 说明纹素数不是自变量。
+            if (iso[6].Or0() > 1e-4)
+            {
+                sb.Append("　　 证据 2｜K 同为 256，纹素 96→6（16×）：耗时 ")
+                  .Append(iso[4].Or0().ToString("F3")).Append("→").Append(iso[6].Or0().ToString("F3"))
+                  .Append(" ms，仅快 ").Append((iso[4].Or0() / iso[6].Or0()).ToString("F2"))
+                  .AppendLine(" 倍（纹素数几乎不是自变量）");
+                sb.Append("　　 　 每次循环迭代暴露 ")
+                  .Append((iso[6].Or0() / 256.0 * 1e6).ToString("F0"))
+                  .AppendLine(" ns —— 一次纹理取样的延迟，完全没被隐藏。");
+            }
+            // 证据三：per-dispatch 固定开销的上界。mip0 占满 384 组、K=1，
+            // 它的耗时就是"一趟 dispatch + 一点工作"的量级 —— 若它很小，
+            // 就排除了"7 趟 dispatch 本身的固定开销"这个解释，
+            // 于是修法应当指向占用率，而不是指向合并 dispatch。
+            sb.Append("　　 证据 3｜mip0（384 组、K=1）").Append(iso[0].Or0().ToString("F3"))
+              .Append(" ms → 单趟 dispatch 的固定开销 ≤ ")
+              .Append((iso[0].Or0() * 1000.0).ToString("F0"))
+              .AppendLine(" µs，7 趟合计也只是零头，固定开销不是主因。");
+
+            sb.Append("　　 全 pass 标称取样 ").Append((totalSamples / 1000.0).ToString("F0"))
+              .Append("k，按 iso 之和折算 ")
+              .Append((sumIso > 1e-6 ? totalSamples / sumIso / 1e6 : 0.0).ToString("F2"))
+              .AppendLine(" G样本/s（3060 的纹理取样率在数百 G样本/s 量级，差两个数量级）");
+        }
+
+        /// <summary>
+        /// 镜像 <c>VistaSkyReflectionSampleCount</c>（SkyReflection.hlsl:94-100）的取样数。
+        ///
+        /// 这是一份**报告专用**的副本，故意不去做"唯一真源"：它只用来给上面那张表算
+        /// 取样量与吞吐，不参与任何判定。所以两边哪天走歧，后果是吞吐那一列的分子错了，
+        /// 而不是某条断言给出错误的通过 —— 前者一眼能看出（G样本/s 会突变），
+        /// 后者才是不可接受的。要做真源同步就得让核把它写进一个 buffer 再读回，
+        /// 而为一列诊断数字加一趟 dispatch 不划算。
+        /// </summary>
+        static int NominalSampleCount(int mip, VistaSkyReflectionMode mode)
+        {
+            if (mip == 0) return 1;
+            if (mode == VistaSkyReflectionMode.AmbientSh) return 16;
+            return Mathf.Min(256, 16 << mip);
+        }
+
         ///
         /// 一条 buffer 录 N 遍而不是 N 次提交+同步：后者量到的几乎全是提交与同步的
         /// 往返延迟（每次百微秒到毫秒量级），被测的 dispatch 反而淹没在里面。
