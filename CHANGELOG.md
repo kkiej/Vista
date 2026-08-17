@@ -109,6 +109,46 @@
     Demo 场景实测：`Custom`、`c_0 = (5120, 5551, 6458)`、
     上 (1444, 2721, 5400) / 下 (8163, 7383, 6234) / 水平 (5153, 5626, 6513)。
 
+- **天空镜面反射 cubemap（#5b）**：64²、7 级 mip 的 Cube RenderTexture，
+  挂到 `RenderSettings.customReflectionTexture`，于是 URP 的
+  `GlossyEnvironmentReflection` 把它当 `unity_SpecCube0` 采 —— **不改任何材质 shader**。
+  这是选"产出一张真 cubemap"而不是"塞一个自定义全局 + 改 shader"的全部理由。
+  - `SkyReflection.compute` 的 `SkyReflectionFilter`：**每级 mip 直接从 SkyView LUT
+    做 GGX 预积分**（Karis 2013 的 `PrefilterEnvMap` 累加，N = V = R，权重 NdotL）。
+    七级各一趟 dispatch，级间零依赖。
+  - 移动端同一个核，辐射来源换成 #5a 的那份 SH（`VISTA_SKY_REFLECTION_SRC_SH`），
+    采样数降到 16。**仍然产出一张真 cubemap**，所以 `unity_SpecCube0` 这条路
+    在两个平台上完全一致 —— 消费端不需要知道自己采的是哪一条路径来的图。
+  - `mip → 感知粗糙度` 用 URP `PerceptualRoughnessToMipmapLevel` 的**解析反函数**
+    `pr = (1.7 − sqrt(2.89 − 2.8·m/6)) / 1.4`，不是线性映射。
+    实测七级：0 / 0.1024 / 0.2151 / **0.3424** / 0.4917 / 0.6814 / 1.0 ——
+    mip3 是 0.342 而不是朴素线性的 0.5。
+  - Editor 自检 `Window/Vista/Validate Sky Reflection`，三条判据全在 GPU 上算
+    （C# 侧刻意不重算任何一条：重算就得再抄一遍 mip 映射与面方向约定，
+    抄错的那一份与 shader 那份走歧时，报出来的偏差既不是 0 也不是明显错误）。
+    Demo 场景实测：
+
+      | | 正午 60° | 日落 3° |
+      | --- | --- | --- |
+      | ① 逐面 mip0 vs LUT（六面最大） | **0.00%** | **0.04%** |
+      | ① 参与比较的取样点 | 64/面，空面 0/6 | 64/面，空面 0/6 |
+      | ② cube 整球均值 | (5709.6, 6172.4, 7155.4) | (723.7, 602.5, 615.9) |
+      | ② LUT 同方向均值 | (5711.6, 6175.8, 7161.0) | (756.4, 611.0, 617.2) |
+      | ② SH 的 `L_00·Y00` | (5711.6, 6175.8, 7161.0) | (756.4, 611.0, 617.2) |
+      | ② cube 离散化偏差 | **0.078%**（阈 0.5%） | **4.315%**（阈 6%） |
+      | ② 跨模块偏差（LUT vs SH） | **1.36e-7** | **1.61e-7** |
+      | ③ mip round-trip 最大 | 3.58e-7 | — |
+      | ③ HLSL 常量 SIZE/MIPS/LOD_STEPS | 64 / 7 / 6 | — |
+
+    判据 ② 的第三列与 #5a 的 `c_0` 逐位一致（正午 (5711.6, 6175.8, 7161.0)），
+    这不是巧合而是设计：两边用**同一个** 1024 点 Fibonacci 方向集
+    （`VISTA_SKY_SH_SAMPLES` == `VISTA_SKY_REFL_VERIFY_MEAN_SAMPLES`），
+    所以均值恒等式在有限样本下也精确成立 —— 1.36e-7 的偏差只来自两边归约顺序不同。
+  - Editor 诊断 `Window/Vista/Log Sky Reflection State`：报运行期链路的实际状态。
+    Demo 场景实测 `defaultReflectionMode = Custom`、
+    `VistaSkyReflectionCube_64x64_Mips_R16G16B16A16_SFloat_Cube`、64²、7 级 mip、
+    `filter = Trilinear`、**`unity_SpecCube0_HDR = (1, 1, 0, 0)`**、`isDirty = False`。
+
 ### 取舍
 
 - **单位用 km 而不是 m**。地球半径 6360 km 写成 6.36e6 后，froxel raymarch 里的 `r*r`
@@ -254,6 +294,58 @@
   微小偏色。用不着为它加采样。这个数留在自检里打印，Task #7 分级时直接读。
   当前整趟只 dispatch 一个线程组（64 线程 × 16 次采样），加到 4096 就是 64 次 ——
   单 SM 上的纹理延迟会真实体现在耗时里，而收益是看不见的 0.04 EV。
+
+- **反射走 cubemap 而不是直接用 #5a 的那份 SH**。依据是 #5a 自检里那个 31.25% ——
+  L2 在朝下法线上的截断误差。这个量级在**漫反射**上过完 tonemap 可以接受
+  （地面反弹本来就是低频的），在**镜面**上就是把日落地平线那圈橙红糊成一团均匀的橙，
+  而反射恰恰是观众唯一能逐像素对照"这个方向的天空到底什么颜色"的地方。
+  移动端也还是 cubemap（只是内容由 SH 重建），理由见下一条。
+- **反射不做「渐进预滤波」（读 mip N−1 写 mip N），每级都直接从 SkyView LUT 积分。**
+  渐进预滤波是这件事的标准做法（HDRP 的 `IBLFilterGGX`、Karis 2013 的实现都是），
+  但它要求同一张资源在同一趟里既当 SRV 又当 UAV，而 RenderGraph 跟踪的是**整张资源**
+  的状态 —— 与三张静态大气表必须拆 pass 是同一类 UB（见「坑」）。绕开只有三条路：
+  ① 源 mip 也按 UAV 读（丢掉硬件双线性与跨面无缝滤波，cube 接缝处出硬边）；
+  ② 两张纹理 ping-pong（HDRP 的形态，正确但显存翻倍且要在图里 `GenerateMips`）；
+  ③ 拆 7 个 pass 串行（正确，但每个 pass 只有几百纹素的工作量，全是调度开销）。
+  直接从 LUT 积分把这一整类问题消掉：全程纯写、只有 UAV 一个状态、零 barrier、
+  七趟 dispatch 挤在一个 pass 里。而且**质量严格更好** —— 没有 box filter 的近似、
+  没有跨级累积误差、mip0 是精确镜面，接缝在结构上不可能出现（每个纹素积的都是
+  真实世界方向）。
+  能这么做的前提是开销够低：需要滤波的纹素只有 mip1~6 共
+  `6 × (1024+256+64+16+4+1) = 8190` 个，配上随 mip 上升的采样数总计约 376k 次
+  LUT 双线性**取样**（不是 raymarch），加上 mip0 的 24.6k 次约 0.4M。
+  （这个估算是纠正过一次的：第一版把 mip0 也算进滤波、还用了一个平的采样数，
+  得出 2.1M，据此差点选了渐进预滤波 —— 改对之后架构结论就翻了。）
+- **不做逐帧摊销（HDRP 会把面/mip 分帧）。** HDRP 摊销是因为它在 256² 上滤波、
+  且走 42 趟光栅 pass；那个约束不迁移过来 —— 这里 mip0 只有 24576 个纹素，
+  全部七级一趟做完。摊销这件事留给 Task #7 当分级旋钮（与采样数、辐射来源一起）。
+- **cubemap 尺寸 64² 是被 URP 定死的，不是拍的。** `ImageBasedLighting.hlsl:16` 的
+  `UNITY_SPECCUBE_LOD_STEPS = 6`，而 URP 的 `GlobalIllumination.hlsl` 用的是
+  **单参**重载 `PerceptualRoughnessToMipmapLevel(pr)` —— 也就是它假设 maxMip 恰好是 6，
+  即 mip 0..6 共 7 级，即边长 `1 << 6 = 64`。所以这两个常量都从
+  `UNITY_SPECCUBE_LOD_STEPS` 推导（`SkyReflection.hlsl:41-42`），
+  而不是各写一个字面量：URP 哪天改了那个 6，我们跟着变，而不是安静地错位一档。
+  自检判据 ③ 把 HLSL 侧的实际取值报回 C# 比对，所以"两边不一致"是一条会红的断言。
+- **判据 ② 的阈值按太阳高度分两档（正午 0.5% / 日落 6%），不是统一放宽到 6%。**
+  实测日落 4.315%、正午 0.078%，差了 55 倍，而这个差是**物理**：
+  cube 三通道分别偏暗 4.3% / 1.4% / 0.2% 且一律偏暗 —— 线性插值在凸的亮带上
+  系统性下冲的签名。日落地平线那圈橙红是全天角频率最高的结构（64² 下每纹素约 1.4°），
+  几乎全在红通道；蓝通道在日落时整片天空近乎平坦，所以几乎不错。
+  统一取 6% 的代价是正午档从"回归探测器"退化成"形式上绿着"：真出现 1% 级别的整体
+  缩放错（比如曝光被乘了两次），只有正午那一档能抓住它，日落档会被离散化误差淹掉。
+  这与 #5a 日落档取 `PositiveInfinity` 的做法**故意不同** —— 那边的截断误差在特定
+  法线上无界，给不出有意义的上限；这边的离散化误差是有界的，留一个真阈值它才还是断言。
+  另外这 4.3% 只影响 mip0：任何有粗糙度的表面读 mip≥1，那里 GGX lobe 的张角远大于
+  1.4°，离散化被滤波宽度盖掉了。
+- **太阳圆盘不进反射图。** 两个理由，任一个单独就够：① URP 的平行光已经给了解析
+  GGX 高光，圆盘再进反射就是重复计一次；② 圆盘亮度在 1e9 量级而 fp16 上限 65504，
+  进来直接饱和成 Inf，而 Inf 会经预滤波的归一化污染整片纹素（不是一个点，是一片）。
+- **GGX 预积分用各向同性近似（N = V = R），不做"更物理"的 NdotV 相关 lobe。**
+  真实 GGX lobe 掠射时会拉长成各向异性，但采样端（URP 的
+  `GlossyEnvironmentReflection`）用的是不带 NdotR 的单参重载 —— 也就是说
+  **它本来就假设这张图是各向同性预滤波的**。跟着采样端的假设走，
+  而不是把写入端做得更物理然后与它错开；后者的症状是掠射角反射整体偏暗，
+  而且查起来会怀疑到积分本身。
 
 ### 坑
 
@@ -404,9 +496,80 @@
   场景连续渲染后 `isDirty` 仍为 `False`）。所以不需要给导出加"仅在值变化时写"的门控。
   这条是写之前担心过、实测证伪的 —— 记下来免得以后又去加没用的门控。
 
+- **Unity 不允许把 Cube RT 绑到 compute 的 `RWTexture2DArray`。** 报错：
+  `Property (_VistaSkyReflectionRW) at kernel index (0) has mismatching output texture
+  dimension (expected 5, got 4)`（5 = Tex2DArray = HLSL 声明，4 = Cube = 绑上来的 RT）。
+  硬件层面 cube 的 UAV view **就是** 2D array view，所以这纯粹是引擎侧的校验，
+  不是能力限制。落地方案：compute 写一张 6 层 × 7 级 mip 的 `Tex2DArray` 中转纹理，
+  dispatch 完逐面 `CopyTexture` 搬进 cube，代价 6×64²×7级 fp16 ≈ **0.4 MB**。
+  另一条路是照 HDRP `IBLFilterGGX` 改成光栅（`SetRenderAttachment` 带
+  `mipLevel`/`depthSlice`），那要重写 GGX 积分核；中转纹理让 GGX 积分、
+  mip↔粗糙度反函数、逐面方向约定这三处最贵最容易错的东西一个字都不用动。
+  顺带**加强**了自检：判据 ① 现在同时验证 `element → CubemapFace` 的映射，
+  搬错面的症状是那一面单独炸红，而不是"六面都对但整体转了 90°"这种要看图才发现的错。
+  - 先前我写下过一条"core / URP 里没有 compute 写 cubemap 的先例"，
+    当时被自己纠正为"分配有先例、绑定没有" —— 这次的报错正好证实了那个拆分：
+    `Runtime/PathTracing/Environment/CubemapRender.cs:152-160` 确实
+    `dimension = Cube` + `enableRandomWrite = true`，但它自己是用
+    `SetRenderTarget(new RenderTargetIdentifier(tex, 0, (CubemapFace)i))` 逐面**光栅**写的，
+    从没把它当 compute UAV 绑过。**`enableRandomWrite` 分配得下来 ≠ 绑得上去。**
+- **`CopyTexture` 只存在于 `IUnsafeCommandBuffer`**（`IUnsafeCommandBuffer.cs:430-464`），
+  `ComputeCommandBuffer` / `RasterCommandBuffer` 上都没有。所以 RenderGraph 侧的
+  拷贝必须是 `AddUnsafePass` + `CommandBufferHelpers.GetNativeCommandBuffer(ctx.cmd)`。
+  这与 `RequestAsyncReadback`、`SetGlobalBuffer` 是同一类不对称 —— 判断一个 API
+  在 RenderGraph 里能不能用，看的是它挂在哪个 command buffer 接口上，不是它在
+  原生 `CommandBuffer` 上存不存在。
+  - 要用的重载是 `CopyTexture(src, srcElement, dst, dstElement)`（:440），
+    它一次搬一个 element 的**全部 mip** —— 所以是 **6 次调用，不是 42 次**。
+  - 立即模式（Editor 自检 / 预览）不需要拆：原生 `CommandBuffer` 的状态转换由图形层
+    自动插，dispatch 与 copy 录在同一条 cmd 里是安全的。所以一个
+    `CopySkyReflectionToCube(CommandBuffer)` 同时服务两条路径。
+- **`RTHandles.Alloc` 的 `slices` 对 Cube 必须是 1，对 Tex2DArray 才是层数。**
+  `RTHandleSystem.cs:881` 把 `slices` 直接转成 `RenderTextureDescriptor.volumeDepth`；
+  cube 的六面来自 `dimension`，再给 `slices: 6` 就是要一个 6×6 面的东西。
+  这次一张 cube（`slices: 1`）+ 一张 array（`slices: 6`）并排放着，正好是对照。
+- **FXC：`GroupMemoryBarrierWithGroupSync` 不能位于任何线程相关 `return` 的下游 ——
+  即使那个条件事实上是组内常量。** 自检核最自然的写法是
+  `if (group == MEAN_GROUP) { ...; return; }` 三段并列，FXC 直接拒绝：
+  `thread sync operation must be in non-varying flow control`。`SV_GroupID` 在组内明明
+  是常量，但 FXC 的判据是**语法上**的。而且这不算保守过度：DXIL 层面 barrier 要求
+  整组到齐，提前退出的线程永远到不了。
+  修法是三段判据顺序排开、barrier 一律留在顶层无条件流里，让八个组全部走完全部
+  barrier —— 出结果的组由 `if (group == ...) && tid == 0u` 决定**写不写**，
+  而不是决定**走不走**。代价是每组多跑两趟归约，自检核不值一提。
+  （备选是拆三个 kernel，但那样 C# 侧要维护三次 dispatch 与三套绑定，
+  而这三条判据是互相印证的，拆开反而弱化了它。）
+- **`#pragma only_renderers` 没有 `d3d12` 这个 token。** D3D12 走的就是 `d3d11` 的
+  编译目标，写上只换来一条 `Unrecognized renderer` 警告。三个文件都清掉了
+  （`SkyReflection.compute`、`AtmosphereLut.compute:23`、`VistaSky.shader:40`）。
+- **自检输出缓冲的「行基址」不要用组号做算术。** 第一版写的是 `MEAN_GROUP + i` /
+  `MIP_GROUP + 3 + m`，看着简洁，实际在第 9 行留了个洞，而 C# 侧按"紧凑排列"去读
+  就整段错位。**行基址与组号是两件不同的事，别复用同一个数** ——
+  现在 HLSL 与 C# 两侧各有一份显式的 `ROW_*` / `k_ReflVerifyRow*` 常量。
+- **`unity_SpecCube0_HDR` 的残余风险已实测排除：`(1, 1, 0, 0)`**，
+  也就是 `DecodeHDREnvironment` 是恒等 —— float Cube RenderTexture 经
+  `customReflectionTexture` 挂上去时引擎不会塞一个解码系数。
+  这条原本列为"待 Task #6 用一个 roughness-0 的球对着背后天空验"的开放风险
+  （症状是"反射整体亮度差一个常数倍"），现在由 `Log Sky Reflection State` 直接读出
+  全局量解决了 —— 比看图判断可靠，也省掉了 Task #6 的一项。
+- **`filterMode` 给中转纹理留 `Trilinear` 而不是 `Point`。** 它不会被采样，
+  滤波模式在功能上无关紧要；但它是 RenderDoc / Frame Debugger 里排查反射问题的第一站，
+  预览图跟着 cube 的滤波模式走比较不容易看错。
+- **cube 上取掉了 `enableRandomWrite`。** 它现在只是 `CopyTexture` 的目标 + SRV，
+  开着也能跑。取掉是为了不让"这张图是 compute 直接写的"这个**已经被验伪**的假设
+  留在代码里 —— 下一个人（包括三个月后的我）会照它去 debug。
+- **在 `file:` 引用的本地 package 里新建文件，Unity 不会自动发现。**
+  `refresh_unity(mode: if_dirty)` 返回 `refresh_triggered: false` 就过去了，
+  编译看着成功、控制台干净，但新的 `[MenuItem]` 根本没注册（菜单执行报
+  "might be invalid, disabled, or context-dependent"）。要 `mode: force` + `scope: all`。
+  这个失败形态很坑，因为它**看起来像代码写错了**而不是像资产没导入。
+
 ### 待办（Task #6 验收时补）
 
-- LUT 五个 pass 的实测耗时（目标合计 < 0.3 ms）。
+- LUT **七个** pass 的实测耗时（目标合计 < 0.3 ms）。Transmittance / MultiScattering
+  只在参数变化的帧存在，稳态是 SkyView + SH + 反射积分 + 反射拷贝 + AP 五个。
+  反射那两个的估算是 0.4M 次 LUT 取样 ≈ 0.03 ms + 6 次整 element 的 `CopyTexture`，
+  需要实测确认 —— 尤其是拷贝，0.4 MB 的搬运本身不贵，但它多了一个 pass 边界的 barrier。
 - 太阳 0°→90° 扫描的 banding 数值判定。目前只有截图观感：日晕在 8-bit 输出上有极淡的
   等值线，2× 超采样后消失，判断是量化而非 LUT 分辨率不足 —— 但这需要读回数值确认，
   截图（JPEG）不足以定性。
