@@ -565,8 +565,20 @@ namespace Vista
         /// <paramref name="mode"/> 必须是 <see cref="PrepareSkyReflection"/> 返回的那个值 ——
         /// 传原始请求值会在 SH 不可用时去读一个未绑定的 buffer。
         /// </summary>
+        /// <param name="bindsOnly">
+        /// 仅供 Editor 耗时诊断：照常推参数与绑 UAV，但**不** dispatch。
+        /// 用来把这个 pass 的开销切成「CPU 侧命令」与「GPU 侧积分」两半 ——
+        /// 实测这个 pass 是整条稳态链路的 83%，而 0.4M 次 LUT 取样按 3060 的取样率
+        /// 只该是几十微秒，两者差一个数量级，所以必须能分开量而不是靠推断。
+        ///
+        /// 用默认参数而不是复制一份"只绑不派"的方法：那两份的绑定序列必须永远一致，
+        /// 而复制体一旦漏跟一次改动，诊断给出的分解就是错的 ——
+        /// 且错的方向是"CPU 侧看起来更便宜"，恰好会把结论带反。
+        /// 这个 bool 是编译期常量传入，热路径上会被折掉。
+        /// </param>
         public void RenderSkyReflection<T>(
-            T d, in VistaAtmosphereViewData view, VistaSkyReflectionMode mode)
+            T d, in VistaAtmosphereViewData view, VistaSkyReflectionMode mode,
+            bool bindsOnly = false)
             where T : struct, IVistaLutDispatcher
         {
             if (!isSkyReflectionValid || m_SkyReflection == null || m_SkyReflectionArray == null) return;
@@ -610,9 +622,10 @@ namespace Vista
 
                 // z = 6 面。最粗的三级（4²/2²/1²）线程组数都是 1，大量线程被核内的
                 // size 判据挡掉 —— 那三级总共 6×21 个纹素，不值得换 dispatch 形状。
-                d.Dispatch(m_ReflectionCS, m_KernelSkyReflectionIdx,
-                    VistaComputeUtils.DivRoundUp(size, 8),
-                    VistaComputeUtils.DivRoundUp(size, 8), 6);
+                if (!bindsOnly)
+                    d.Dispatch(m_ReflectionCS, m_KernelSkyReflectionIdx,
+                        VistaComputeUtils.DivRoundUp(size, 8),
+                        VistaComputeUtils.DivRoundUp(size, 8), 6);
             }
         }
 
