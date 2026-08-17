@@ -1,0 +1,519 @@
+#ifndef VISTA_ATMOSPHERE_SCATTERING_INCLUDED
+#define VISTA_ATMOSPHERE_SCATTERING_INCLUDED
+
+// ============================================================================
+//  共享 raymarch 积分器。
+//
+//  MS LUT / SkyView LUT / AerialPerspective LUT / 体积雾 全部复用这一个函数，
+//  差异只体现在 VistaRaymarchSettings 上。之所以不为每张表各写一遍：
+//  单次散射的能量计算一旦在某一处写歧了，天空和雾就会对不上（典型症状是
+//  远山的雾色和天空色在地平线交界处有一条缝），而这种 bug 极难定位。
+//
+//  参考：Hillaire, "A Scalable and Production Ready Sky and Atmosphere
+//  Rendering Technique", EGSR 2020。
+// ============================================================================
+
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/GlobalSamplers.hlsl"
+#include "Packages/com.kkiej.vista/ShaderLibrary/AtmosphereDef.hlsl"
+
+TEXTURE2D(_VistaTransmittanceLut);
+TEXTURE2D(_VistaMultiScatteringLut);
+
+// MS LUT 分辨率。这是**算法常量**而不是可调项：多次散射对 (muSun, 高度) 是极平滑的
+// 二维函数，Hillaire 实测 32×32 已经看不出与 128×128 的差别。C# 侧
+// VistaAtmosphereLuts.k_MultiScatteringSize 必须与此一致。
+#define VISTA_MULTISCATTERING_LUT_RES 32.0
+
+// 10 m。用来把采样点从"正好贴在地面上"挪开——r 恰好等于 bottomRadius 时
+// 切线方向的 ray-sphere 判别式在 0 附近抖动，会在地平线出现一圈噪点。
+#define VISTA_PLANET_RADIUS_OFFSET 0.01
+
+// ----------------------------------------------------------------------------
+//  几何：通用 ray-sphere（地面反弹点、太阳方向的地球遮挡都需要非 r/mu 形式）
+// ----------------------------------------------------------------------------
+// rayDir 须归一化。返回最近的非负交点距离，无交点返回 -1。
+float VistaRaySphereIntersectNearest(float3 rayOrigin, float3 rayDir, float3 center, float radius)
+{
+    float3 oc = rayOrigin - center;
+    float b = dot(oc, rayDir);
+    float c = dot(oc, oc) - radius * radius;
+    float discriminant = b * b - c;
+    if (discriminant < 0.0)
+        return -1.0;
+
+    float sqrtDisc = sqrt(discriminant);
+    float t0 = -b - sqrtDisc;
+    float t1 = -b + sqrtDisc;
+    if (t1 < 0.0)
+        return -1.0;
+    return (t0 < 0.0) ? t1 : t0;
+}
+
+// ----------------------------------------------------------------------------
+//  相位函数
+//
+//  cosTheta 的约定：cosTheta = dot(rayDir, sunDir)，即**看向太阳时为 +1**。
+//
+//  推导（这个符号最容易搞反，搞反的症状是光晕出现在太阳的反侧）：
+//  相位函数的 θ 是入射传播方向与散射传播方向的夹角。
+//  光从太阳来 -> 入射传播方向 = -sunDir；光射向眼睛 -> 散射传播方向 = -rayDir。
+//  cosθ = dot(-sunDir, -rayDir) = dot(sunDir, rayDir)。
+//  前向散射（θ=0）即视线与阳光同向，也就是逆光看太阳——此时 Mie 光晕最强。✓
+// ----------------------------------------------------------------------------
+float VistaRayleighPhase(float cosTheta)
+{
+    return (3.0 / (16.0 * PI)) * (1.0 + cosTheta * cosTheta);
+}
+
+float VistaHenyeyGreensteinPhase(float g, float cosTheta)
+{
+    float g2 = g * g;
+    // cosTheta = 1（看向太阳）时 denom 最小 -> 相位最大，即前向散射峰
+    float denom = 1.0 + g2 - 2.0 * g * cosTheta;
+    return (1.0 - g2) / (4.0 * PI * denom * sqrt(max(1e-4, denom)));
+}
+
+#define VISTA_ISOTROPIC_PHASE (1.0 / (4.0 * PI))
+
+// ----------------------------------------------------------------------------
+//  LUT 采样
+// ----------------------------------------------------------------------------
+
+// 到太阳的透射率。muSun = dot(up, sunDir)。
+// 注意：视线朝太阳但太阳在地平线下时，Transmittance LUT 的参数化会给出穿过地心的
+// 无意义结果，必须靠 VistaEarthShadow 归零，不能只靠这张表。
+float3 VistaSampleTransmittanceToSun(float r, float muSun)
+{
+    float2 uv = VistaRMuToTransmittanceLutUv(r, muSun);
+    return SAMPLE_TEXTURE2D_LOD(_VistaTransmittanceLut, sampler_LinearClamp, uv, 0).rgb;
+}
+
+// 采样点 P 是否被星球本体挡住太阳。1 = 见光，0 = 在星球阴影里。
+//
+// 需要偏置的原因：贴地采样点（视线打到地面时的末端采样点就是）到太阳的射线是
+// **切着球面离开**的，无偏置时 c = |P|² - Rb² = 0，判别式给出 t = 0 的退化根，
+// 于是"正午的地面"会被判成全阴影。
+//
+// 偏置方向必须让采样点落在遮挡球**外面**，也就是把球心沿 up 推**远**：
+//   c = (r + offset)² - Rb² > 0，测试退化成物理上正确的"太阳是否在当地地平线以下"。
+// 反过来把球心朝采样点推近（up * offset，UE 的 SkyAtmosphere 是这么写的）会得到
+//   c = (r - offset)² - Rb² < 0 —— 海拔不足 10 m 的采样点一律被判成"在星球内部"，
+// 直射项被整体归零。它在 UE 里不显眼（近处切片本就贡献极小），但在本项目里是实测到的
+// 硬伤：相机贴地时那个 10 m 的台阶正好落在 AP 第一片内部，
+// 被积函数出现阶跃，2 步与 256 步的求积因此相差 24%（见 CHANGELOG 的坑）。
+//
+// 10 m 的容差同时还兜住 fp32：r 在 6360 km 上的 ulp 是 0.49 m，
+// 海拔算出负值也不会误判。
+float VistaEarthShadow(float3 posKm, float3 sunDir)
+{
+    float3 up = normalize(posKm);
+    float t = VistaRaySphereIntersectNearest(
+        posKm, sunDir, -up * VISTA_PLANET_RADIUS_OFFSET, VISTA_BOTTOM_RADIUS);
+    return t >= 0.0 ? 0.0 : 1.0;
+}
+
+float2 VistaMultiScatteringLutUv(float r, float muSun)
+{
+    float thickness = VISTA_TOP_RADIUS - VISTA_BOTTOM_RADIUS;
+    float2 unitRange = saturate(float2(muSun * 0.5 + 0.5, (r - VISTA_BOTTOM_RADIUS) / thickness));
+    return float2(
+        VistaTexCoordFromUnitRange(unitRange.x, VISTA_MULTISCATTERING_LUT_RES),
+        VistaTexCoordFromUnitRange(unitRange.y, VISTA_MULTISCATTERING_LUT_RES));
+}
+
+// 多次散射的等效入射亮度。假定各向同性——这是这套方案最大的一处物理简化：
+// 二次以上散射已经把方向性抹平，各向同性的误差在 1% 量级，
+// 换来的是把"无限次散射"压成一张 32×32 的表 + 一次采样。
+float3 VistaSampleMultiScattering(float r, float muSun)
+{
+    float2 uv = VistaMultiScatteringLutUv(r, muSun);
+    return SAMPLE_TEXTURE2D_LOD(_VistaMultiScatteringLut, sampler_LinearClamp, uv, 0).rgb;
+}
+
+// ----------------------------------------------------------------------------
+//  积分器
+// ----------------------------------------------------------------------------
+struct VistaRaymarchSettings
+{
+    float3 sunIlluminance;      // 建 MS LUT 时传 1
+    float  sampleCount;         // variableSampleCount 时作为下界
+    float  sampleCountMax;      // 仅 variableSampleCount 有效
+    float  tMax;                // < 0 = 自动（到大气顶或地面）；用于深度缓冲截断
+    bool   variableSampleCount; // 按视线长度自适应步数
+    bool   applyPhase;          // false = 各向同性相位（建 MS LUT 用）
+    bool   includeGroundBounce; // 计入地面反弹的一次漫反射
+    bool   useMultiScattering;  // 采样 MS LUT（建 MS LUT 时必须 false，否则自引用）
+};
+
+VistaRaymarchSettings VistaDefaultRaymarchSettings()
+{
+    VistaRaymarchSettings s;
+    s.sunIlluminance      = _VistaSun.xyz;
+    s.sampleCount         = 32.0;
+    s.sampleCountMax      = 32.0;
+    s.tMax                = -1.0;
+    s.variableSampleCount = false;
+    s.applyPhase          = true;
+    s.includeGroundBounce = true;
+    s.useMultiScattering  = true;
+    return s;
+}
+
+struct VistaScatteringResult
+{
+    float3 luminance;       // 沿视线累积的散射亮度
+    float3 transmittance;   // 整段透射率
+    float3 opticalDepth;
+    float3 multiScatAs1;    // 建 MS LUT 用：入射亮度恒为 1 时的散射传递量
+};
+
+// 步段内的取样位置。0.5 是中点，Hillaire 取 0.3——因为密度沿步段是指数衰减的，
+// 能量重心偏向近端，取 0.3 比中点更接近解析积分。
+// 提成宏而不是留在积分器里的局部 const：AP LUT 的行进循环在别的文件里，
+// 两处若取不同的段内位置，天空与远山雾色在地平线交界处会差一个可见的台阶。
+#define VISTA_SAMPLE_SEGMENT_T 0.3
+
+// ----------------------------------------------------------------------------
+//  单个采样点的介质求值
+//
+//  为什么把它从积分器循环里抽出来：AP LUT 需要**一次行进、逐切片输出**的循环
+//  （见 AerialPerspective.hlsl），那个循环结构与这里的不同，无法直接复用
+//  VistaIntegrateScatteredLuminance。但两者必须共用同一份能量计算 ——
+//  否则就回到了本文件开头警告的那个 bug：远山雾色与天空色在交界处对不上。
+//  所以只复制循环，绝不复制物理。
+// ----------------------------------------------------------------------------
+struct VistaScatterSample
+{
+    float3 scattered;   // 该点的散射源项（已含相位、到太阳的透射率、星球阴影、多次散射）
+    float3 msAs1;       // 入射亮度恒为 1 时的散射系数和（建 MS LUT 用）
+    float3 extinction;  // 已兜底 >= 1e-9，可直接作除数
+};
+
+VistaScatterSample VistaEvaluateScatterSample(
+    float3 p, float3 rayDir, float3 sunDir, VistaRaymarchSettings s)
+{
+    float  r  = length(p);
+    float3 up = p / r;
+
+    VistaMediumSample medium = VistaSampleMedium(r - VISTA_BOTTOM_RADIUS);
+
+    float  muSun = dot(sunDir, up);
+    float3 transmittanceToSun = VistaSampleTransmittanceToSun(r, muSun);
+    float  earthShadow = VistaEarthShadow(p, sunDir);
+
+    float3 phaseTimesScattering;
+    if (s.applyPhase)
+    {
+        float cosTheta = dot(rayDir, sunDir);
+        phaseTimesScattering =
+              medium.scatteringRayleigh * VistaRayleighPhase(cosTheta)
+            + medium.scatteringMie      * VistaHenyeyGreensteinPhase(_VistaMieExtinct.w, cosTheta);
+    }
+    else
+    {
+        phaseTimesScattering =
+            (medium.scatteringRayleigh + medium.scatteringMie) * VISTA_ISOTROPIC_PHASE;
+    }
+
+    float3 multiScattered = 0.0;
+    if (s.useMultiScattering)
+    {
+        multiScattered = VistaSampleMultiScattering(r, muSun)
+                       * (medium.scatteringRayleigh + medium.scatteringMie);
+    }
+
+    VistaScatterSample o;
+    o.scattered = s.sunIlluminance
+                * (earthShadow * transmittanceToSun * phaseTimesScattering)
+                + s.sunIlluminance * multiScattered;
+    o.msAs1 = medium.scatteringRayleigh + medium.scatteringMie;
+    // 大气顶附近密度指数衰减到接近 0，除法要兜底
+    o.extinction = max(medium.extinction, 1e-9);
+    return o;
+}
+
+// posKm / sunDir 都在"星球中心为原点"的大气空间（km）。rayDir、sunDir 须归一化。
+VistaScatteringResult VistaIntegrateScatteredLuminance(
+    float3 posKm, float3 rayDir, float3 sunDir, VistaRaymarchSettings s)
+{
+    VistaScatteringResult result;
+    result.luminance     = 0.0;
+    result.transmittance = 1.0;
+    result.opticalDepth  = 0.0;
+    result.multiScatAs1  = 0.0;
+
+    const float3 planetCenter = float3(0.0, 0.0, 0.0);
+
+    // ---- 积分上限 ----
+    float tBottom = VistaRaySphereIntersectNearest(posKm, rayDir, planetCenter, VISTA_BOTTOM_RADIUS);
+    float tTop    = VistaRaySphereIntersectNearest(posKm, rayDir, planetCenter, VISTA_TOP_RADIUS);
+
+    float tMax;
+    if (tBottom < 0.0)
+    {
+        if (tTop < 0.0)
+            return result;      // 在大气外且视线不进入大气
+        tMax = tTop;
+    }
+    else
+    {
+        tMax = (tTop > 0.0) ? min(tTop, tBottom) : tBottom;
+    }
+
+    bool hitGround = (tBottom > 0.0) && (tMax == tBottom);
+
+    if (s.tMax >= 0.0 && s.tMax < tMax)
+    {
+        tMax = s.tMax;          // 被不透明物遮挡：积分到深度处为止，地面反弹不再成立
+        hitGround = false;
+    }
+    if (tMax <= 0.0)
+        return result;
+
+    // ---- 步进分布 ----
+    // 非均匀分布（t 的平方）把采样点堆在近处：航空透视的梯度几乎全在前几百米，
+    // 均匀步进会把预算浪费在远处已经饱和的区间。
+    float sampleCount      = s.sampleCount;
+    float sampleCountFloor = s.sampleCount;
+    float tMaxFloor        = tMax;
+    if (s.variableSampleCount)
+    {
+        sampleCount      = lerp(s.sampleCount, s.sampleCountMax, saturate(tMax * 0.01));
+        sampleCountFloor = floor(sampleCount);
+        // 把 tMax 缩到最后一个完整步段，避免末段长度突变造成的带状
+        tMaxFloor = tMax * sampleCountFloor / sampleCount;
+    }
+
+    // 步段内的取样位置见 VISTA_SAMPLE_SEGMENT_T。
+
+    float3 throughput = 1.0;
+    float t  = 0.0;
+    float dt = tMax / sampleCount;
+
+    for (float i = 0.0; i < sampleCount; i += 1.0)
+    {
+        if (s.variableSampleCount)
+        {
+            float t0 = i / sampleCountFloor;
+            float t1 = (i + 1.0) / sampleCountFloor;
+            t0 = t0 * t0;
+            t1 = t1 * t1;
+            t0 = tMaxFloor * t0;
+            t1 = (t1 > 1.0) ? tMax : (tMaxFloor * t1);
+            dt = t1 - t0;
+            t  = t0 + dt * VISTA_SAMPLE_SEGMENT_T;
+        }
+        else
+        {
+            float tNew = tMax * (i + VISTA_SAMPLE_SEGMENT_T) / sampleCount;
+            dt = tNew - t;
+            t  = tNew;
+        }
+
+        float3 p = posKm + t * rayDir;
+
+        VistaScatterSample smp = VistaEvaluateScatterSample(p, rayDir, sunDir, s);
+
+        float3 sampleOpticalDepth   = smp.extinction * dt;
+        float3 sampleTransmittance  = exp(-sampleOpticalDepth);
+        result.opticalDepth += sampleOpticalDepth;
+
+        // 步段内的解析积分：∫ S·exp(-σt) dt = S·(1 - exp(-σ·dt)) / σ。
+        // 直接用 S·dt（矩形法）在光学厚的步段会明显高估，是低步数下带状的主因。
+        result.luminance += throughput
+            * (smp.scattered - smp.scattered * sampleTransmittance) / smp.extinction;
+
+        // MS LUT 的输入项：入射亮度恒为 1、无相位、无遮挡时的散射传递量
+        result.multiScatAs1 += throughput
+            * (smp.msAs1 - smp.msAs1 * sampleTransmittance) / smp.extinction;
+
+        throughput *= sampleTransmittance;
+    }
+
+    // ---- 地面反弹（Lambert 一次漫反射）----
+    if (s.includeGroundBounce && hitGround)
+    {
+        float3 p = posKm + tBottom * rayDir;
+        float  r = length(p);
+        float3 up = p / r;
+        float  muSun = dot(sunDir, up);
+        float3 transmittanceToSun = VistaSampleTransmittanceToSun(r, muSun);
+        float  nDotL = saturate(muSun);
+
+        result.luminance += s.sunIlluminance * transmittanceToSun * throughput
+                          * nDotL * _VistaGround.xyz * (1.0 / PI);
+    }
+
+    result.transmittance = throughput;
+    return result;
+}
+
+// ============================================================================
+//  Sky-View LUT 参数化
+//
+//  这张表能成立的前提是**绕 up 轴的方位对称性**：给定相机高度与太阳天顶角后，
+//  天空亮度只取决于 (视线天顶角, 视线与太阳的方位夹角) 两个量。
+//  于是本该是 4D 的天空被压成一张 2D 表 —— 这是整个方案里性价比最高的一步降维。
+//  代价：一旦引入方位上不对称的东西（云、地形遮挡、局部雾），这张表就不再够用，
+//  那些必须走别的通道（Step 7 的云、Step 3 的雾）。
+//
+//  uv.y 在**地平线处硬分段**：< 0.5 为地平线以上，> 0.5 为地平线以下，
+//  两段内各做一次平方 warp 把纹素往地平线堆。
+//  为什么必须这么做：地平线上下几度内是长路径 + Mie 前向峰 + 地面反弹三者的交界，
+//  亮度梯度全场最大。线性映射下 108 行的表会在地平线留一条肉眼可见的横向台阶
+//  （日落时最明显，因为那时地平线附近还叠加了强色相变化）。
+//
+//  uv.x -> lightViewCosAngle 同样做平方 warp：uv.x=1 对应正对太阳，
+//  HG 相位在太阳周围几度内变化一个数量级，需要额外纹素。
+// ============================================================================
+
+TEXTURE2D(_VistaSkyViewLut);
+
+void VistaSkyViewLutUvToParams(float viewHeight, float2 uv,
+                               out float viewZenithCosAngle, out float lightViewCosAngle)
+{
+    // 抵消采样端的纹素中心内缩，保证正反映射严格互逆
+    uv = float2(VistaUnitRangeFromTexCoord(uv.x, _VistaSkyViewLutSize.x),
+                VistaUnitRangeFromTexCoord(uv.y, _VistaSkyViewLutSize.y));
+
+    // beta: 从相机看星球边缘的张角；zenithHorizonAngle: 天顶到地平线的张角。
+    // 相机越高，地平线越"往下沉"，所以这两个量必须随 viewHeight 变化，
+    // 不能写成常量 PI/2 —— 否则相机爬山时地平线会在 LUT 里错位。
+    float vHorizon = sqrt(max(0.0, viewHeight * viewHeight - VISTA_BOTTOM_RADIUS_2));
+    float cosBeta  = vHorizon / max(viewHeight, 1e-4);
+    float beta     = acos(clamp(cosBeta, -1.0, 1.0));
+    float zenithHorizonAngle = PI - beta;
+
+    if (uv.y < 0.5)
+    {
+        // 地平线以上：uv.y = 0 -> 天顶，uv.y = 0.5 -> 地平线
+        float coord = 1.0 - 2.0 * uv.y;
+        coord *= coord;
+        coord = 1.0 - coord;
+        viewZenithCosAngle = cos(zenithHorizonAngle * coord);
+    }
+    else
+    {
+        // 地平线以下：uv.y = 0.5 -> 地平线，uv.y = 1 -> 天底
+        float coord = uv.y * 2.0 - 1.0;
+        coord *= coord;
+        viewZenithCosAngle = cos(zenithHorizonAngle + beta * coord);
+    }
+
+    float coord = uv.x;
+    coord *= coord;
+    // 负号：uv.x = 1 时 lightViewCosAngle = -1... 见下方 ParamsToUv 的对应式，
+    // 两边是同一组约定，改一处必须改另一处。
+    lightViewCosAngle = -(coord * 2.0 - 1.0);
+}
+
+float2 VistaSkyViewLutParamsToUv(float viewHeight, float viewZenithCosAngle,
+                                 float lightViewCosAngle, bool intersectGround)
+{
+    float vHorizon = sqrt(max(0.0, viewHeight * viewHeight - VISTA_BOTTOM_RADIUS_2));
+    float cosBeta  = vHorizon / max(viewHeight, 1e-4);
+    float beta     = acos(clamp(cosBeta, -1.0, 1.0));
+    float zenithHorizonAngle = PI - beta;
+
+    float2 uv;
+    if (!intersectGround)
+    {
+        float coord = acos(clamp(viewZenithCosAngle, -1.0, 1.0)) / max(zenithHorizonAngle, 1e-4);
+        coord = 1.0 - coord;
+        coord = sqrt(max(0.0, coord));   // warp 的逆：平方 <-> 开方
+        coord = 1.0 - coord;
+        uv.y = coord * 0.5;
+    }
+    else
+    {
+        float coord = (acos(clamp(viewZenithCosAngle, -1.0, 1.0)) - zenithHorizonAngle) / max(beta, 1e-4);
+        coord = sqrt(max(0.0, coord));
+        uv.y = coord * 0.5 + 0.5;
+    }
+
+    uv.x = sqrt(max(0.0, -lightViewCosAngle * 0.5 + 0.5));
+
+    return float2(VistaTexCoordFromUnitRange(saturate(uv.x), _VistaSkyViewLutSize.x),
+                  VistaTexCoordFromUnitRange(saturate(uv.y), _VistaSkyViewLutSize.y));
+}
+
+// 相机在大气之外时把积分起点推到大气顶。返回 false = 视线完全不进入大气。
+// 本项目相机永远在大气内，但这几行是白送的正确性，且 Editor 里把 bottomRadius
+// 调小做参数实验时会立刻用到。
+bool VistaMoveToTopAtmosphere(inout float3 posKm, float3 rayDir)
+{
+    float viewHeight = length(posKm);
+    if (viewHeight <= VISTA_TOP_RADIUS)
+        return true;
+
+    float tTop = VistaRaySphereIntersectNearest(posKm, rayDir, float3(0.0, 0.0, 0.0), VISTA_TOP_RADIUS);
+    if (tTop < 0.0)
+        return false;
+
+    float3 up = posKm / viewHeight;
+    // 往内推 10 m，避免起点正好落在边界上导致后续判别式在 0 附近抖动
+    posKm = posKm + rayDir * tTop - up * VISTA_PLANET_RADIUS_OFFSET;
+    return true;
+}
+
+// 采样端便捷函数。posKm 在大气空间；rayDir / sunDir 是单位矢量，
+// 因为大气空间与世界空间同朝向，两者可以直接混用（见 AtmosphereDef.hlsl 的说明）。
+float3 VistaSampleSkyViewLut(float3 posKm, float3 rayDir, float3 sunDir)
+{
+    float viewHeight = length(posKm);
+    float3 up = posKm / max(viewHeight, 1e-4);
+
+    float viewZenithCosAngle = dot(rayDir, up);
+
+    // 构造以 up 为轴、在水平面内朝向太阳的正交基，取出"视线与太阳的方位夹角"余弦。
+    // 这一步就是把 3D 压成 2D 的关键：只保留方位差，丢弃绝对方位。
+    float3 sideRaw = cross(up, rayDir);
+    float  sideLen = length(sideRaw);
+
+    float lightViewCosAngle;
+    if (sideLen < 1e-5)
+    {
+        // 视线与 up 平行（正看天顶/天底）：方位角无定义。
+        // 此时 LUT 的整行都是同一个值（viewZenithCos = ±1 时 rayDir 与 uv.x 无关），
+        // 所以取任意值都精确，取 0 即可，关键是不能让 normalize 产出 NaN。
+        lightViewCosAngle = 0.0;
+    }
+    else
+    {
+        float3 sideVector    = sideRaw / sideLen;
+        float3 forwardVector = normalize(cross(sideVector, up));
+        float2 lightOnPlane  = float2(dot(sunDir, forwardVector),
+                                      dot(sunDir, cross(forwardVector, up)));
+        lightOnPlane = normalize(lightOnPlane + 1e-8);
+        lightViewCosAngle = lightOnPlane.x;
+    }
+
+    bool intersectGround = VistaRayIntersectsGround(viewHeight, viewZenithCosAngle);
+    float2 uv = VistaSkyViewLutParamsToUv(viewHeight, viewZenithCosAngle,
+                                          lightViewCosAngle, intersectGround);
+    return SAMPLE_TEXTURE2D_LOD(_VistaSkyViewLut, sampler_LinearClamp, uv, 0).rgb;
+}
+
+// 太阳圆盘。**不烘进 SkyView LUT**：192×108 的表上太阳只占不到一个纹素，
+// 烘进去必然被抹成一团糊，而且相机转动时会随 LUT 的双线性插值抖动。
+// 解析画法既锐利又稳定，且角半径可以自由调（大气散射用的 0.545° 是地球实测值）。
+// limbDarkening: 太阳盘面边缘比中心暗，是肉眼可辨的细节，公式取 Hestroffer & Magnan 1998 的简化式。
+float3 VistaSunDisc(float3 rayDir, float3 sunDir, float3 transmittanceToSun)
+{
+    float cosTheta = dot(rayDir, sunDir);
+    float cosLimit = _VistaSun.w;               // cos(角半径)
+    if (cosTheta < cosLimit)
+        return 0.0;
+
+    // 归一化到盘面内半径 [0,1]
+    float sinLimit2 = max(1e-8, 1.0 - cosLimit * cosLimit);
+    float rDisc = sqrt(saturate((1.0 - cosTheta * cosTheta) / sinLimit2));
+    float mu = sqrt(saturate(1.0 - rDisc * rDisc));
+    float limbDarkening = 0.397 + 0.603 * pow(max(mu, 1e-4), 0.4);
+
+    // 从"总照度 lux"换算成"盘面亮度 cd/m²"：除以盘面立体角 2π(1-cosLimit)
+    float solidAngle = 2.0 * PI * (1.0 - cosLimit);
+    return _VistaSun.xyz / solidAngle * limbDarkening * transmittanceToSun;
+}
+
+#endif // VISTA_ATMOSPHERE_SCATTERING_INCLUDED

@@ -1,0 +1,785 @@
+// Vista 大气 LUT 计算。Hillaire, "A Scalable and Production Ready Sky and
+// Atmosphere Rendering Technique", EGSR 2020。参数化沿用 Bruneton 2008/2017。
+//
+// 核按 LUT 依赖顺序排列：
+//   TransmittanceLut       静态，只依赖大气参数
+//   MultiScatteringLut     静态，依赖 Transmittance
+//   SkyViewLut             逐帧，依赖前两张 + 太阳方向 + 相机高度
+//   AerialPerspectiveLut   逐帧，依赖前两张 + 太阳方向 + 相机位置与视锥
+//   SkyAmbientSh           逐帧，依赖 SkyView（把天空投影成 SH9 环境光）
+
+#pragma kernel TransmittanceLut
+#pragma kernel MultiScatteringLut
+#pragma kernel SkyViewLut
+#pragma kernel SkyViewLutRoundTrip
+#pragma kernel AerialPerspectiveLut
+#pragma kernel AerialPerspectiveRoundTrip
+#pragma kernel AerialPerspectiveSliceError
+#pragma kernel SkyAmbientSh
+#pragma kernel SkyAmbientShReference
+
+// 不含 gles3：整套 LUT 走 compute + RWTexture。移动端目标是 Vulkan / Metal，
+// GLES3.x 上改用 fragment shader 写 LUT 的降级路径（见 CHANGELOG）。
+#pragma only_renderers d3d11 d3d12 vulkan metal playstation xboxone xboxseries switch
+
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+#include "Packages/com.kkiej.vista/ShaderLibrary/AtmosphereDef.hlsl"
+#include "Packages/com.kkiej.vista/ShaderLibrary/AtmosphereScattering.hlsl"
+#include "Packages/com.kkiej.vista/ShaderLibrary/AerialPerspective.hlsl"
+#include "Packages/com.kkiej.vista/ShaderLibrary/SphericalHarmonics.hlsl"
+
+// ============================================================================
+//  Transmittance LUT
+// ============================================================================
+
+// 积分采样数。Bruneton 用 500，Hillaire 的实现用 40。
+// 这张表是静态的，只在参数变化时重算，所以给足采样数不影响帧开销。
+#define VISTA_TRANSMITTANCE_SAMPLE_COUNT 40u
+
+RWTexture2D<float4> _VistaTransmittanceLutRW;
+
+[numthreads(8, 8, 1)]
+void TransmittanceLut(uint3 id : SV_DispatchThreadID)
+{
+    uint2 size = (uint2)_VistaTransmittanceLutSize.xy;
+    if (id.x >= size.x || id.y >= size.y)
+        return;
+
+    // 纹素中心 -> 单位区间（反向抵消 VistaTexCoordFromUnitRange 的内缩）
+    float2 texCoord = ((float2)id.xy + 0.5) * _VistaTransmittanceLutSize.zw;
+    float2 unitRange = float2(
+        VistaUnitRangeFromTexCoord(texCoord.x, _VistaTransmittanceLutSize.x),
+        VistaUnitRangeFromTexCoord(texCoord.y, _VistaTransmittanceLutSize.y));
+
+    float r, mu;
+    VistaTransmittanceLutUvToRMu(unitRange, r, mu);
+
+    float3 opticalDepth = VistaComputeOpticalDepthToTopAtmosphereBoundary(
+        r, mu, VISTA_TRANSMITTANCE_SAMPLE_COUNT);
+
+    _VistaTransmittanceLutRW[id.xy] = float4(exp(-opticalDepth), 1.0);
+}
+
+// ============================================================================
+//  Multi-Scattering LUT
+//
+//  参数化：uv.x -> cos(太阳天顶角) ∈ [-1, 1]，uv.y -> 海拔 ∈ [0, 厚度]。
+//  与视线方向无关——这正是"多次散射视作各向同性"这一简化换来的降维，
+//  否则这张表要多两个维度。
+//
+//  做法（Hillaire）：在每个 (muSun, 高度) 上，往球面 64 个均匀方向各做一次
+//  raymarch，得到两个量：
+//    L2   = 二阶散射亮度（把一阶散射的结果当作各向同性入射）
+//    fms  = 入射亮度恒为 1 时的散射传递率
+//  再用等比级数把无限阶一次求和：Σ = L2 · 1/(1 - fms)。
+//
+//  取舍：**不做完整的 Monte Carlo 多次散射**。完整解需要在每一阶重新解一次
+//  辐射传输方程，烘焙时间从毫秒级涨到分钟级，而与这套近似的差别在 1% 量级，
+//  在 tonemap 之后完全看不出。生产环境（UE5 的 SkyAtmosphere、Unity HDRP 的
+//  PhysicallyBasedSky）用的都是这套近似。
+// ============================================================================
+
+#define VISTA_MS_SQRT_SAMPLES 8u
+#define VISTA_MS_DIR_COUNT    64u   // = SQRT_SAMPLES^2
+
+// 每个方向 20 步。这张表极平滑，步数的影响远小于方向数。
+#define VISTA_MS_RAYMARCH_STEPS 20.0
+
+RWTexture2D<float4> _VistaMultiScatteringLutRW;
+
+groupshared float3 gs_MultiScatAs1[VISTA_MS_DIR_COUNT];
+groupshared float3 gs_Luminance[VISTA_MS_DIR_COUNT];
+
+// 一个线程组 = 一个纹素 = 64 个方向。dispatch (32, 32, 1)。
+[numthreads(1, 1, 64)]
+void MultiScatteringLut(uint3 id : SV_DispatchThreadID, uint3 groupThreadId : SV_GroupThreadID)
+{
+    const float res = VISTA_MULTISCATTERING_LUT_RES;
+
+    float2 texCoord = ((float2)id.xy + 0.5) / res;
+    float2 unitRange = float2(
+        VistaUnitRangeFromTexCoord(texCoord.x, res),
+        VistaUnitRangeFromTexCoord(texCoord.y, res));
+
+    float muSun = unitRange.x * 2.0 - 1.0;
+    // up = +z。太阳放在 zy 平面内即可，绕 up 轴的旋转对结果无影响（各向同性）。
+    float3 sunDir = float3(0.0, sqrt(saturate(1.0 - muSun * muSun)), muSun);
+
+    float thickness = VISTA_TOP_RADIUS - VISTA_BOTTOM_RADIUS;
+    // 与 VistaMultiScatteringLutUv 的逆映射保持一致；max 只是把最底层那一格
+    // 从"正好贴地"抬开 10 m，避免切线方向判别式在 0 附近抖动。
+    float r = VISTA_BOTTOM_RADIUS + max(unitRange.y * thickness, VISTA_PLANET_RADIUS_OFFSET);
+    float3 posKm = float3(0.0, 0.0, r);
+
+    // ---- 球面均匀取向：64 个方向，一个线程一个 ----
+    // 均匀球面采样（Marsaglia）：phi = acos(1 - 2u)，而不是 phi = pi*u，
+    // 后者会把方向堆在两极，多次散射会算偏。
+    uint dirIndex = groupThreadId.z;
+    float fi = 0.5 + (float)(dirIndex / VISTA_MS_SQRT_SAMPLES);
+    float fj = 0.5 + (float)(dirIndex % VISTA_MS_SQRT_SAMPLES);
+    float randA = fi / (float)VISTA_MS_SQRT_SAMPLES;
+    float randB = fj / (float)VISTA_MS_SQRT_SAMPLES;
+
+    float theta = 2.0 * PI * randA;
+    float phi   = acos(1.0 - 2.0 * randB);
+    float sinPhi, cosPhi, sinTheta, cosTheta;
+    sincos(phi, sinPhi, cosPhi);
+    sincos(theta, sinTheta, cosTheta);
+    float3 rayDir = float3(cosTheta * sinPhi, sinTheta * sinPhi, cosPhi);
+
+    VistaRaymarchSettings settings = VistaDefaultRaymarchSettings();
+    settings.sunIlluminance      = 1.0;     // 归一化：这张表存的是传递率，不是绝对亮度
+    settings.sampleCount         = VISTA_MS_RAYMARCH_STEPS;
+    settings.sampleCountMax      = VISTA_MS_RAYMARCH_STEPS;
+    settings.variableSampleCount = false;
+    settings.applyPhase          = false;   // 各向同性
+    settings.includeGroundBounce = true;    // 地面反弹是多次散射的重要来源
+    settings.useMultiScattering  = false;   // 必须关：否则自引用
+
+    VistaScatteringResult result =
+        VistaIntegrateScatteredLuminance(posKm, rayDir, sunDir, settings);
+
+    gs_Luminance[dirIndex]     = result.luminance;
+    gs_MultiScatAs1[dirIndex]  = result.multiScatAs1;
+
+    // ---- 组内归约 ----
+    GroupMemoryBarrierWithGroupSync();
+    [unroll]
+    for (uint stride = VISTA_MS_DIR_COUNT / 2u; stride > 0u; stride >>= 1u)
+    {
+        if (dirIndex < stride)
+        {
+            gs_Luminance[dirIndex]    += gs_Luminance[dirIndex + stride];
+            gs_MultiScatAs1[dirIndex] += gs_MultiScatAs1[dirIndex + stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (dirIndex > 0u)
+        return;
+
+    // 球面积分 ∫L·p dω，p = 1/4π：(4π/N)·ΣL·(1/4π) = ΣL/N，即方向平均。
+    // 论文里 4π 与 1/4π 是显式写出来的，这里约掉了——对着论文看代码时别找不到。
+    float invCount = 1.0 / (float)VISTA_MS_DIR_COUNT;
+    float3 secondOrder = gs_Luminance[0]    * invCount;
+    float3 fms         = gs_MultiScatAs1[0] * invCount;
+
+    // 无限阶等比级数。fms 物理上必 < 1（单次散射反照率 < 1 且路径有限），
+    // clamp 只是防 fp 边界情形除出 inf 污染整张表。
+    float3 sumOfAllOrders = 1.0 / (1.0 - min(fms, 0.999));
+
+    _VistaMultiScatteringLutRW[id.xy] = float4(secondOrder * sumOfAllOrders, 1.0);
+}
+
+// ============================================================================
+//  Sky-View LUT（逐帧）
+//
+//  参数化见 AtmosphereScattering.hlsl 的 VistaSkyViewLutUvToParams。
+//  这个核在一个**规范坐标系**里积分：up = +z，太阳落在 xz 平面 x>0 的一侧。
+//  这样做是合法的，因为 (viewZenithCos, lightViewCos) 这两个标量与坐标系无关，
+//  只要重建出的方向能复现这两个标量，积分结果就与世界空间中的真实朝向一致。
+//  好处：核里完全不需要相机的世界朝向，也不需要任何矩阵。
+// ============================================================================
+
+// 步数区间。地平线方向路径最长（几百 km），会取到上界；天顶方向取下界。
+// 天空是全屏最平滑的渐变，带状在这里最刺眼，所以不吝惜步数：
+// 192×108×~48 ≈ 1M 采样/帧，在 PC 上是零点几毫秒量级。
+// 移动端分级（Task #7）把这两个数降到 8 / 16，并把表降到 128×72。
+#define VISTA_SKYVIEW_SPP_MIN 32.0
+#define VISTA_SKYVIEW_SPP_MAX 64.0
+
+RWTexture2D<float4> _VistaSkyViewLutRW;
+
+[numthreads(8, 8, 1)]
+void SkyViewLut(uint3 id : SV_DispatchThreadID)
+{
+    uint2 size = (uint2)_VistaSkyViewLutSize.xy;
+    if (id.x >= size.x || id.y >= size.y)
+        return;
+
+    float2 uv = ((float2)id.xy + 0.5) * _VistaSkyViewLutSize.zw;
+
+    float viewHeight = _VistaViewPosKm.w;
+
+    float viewZenithCosAngle, lightViewCosAngle;
+    VistaSkyViewLutUvToParams(viewHeight, uv, viewZenithCosAngle, lightViewCosAngle);
+
+    // ---- 搬进规范坐标系 ----
+    // 太阳天顶角是真实的（取自世界空间的 up 与太阳方向），只有绕 up 的方位被规范化。
+    float3 worldUp = _VistaViewPosKm.xyz / max(viewHeight, 1e-4);
+    float sunZenithCosAngle = dot(worldUp, _VistaSunDirection.xyz);
+    float3 sunDir = float3(sqrt(saturate(1.0 - sunZenithCosAngle * sunZenithCosAngle)),
+                           0.0, sunZenithCosAngle);
+
+    float3 posKm = float3(0.0, 0.0, viewHeight);
+
+    float viewZenithSinAngle = sqrt(saturate(1.0 - viewZenithCosAngle * viewZenithCosAngle));
+    // y 分量取正即可：天空对太阳所在的竖直平面镜像对称，负方位与正方位同值。
+    float3 rayDir = float3(viewZenithSinAngle * lightViewCosAngle,
+                           viewZenithSinAngle * sqrt(saturate(1.0 - lightViewCosAngle * lightViewCosAngle)),
+                           viewZenithCosAngle);
+
+    if (!VistaMoveToTopAtmosphere(posKm, rayDir))
+    {
+        _VistaSkyViewLutRW[id.xy] = float4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
+
+    VistaRaymarchSettings settings = VistaDefaultRaymarchSettings();
+    settings.sampleCount         = VISTA_SKYVIEW_SPP_MIN;
+    settings.sampleCountMax      = VISTA_SKYVIEW_SPP_MAX;
+    settings.variableSampleCount = true;
+    settings.applyPhase          = true;
+    settings.useMultiScattering  = true;
+    // **与论文不同：这里开地面反弹。**
+    // Hillaire 关掉它，因为 UE 里地平线以下永远被几何体覆盖，环境光另有来源。
+    // 我们把这张表同时用于生成环境光 SH（Task #5），下半球必须带地面反弹的辐射，
+    // 否则场景只被上半球照亮，暗部会死黑、AO 看着像贴上去的。
+    // 另外 512 m 的场景根本铺不到地平线，地平线以下的天空盒是真会被看到的。
+    settings.includeGroundBounce = true;
+
+    VistaScatteringResult result =
+        VistaIntegrateScatteredLuminance(posKm, rayDir, sunDir, settings);
+
+    // 太阳圆盘不进这张表：192×108 上太阳占不到一个纹素，烘进去必然糊成一团，
+    // 且相机转动时会随双线性插值抖。改由天空盒 shader 解析绘制。
+    _VistaSkyViewLutRW[id.xy] = float4(result.luminance, 1.0);
+}
+
+// ============================================================================
+//  Sky-View 参数化 round-trip 自检（仅 Editor 调用）
+//
+//  这套映射有两段分支（地平线上/下）+ 两次平方 warp + 一次纹素中心内缩，
+//  任一处写反的症状都是"天空在地平线附近整体偏移"，而那种偏移极容易被误判成
+//  大气参数没调好，从而往错误的方向排查。直接做数值 round-trip 最省事。
+//
+//  复用 _VistaSkyViewLutRW 作为输出，避免为自检多开一个绑定点；
+//  调用方读完后重新跑一次 SkyViewLut 覆盖回真实内容。
+// ============================================================================
+
+// 误差量级在 1e-7，而输出是 fp16（最小正规数 ~6e-5），直接存会被压成 0，
+// 那样测试永远"通过"。放大 4096（2 的幂，fp16 上精确）后再存，C# 侧除回去。
+#define VISTA_ROUNDTRIP_SCALE 4096.0
+
+[numthreads(8, 8, 1)]
+void SkyViewLutRoundTrip(uint3 id : SV_DispatchThreadID)
+{
+    uint2 size = (uint2)_VistaSkyViewLutSize.xy;
+    if (id.x >= size.x || id.y >= size.y)
+        return;
+
+    float2 uv = ((float2)id.xy + 0.5) * _VistaSkyViewLutSize.zw;
+    float viewHeight = _VistaViewPosKm.w;
+
+    float viewZenithCosAngle, lightViewCosAngle;
+    VistaSkyViewLutUvToParams(viewHeight, uv, viewZenithCosAngle, lightViewCosAngle);
+
+    // 用与采样端**完全相同**的方式判定地平线上下，否则测的就不是真实路径
+    bool intersectGround = VistaRayIntersectsGround(viewHeight, viewZenithCosAngle);
+    float2 uv2 = VistaSkyViewLutParamsToUv(
+        viewHeight, viewZenithCosAngle, lightViewCosAngle, intersectGround);
+
+    _VistaSkyViewLutRW[id.xy] = float4(
+        abs(uv2 - uv) * VISTA_ROUNDTRIP_SCALE,
+        viewZenithCosAngle,
+        lightViewCosAngle);
+}
+
+// ============================================================================
+//  Aerial Perspective LUT（逐帧）
+//
+//  参数化、分层理由、彩色 vs 灰度透射率的取舍见 ShaderLibrary/AerialPerspective.hlsl。
+//
+//  循环结构：**一个线程负责一整根 froxel 柱**，沿视线只行进一次，
+//  每跨过一个切片边界就把当前累积量写出去。
+//  为什么不像 SkyView 那样一个线程一个纹素（即每片各自从相机重新积分一遍）：
+//  那样是 O(切片数²) 的采样量，更要命的是每片用的求积节点不同，
+//  相邻切片之间会出现非单调的抖动 —— 三线性插值把它放大成沿深度的带状。
+//  单次行进按构造保证累积量沿深度单调。
+//
+//  代价：循环体不能直接复用 VistaIntegrateScatteredLuminance（那个函数只返回端点值）。
+//  所以这里只重写**循环**，逐点的能量计算调用共享的 VistaEvaluateScatterSample，
+//  段内解析积分与段内取样位置（VISTA_SAMPLE_SEGMENT_T）也与天空完全一致。
+//  物理绝不复制两份 —— 否则就是 AtmosphereScattering.hlsl 开头警告的那个 bug。
+// ============================================================================
+
+// 单步最长 0.25 km：Rayleigh 标高 8 km、Mie 标高 1.2 km，0.25 km 的步长
+// 在最陡的 Mie 剖面上密度变化也只有 ~20%，段内解析积分足以吸收。
+#define VISTA_AP_STEP_MAX_KM 0.25
+#define VISTA_AP_STEPS_MIN   2.0
+#define VISTA_AP_STEPS_MAX   16.0
+
+// 高步数参考解，只给自检用（AerialPerspectiveSliceError）。
+#define VISTA_AP_REFERENCE_STEPS 256.0
+
+RWTexture3D<float4> _VistaApScatterLutRW;
+RWTexture3D<float4> _VistaApTransmittanceLutRW;
+
+// 本核假定相机在大气内（本项目恒成立）。相机在大气外时 tLimit 会退化成
+// "到大气顶的入射距离"，整张表变成 0 —— 是安全的降级，不是 NaN。
+[numthreads(8, 8, 1)]
+void AerialPerspectiveLut(uint3 id : SV_DispatchThreadID)
+{
+    uint3 size = (uint3)_VistaApSize.xyz;
+    if (id.x >= size.x || id.y >= size.y)
+        return;
+
+    float2 uv = ((float2)id.xy + 0.5) / _VistaApSize.xy;
+    float3 rayDir = VistaApFroxelRayDirection(uv);
+    float3 posKm  = _VistaViewPosKm.xyz;
+
+    // 视线在大气内的可用长度：出大气顶或撞地，谁先到算谁。
+    // 超出这个长度的切片没有物理意义，把积分上限钉住让它们饱和即可 ——
+    // 下游只会用自己几何体的深度去采样，不会问到墙外面去。
+    const float3 planetCenter = float3(0.0, 0.0, 0.0);
+    float tTop    = VistaRaySphereIntersectNearest(posKm, rayDir, planetCenter, VISTA_TOP_RADIUS);
+    float tBottom = VistaRaySphereIntersectNearest(posKm, rayDir, planetCenter, VISTA_BOTTOM_RADIUS);
+    float tLimit  = max(tTop, 0.0);
+    if (tBottom > 0.0)
+        tLimit = min(tLimit, tBottom);
+
+    VistaRaymarchSettings s = VistaDefaultRaymarchSettings();
+    s.applyPhase         = true;
+    s.useMultiScattering = true;
+    // 相机与几何体之间没有"地面端点"：远端的辐射由几何体自己提供，
+    // 这里再加一次地面反弹就是重复计能量（远山会发白）。
+    s.includeGroundBounce = false;
+
+    float3 luminance  = 0.0;
+    float3 throughput = 1.0;
+    float  tPrev      = 0.0;
+    float3 sunDir     = _VistaSunDirection.xyz;
+
+    for (uint slice = 0u; slice < size.z; ++slice)
+    {
+        float w     = (float)slice * _VistaApSize.w;
+        float tNext = min(VistaApSliceCoordToDistance(w), tLimit);
+
+        float segLen = tNext - tPrev;
+        if (segLen > 0.0)
+        {
+            float steps = clamp(ceil(segLen / VISTA_AP_STEP_MAX_KM),
+                                VISTA_AP_STEPS_MIN, VISTA_AP_STEPS_MAX);
+            float dt = segLen / steps;
+
+            for (float i = 0.0; i < steps; i += 1.0)
+            {
+                float  t = tPrev + (i + VISTA_SAMPLE_SEGMENT_T) * dt;
+                float3 p = posKm + t * rayDir;
+
+                VistaScatterSample smp = VistaEvaluateScatterSample(p, rayDir, sunDir, s);
+
+                float3 sampleTransmittance = exp(-smp.extinction * dt);
+                luminance += throughput
+                    * (smp.scattered - smp.scattered * sampleTransmittance) / smp.extinction;
+                throughput *= sampleTransmittance;
+            }
+        }
+
+        // 灰度透射率同时写进 alpha：移动端路径只采这一张表就够（见 AerialPerspective.hlsl）
+        float greyTransmittance = dot(throughput, 1.0 / 3.0);
+        _VistaApScatterLutRW[uint3(id.xy, slice)]       = float4(luminance, greyTransmittance);
+        _VistaApTransmittanceLutRW[uint3(id.xy, slice)] = float4(throughput, 1.0);
+
+        tPrev = tNext;
+    }
+}
+
+// ============================================================================
+//  AP 深度分布 round-trip 自检（仅 Editor 调用）
+//
+//  正反映射有 pow / log 两套分支，写反的症状是"雾整体近了或远了一格"，
+//  而那种偏移非常容易被误判成大气参数或雾密度没调好。数值 round-trip 最省事。
+//  同时把每片的实际距离一起写出去，好在 C# 侧检查单调性与两端点。
+//
+//  输出借用 _VistaApScatterLutRW 的 (0, 0, slice) 一列；调用方读完重跑正式核覆盖。
+// ============================================================================
+[numthreads(64, 1, 1)]
+void AerialPerspectiveRoundTrip(uint3 id : SV_DispatchThreadID)
+{
+    uint depth = (uint)_VistaApSize.z;
+    if (id.x >= depth)
+        return;
+
+    float w  = (float)id.x * _VistaApSize.w;
+    float d  = VistaApSliceCoordToDistance(w);
+    float w2 = VistaApDistanceToSliceCoord(d);
+
+    // texW 也一并验：它把 w 映到纹素中心，写错会让整条深度轴偏半片
+    float texW = VistaApSliceCoordToTexW(w);
+
+    _VistaApScatterLutRW[uint3(0, 0, id.x)] = float4(
+        abs(w2 - w) * VISTA_ROUNDTRIP_SCALE,
+        d,
+        w,
+        texW);
+}
+
+// ============================================================================
+//  AP 切片分布质量测量（仅 Editor 调用）
+//
+//  这个核回答的是"32 片够不够、Power 还是 Log 更合适"，用数值而不是眼睛：
+//
+//    errCenter = |LUT[i] - truth(D(w_i))| / truth(D(w_i))
+//        切片中心处的**本地**相对误差。衡量的是**行进循环本身**：步数是否够、
+//        重写的循环是否与共享积分器 VistaIntegrateScatteredLuminance 等价。
+//        它测的是代码等价性而不是画面，所以用本地相对误差，且必须处处都小。
+//
+//    errMid    = |(LUT[i]+LUT[i+1])/2 - truth(D(w_mid))| / LUT[depth-1]
+//        切片中点处的误差。(LUT[i]+LUT[i+1])/2 正是三线性插值在该处给出的值，
+//        所以这一项衡量的是**切片分布**：够不够密、非线性布得对不对。
+//        换分布模式看这一项怎么变，才是选 Power 还是 Log 的依据。
+//
+//        分母用的是**这根柱子在最远片上的累积总量**，而不是本地参考值。理由：
+//        本地相对误差在最近的一两片必然爆掉，而且是被参数化**算术上强制**的 ——
+//        Power(k=2) 的 d ∝ w² 在 w=0 处导数为 0，第 0 片在 d=0、第 1 片在 d=33 m，
+//        而中点 w=0.5/31 对应 d=8.3 m。插值给出 0.5·L(33m)，真值约 0.25·L(33m)，
+//        于是本地误差恒为 100%，加多少切片都不会变。但那里的绝对量只有 1.3 cd/m²，
+//        而整根柱子要累积到几千 —— 画面上并不存在这个"误差"。
+//        改用柱子总量做分母后，这一项直接读作"贴到画面上的雾量错了百分之几"，
+//        阈值也就能按"平滑渐变上多少对比度会看出带状"来定，而不是拍一个比值。
+//
+//  输出借用 _VistaApTransmittanceLutRW；调用方读完重跑正式核覆盖。
+//  RGBA = errCenter、errMid、参考解灰度亮度、LUT 灰度亮度。
+//  后两个通道存的是**原始亮度**而不是切片距离：距离在 C# 侧能精确复刻
+//  （见 VistaAtmosphereSelfTest.ApDistance），而原始值不能 ——
+//  没有它，"误差 24%" 这种报告无法区分"LUT 偏高"还是"参考解偏低"，
+//  而这两者的修法完全相反。
+// ============================================================================
+TEXTURE3D(_VistaApScatterLutRead);
+
+float3 VistaApReferenceLuminance(float3 posKm, float3 rayDir, float3 sunDir, float tMax)
+{
+    VistaRaymarchSettings s = VistaDefaultRaymarchSettings();
+    s.sampleCount         = VISTA_AP_REFERENCE_STEPS;
+    s.sampleCountMax      = VISTA_AP_REFERENCE_STEPS;
+    s.variableSampleCount = false;
+    s.applyPhase          = true;
+    s.useMultiScattering  = true;
+    s.includeGroundBounce = false;
+    s.tMax                = tMax;
+    return VistaIntegrateScatteredLuminance(posKm, rayDir, sunDir, s).luminance;
+}
+
+[numthreads(64, 1, 1)]
+void AerialPerspectiveSliceError(uint3 id : SV_DispatchThreadID)
+{
+    uint depth = (uint)_VistaApSize.z;
+    if (id.x >= depth)
+        return;
+
+    // 固定测屏幕中心那一根柱子：它的视线方向最有代表性，
+    // 而且与 C# 侧解析算出的方向一致，便于对照。
+    uint2 column = uint2((uint)_VistaApSize.x / 2u, (uint)_VistaApSize.y / 2u);
+    float2 uv = ((float2)column + 0.5) / _VistaApSize.xy;
+    float3 rayDir = VistaApFroxelRayDirection(uv);
+    float3 posKm  = _VistaViewPosKm.xyz;
+    float3 sunDir = _VistaSunDirection.xyz;
+
+    float wCenter = (float)id.x * _VistaApSize.w;
+    float dCenter = VistaApSliceCoordToDistance(wCenter);
+
+    float3 lutCenter = LOAD_TEXTURE3D(_VistaApScatterLutRead, uint3(column, id.x)).rgb;
+    float3 refCenter = VistaApReferenceLuminance(posKm, rayDir, sunDir, dCenter);
+
+    float errCenter = 0.0;
+    float refC = dot(refCenter, 1.0 / 3.0);
+    float lutC = dot(lutCenter, 1.0 / 3.0);
+    if (refC > 1e-4)
+        errCenter = abs(lutC - refC) / refC;
+
+    float errMid = 0.0;
+    if (id.x + 1u < depth)
+    {
+        float wMid = ((float)id.x + 0.5) * _VistaApSize.w;
+        float dMid = VistaApSliceCoordToDistance(wMid);
+
+        float3 lutNext = LOAD_TEXTURE3D(_VistaApScatterLutRead, uint3(column, id.x + 1u)).rgb;
+        float3 interp  = 0.5 * (lutCenter + lutNext);
+        float3 refMid  = VistaApReferenceLuminance(posKm, rayDir, sunDir, dMid);
+
+        // 分母 = 这根柱子最远片上的累积量，也就是它最终会贴到画面上的雾量。
+        // 用本地参考值当分母会让最近的一两片恒定爆表（见头部注释）。
+        float3 columnFar = LOAD_TEXTURE3D(_VistaApScatterLutRead, uint3(column, depth - 1u)).rgb;
+        float  farC = max(dot(columnFar, 1.0 / 3.0), 1e-4);
+
+        errMid = abs(dot(interp, 1.0 / 3.0) - dot(refMid, 1.0 / 3.0)) / farC;
+    }
+
+    _VistaApTransmittanceLutRW[uint3(0, 0, id.x)] = float4(errCenter, errMid, refC, lutC);
+
+    // ---- 区间诊断（只一个线程写，与上面的每片数据分开放在别的行）----
+    // 上面那些百分比全部假定"两个积分器走的是同一段路、被积函数在这段路上连续"。
+    // 这两个前提破掉时，症状只是"误差百分比不对"，看不出前提破了 ——
+    // 所以它们必须单独测出来。这三组数是定位 24% 那个坑的工具，留作回归探针。
+    //
+    //   tBottom / tTop / 海拔 / up·ray：区间本身。
+    //     贴地相机的 c = dot(oc,oc) - Rb² 是在量级 4e7 上算的，fp32 在那里的间隔是 4，
+    //     曾怀疑 c 的符号是噪声、从而 VistaRaySphereIntersectNearest 返回一个 ~0.01 km
+    //     的伪根把 tMax 钳掉。实测 tBottom = -1（水平视线略朝上，不该有地面交点），
+    //     这条路被排除 —— 但它是唯一能把"区间被截"和"求积不准"分开的观测。
+    //
+    //   earthShadow @3 m / @1 km：被积函数的连续性。
+    //     VistaEarthShadow 的偏置一旦写成 +up（把遮挡球心朝采样点推近），海拔不足 10 m
+    //     的采样点会被整体判成"在星球内部"，直射项归零，于是第一片内部出现一个阶跃 ——
+    //     两套求积在阶跃两侧取节点，差出 24%。修好后这两个数必须**同为 1**。
+    //
+    //   线性探针 ref(0.02) / ref(0.04)：兜住上面两条都没抓到的情况。
+    //     20~40 m 的路径上 VistaEvaluateScatterSample 只随 r、muSun 变化，实质是常数，
+    //     所以 ref(2L) 必须 ≈ 2·ref(L)。不成立就是区间或连续性出了问题，
+    //     而不是步数不够 —— 这一条把"该查参数化"和"该加步数"彻底分开。
+    if (id.x == 0u)
+    {
+        const float3 planetCenter = float3(0.0, 0.0, 0.0);
+        float tB = VistaRaySphereIntersectNearest(posKm, rayDir, planetCenter, VISTA_BOTTOM_RADIUS);
+        float tT = VistaRaySphereIntersectNearest(posKm, rayDir, planetCenter, VISTA_TOP_RADIUS);
+        float upDotRay = dot(normalize(posKm), rayDir);
+        // 海拔换成 m 再存：km 下的值会掉进 fp16 的次正规区，读回来是 0，分不清"真为 0"
+        float altM = (length(posKm) - VISTA_BOTTOM_RADIUS) * 1000.0;
+        _VistaApTransmittanceLutRW[uint3(1, 0, 0)] = float4(tB, tT, altM, upDotRay);
+
+        float shadowNear = VistaEarthShadow(posKm + 0.003 * rayDir, sunDir);
+        float shadowFar  = VistaEarthShadow(posKm + 1.000 * rayDir, sunDir);
+        float ref1 = dot(VistaApReferenceLuminance(posKm, rayDir, sunDir, 0.02), 1.0 / 3.0);
+        float ref2 = dot(VistaApReferenceLuminance(posKm, rayDir, sunDir, 0.04), 1.0 / 3.0);
+        _VistaApTransmittanceLutRW[uint3(2, 0, 0)] = float4(shadowNear, shadowFar, ref1, ref2);
+    }
+}
+
+// ============================================================================
+//  天空环境光 SH（逐帧）
+//
+//  把 SkyView LUT 投影成 9 个 L2 球谐系数，作为整套间接光的**唯一天空入口**：
+//  漫反射环境光、体积雾的环境项、Step 4 的 PRT relight 都从这一份读，
+//  于是"天空变了但间接光没跟上"这类不一致在结构上就不可能发生。
+//
+//  ---- 为什么不用 AmbientMode.Skybox 让 Unity 自己卷积 ----
+//  Unity 那条路会把**太阳圆盘**一起卷进去。EV100=15 下圆盘约 41000 渲染单位、
+//  占球面 1.8e-5 立体角，平均贡献 ~0.74，而天空本身平均只有 ~0.1 ——
+//  环境光会偏亮约 8 倍，而且太阳一动整个场景的间接光就跟着跳。
+//  物理上圆盘的能量是 URP 那盏平行光的职责，重复计入是双计。
+//  自己投影就能把圆盘排除在外（SkyView LUT 里本来就没有圆盘），
+//  这是本模块**自建 SH 的唯一动机** —— 不是为了自己写一遍。
+//
+//  ---- 为什么按方向采样而不是按 LUT 纹素累加 ----
+//  见 SphericalHarmonics.hlsl 里 VistaFibonacciSphereDir 的注释：
+//  那张表的 uv 故意把纹素堆在地平线，按纹素累加等于按非均匀密度加权。
+//
+//  ---- 为什么是 L2 而不是 L1 ----
+//  日落时天空是"天顶暗 + 日侧地平线一圈橙 + 背侧蓝紫"。L1 只能表达一个方向的偶极，
+//  会把那一圈压成单侧染色，暗部的冷蓝完全丢掉 —— 而"暗部偏冷、亮部偏暖"正是
+//  这套画面最主要的观感来源。L2 的九个系数能留住地平线环带那一项（Y20）。
+//  代价是 9 个系数而不是 4 个，以及 shader 里多两行 —— 与画面收益不成比例地小。
+//  UE 的 SkyLight 与 HDRP 的 ambient probe 也都是 L2，这是主流形态。
+// ============================================================================
+
+#define VISTA_SKY_SH_THREADS 64u
+
+// 1024 个方向。SH9 只能表达到二阶，被积函数（天空）本身又极平滑，
+// 所以采样数远早于 LUT 分辨率就收敛了 —— 加到 4096 对系数的影响在 0.1% 以下。
+// 取 1024 而不是 256：日落时地平线那一圈的角宽只有几度，L2 的 Y20 项对它敏感，
+// 256 个方向在地平线上只落 ~10 个样本，帧间抖动会让环境光轻微闪。
+#define VISTA_SKY_SH_SAMPLES 1024u
+
+RWStructuredBuffer<float4> _VistaSkyAmbientShRW;
+
+groupshared float3 gs_SkySh[VISTA_SKY_SH_THREADS][VISTA_SH_COEFF_COUNT];
+
+// 一个线程组搞定整张 SH：dispatch(1, 1, 1)。
+// 9 个系数的归约用不着跨组通信，而跨组就得再开一张中间 buffer + 第二个 pass。
+[numthreads(64, 1, 1)]
+void SkyAmbientSh(uint3 groupThreadId : SV_GroupThreadID)
+{
+    uint tid = groupThreadId.x;
+
+    float3 posKm  = _VistaViewPosKm.xyz;
+    float3 sunDir = _VistaSunDirection.xyz;
+
+    float3 acc[VISTA_SH_COEFF_COUNT];
+    [unroll]
+    for (uint c0 = 0u; c0 < VISTA_SH_COEFF_COUNT; ++c0)
+        acc[c0] = 0.0;
+
+    // 跨步循环（tid, tid+64, tid+128, …）而不是每线程一段连续区间：
+    // Fibonacci 螺旋的相邻样本在球面上是相邻的，连续分段会让同一 warp 里的
+    // 64 个线程去采 LUT 上彼此很远的纹素；跨步则让一个 warp 的 64 个样本
+    // 落在螺旋上相隔均匀的位置，纹理 cache 命中反而更差 —— 但这里真正的理由是
+    // **数值**：跨步让每个线程的部分和都是全球面的一个均匀子集，量级相近，
+    // 归约时不会出现"一个很大的和加一个很小的和"的有效位损失。
+    for (uint s = tid; s < VISTA_SKY_SH_SAMPLES; s += VISTA_SKY_SH_THREADS)
+    {
+        float3 dir = VistaFibonacciSphereDir(s, VISTA_SKY_SH_SAMPLES);
+
+        // dir 同时作为世界空间视线方向喂给 LUT、作为世界空间方向喂给 SH 基，
+        // 所以产出的 SH 就在**世界空间**里 —— 这正是 RenderSettings.ambientProbe
+        // 与 unity_SHAr 期待的坐标系，不需要任何换基。
+        float3 L = VistaSampleSkyViewLut(posKm, dir, sunDir);
+
+        float y[VISTA_SH_COEFF_COUNT];
+        VistaShBasis(dir, y);
+
+        [unroll]
+        for (uint c1 = 0u; c1 < VISTA_SH_COEFF_COUNT; ++c1)
+            acc[c1] += L * y[c1];
+    }
+
+    [unroll]
+    for (uint c2 = 0u; c2 < VISTA_SH_COEFF_COUNT; ++c2)
+        gs_SkySh[tid][c2] = acc[c2];
+
+    GroupMemoryBarrierWithGroupSync();
+    [unroll]
+    for (uint stride = VISTA_SKY_SH_THREADS / 2u; stride > 0u; stride >>= 1u)
+    {
+        if (tid < stride)
+        {
+            [unroll]
+            for (uint c3 = 0u; c3 < VISTA_SH_COEFF_COUNT; ++c3)
+                gs_SkySh[tid][c3] += gs_SkySh[tid + stride][c3];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (tid > 0u)
+        return;
+
+    // 蒙特卡洛估计 ∫L·Y_i dω ≈ (4π/N)·Σ L·Y_i（均匀球面采样，pdf = 1/4π）。
+    // 存的是**原始辐射亮度矩**，不折余弦瓣 —— 理由见 SphericalHarmonics.hlsl 头部。
+    float weight = 4.0 * PI / (float)VISTA_SKY_SH_SAMPLES;
+    [unroll]
+    for (uint c4 = 0u; c4 < VISTA_SH_COEFF_COUNT; ++c4)
+        _VistaSkyAmbientShRW[c4] = float4(gs_SkySh[0][c4] * weight, 0.0);
+}
+
+// ============================================================================
+//  天空环境光 SH 的参考解（仅 Editor 自检调用）
+//
+//  这是本模块唯一的**实质性**正确性判据。上游那些"系数有限、非负"的检查只能拦住
+//  彻底写坏的情况；真正会发生的错误是**缩放错了**（少乘一个 4π、少乘 Â_l、
+//  基函数常数抄错一个数量级），而缩放错的症状是"环境光整体亮/暗几倍"——
+//  在任何单一场景里都像是美术没调好，看图永远发现不了。
+//
+//  所以直接测那条定义式：把 SH 重建出的辐照度与**从 LUT 数值积分出来的**
+//      (1/π)·∫L(ω)·max(0, n·ω)dω
+//  在若干法线上比。两边共用 SkyView LUT 作为 L 的来源，所以这一项测的纯粹是
+//  "投影 + 重建"这条链路，与大气本身对不对无关（那个由 Task #1~#4 的自检负责）。
+//
+//  输出自描述：每个法线连写三条（法线、参考值、SH 重建值），
+//  C# 侧因此完全不需要知道用了哪些法线 —— 少一份必然会写歧的镜像常量。
+// ============================================================================
+
+// 4096：参考解必须比被测对象精确得多，否则测出来的是参考解自己的噪声。
+// 相对 1024 提高 4 倍样本 -> 蒙特卡洛标准差降一半，而余弦加权积分比 SH 矩更平滑，
+// 实际收敛得更快。
+#define VISTA_SKY_SH_REF_SAMPLES 4096u
+#define VISTA_SKY_SH_REF_NORMALS 8u
+// 最后再多两个组算"全天球平均亮度"。这一项的价值在于它**不含 L2 截断误差**：
+//   mean_n[(1/π)∫L·max(0,n·ω)dω] = (1/π)·∫L·mean_n[max(0,n·ω)]dω
+//                                = (1/π)·∫L·(1/4)dω = (1/4π)·∫L dω
+// 而 SH 侧同一个量恰好就是 L_00·Y00（一阶以上在整球上均值为 0）。
+// 于是这条等式与"L2 能不能表达这个天空"完全无关，只取决于 4π/N 权重、Ŷ_0、Â_0。
+// 逐法线那些数字在日落时的偏差是 L2 截断（物理上不可避免），不能当判据用。
+//
+// 为什么要**两个**均值组：
+//   组 N  用 4096 样本 —— 精度参考，与被测对象采样数不同。
+//   组 N+1 用 VISTA_SKY_SH_SAMPLES（与 SH 投影**完全相同**的方向集）。
+// 只有后者才让上面那条等式在有限样本下也精确成立（两边逐项对应，只差归约顺序）。
+// 用 4096 那份去卡紧阈值实测差 2.75%（日落，红通道）—— 那不是 bug，
+// 是 1024 与 4096 在"地平线几度宽的高对比亮带"上的求积差异。
+// 两者分开之后：前者是**正确性**判据（紧），后者是**收敛性**度量（松，且正是
+// Task #7 决定 VISTA_SKY_SH_SAMPLES 分级时要看的那个数）。
+#define VISTA_SKY_SH_REF_MEANS  2u
+#define VISTA_SKY_SH_REF_GROUPS (VISTA_SKY_SH_REF_NORMALS + VISTA_SKY_SH_REF_MEANS)
+
+RWStructuredBuffer<float4> _VistaSkyAmbientShRefRW;
+
+groupshared float3 gs_SkyShRef[VISTA_SKY_SH_THREADS];
+
+// 测试法线。从太阳方向导出而不是写死八个常量，这样一次扫描（正午/日落/夜）
+// 就自动覆盖"朝阳面 / 背阴面 / 天顶 / 地面"这几个物理上最容易出错的方位 ——
+// 日落时朝阳面与背阴面的辐照度能差一个数量级，正是 L2 该被考验的地方。
+float3 VistaSkyShTestNormal(uint index, float3 sunDir)
+{
+    const float3 up = float3(0.0, 1.0, 0.0);
+
+    float3 sunH   = sunDir - up * dot(sunDir, up);
+    float  sunHLen = length(sunH);
+    // 太阳正当顶时水平分量退化，取任意水平方向即可（此时天空绕 up 近似对称）
+    sunH = (sunHLen > 1e-4) ? (sunH / sunHLen) : float3(1.0, 0.0, 0.0);
+    float3 side = cross(up, sunH);
+
+    switch (index)
+    {
+        case 0u: return up;                          // 天顶：只吃上半球
+        case 1u: return -up;                         // 朝下：只吃地面反弹，最容易被写成 0
+        case 2u: return sunH;                        // 正对太阳的立面
+        case 3u: return -sunH;                       // 背阴立面
+        case 4u: return normalize(up + sunH);        // 45° 朝阳斜面
+        case 5u: return normalize(up - sunH);        // 45° 背阴斜面
+        case 6u: return side;                        // 侧向立面（方位中性）
+        default: return normalize(up * 2.0 + side);  // 一个通用方向，九个基全非零
+    }
+}
+
+// 一个线程组一个法线：dispatch(VISTA_SKY_SH_REF_GROUPS, 1, 1)。
+// 最后两组（ni >= VISTA_SKY_SH_REF_NORMALS）算的是全天球平均亮度，不是某个法线。
+[numthreads(64, 1, 1)]
+void SkyAmbientShReference(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
+{
+    uint tid = groupThreadId.x;
+    uint ni  = groupId.x;
+
+    float3 posKm  = _VistaViewPosKm.xyz;
+    float3 sunDir = _VistaSunDirection.xyz;
+
+    bool isMean = (ni >= VISTA_SKY_SH_REF_NORMALS);
+    // 均值组没有法线。写 0 而不是随便挑一个方向：C# 侧靠"法线为零向量"识别这些行，
+    // 挑个真方向就得在两边各维护一份"第几行是均值"的约定。
+    float3 n    = isMean ? float3(0.0, 0.0, 0.0) : VistaSkyShTestNormal(ni, sunDir);
+
+    // 第一个均值组用高样本数（精度参考），第二个用与 SH 投影完全一致的方向集
+    // （让均值恒等式在有限样本下也精确成立）。
+    uint sampleCount = VISTA_SKY_SH_REF_SAMPLES;
+    if (isMean && (ni - VISTA_SKY_SH_REF_NORMALS) == 1u)
+        sampleCount = VISTA_SKY_SH_SAMPLES;
+
+    float3 acc = 0.0;
+    for (uint s = tid; s < sampleCount; s += VISTA_SKY_SH_THREADS)
+    {
+        float3 dir = VistaFibonacciSphereDir(s, sampleCount);
+        if (isMean)
+        {
+            acc += VistaSampleSkyViewLut(posKm, dir, sunDir);
+            continue;
+        }
+        float cosine = dot(n, dir);
+        if (cosine <= 0.0)
+            continue;   // 下半球对这个法线无贡献，省掉一次 LUT 采样
+        acc += VistaSampleSkyViewLut(posKm, dir, sunDir) * cosine;
+    }
+
+    gs_SkyShRef[tid] = acc;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll]
+    for (uint stride = VISTA_SKY_SH_THREADS / 2u; stride > 0u; stride >>= 1u)
+    {
+        if (tid < stride)
+            gs_SkyShRef[tid] += gs_SkyShRef[tid + stride];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (tid > 0u)
+        return;
+
+    float3 sh[VISTA_SH_COEFF_COUNT];
+    VistaLoadSkyAmbientSh(sh);
+
+    // 均值：(1/4π)·∫L dω ≈ (1/4π)·(4π/N)·Σ = Σ/N。
+    // 逐法线：(1/π)·∫L·max(0, n·ω)dω ≈ (1/π)·(4π/N)·Σ = (4/N)·Σ。
+    // 后者除以 π 是为了与 Unity Evaluate 的语义对齐（albedo=1 的出射亮度），
+    // 见 VistaAmbientShSelfTest.ProbeUnityConvention。
+    float  scale = (isMean ? 1.0 : 4.0) / (float)sampleCount;
+    float3 refValue = gs_SkyShRef[0] * scale;
+    float3 shValue  = isMean ? VistaShAmbientMean(sh) : VistaShIrradiance(sh, n);
+
+    _VistaSkyAmbientShRefRW[ni * 3u + 0u] = float4(n, 0.0);
+    _VistaSkyAmbientShRefRW[ni * 3u + 1u] = float4(refValue, 0.0);
+    _VistaSkyAmbientShRefRW[ni * 3u + 2u] = float4(shValue, 0.0);
+}
