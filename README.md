@@ -4,15 +4,15 @@
 
 ## 归属声明
 
-本 package 内所有代码由 kkiej 编写。参考实现与论文见各模块目录下的 `NOTES.md` 与
-仓库根目录的 `CHANGELOG.md`；参考但未复制代码的项目：
-Unity HDRP `PhysicallyBasedSky`、`IllusionRP`（阅读参考，未引入）。
+本 package 内所有代码由 kkiej 编写。每个取舍的理由、参考的论文、以及踩过的坑
+都记在仓库根目录的 [CHANGELOG.md](CHANGELOG.md) 里；参考但**未复制代码**的项目：
+Unity HDRP `PhysicallyBasedSky`、`IllusionRP`（阅读参考，未引入工程）。
 
 ## 模块
 
 | 模块 | 状态 | 主要参考 |
 |---|---|---|
-| Atmosphere（物理大气散射 LUT） | 规划中 | Hillaire, EGSR 2020 |
+| Atmosphere（物理大气散射 LUT） | **可用** | Hillaire, EGSR 2020 |
 | TimeOfDay（时间轴驱动系统） | 规划中 | — |
 | VolumetricFog（froxel 体积雾 + 光轴） | 规划中 | Wronski 2014 / Hillaire 2016 |
 | GlobalIllumination（PRT probe GI） | 规划中 | Sloan et al. 2002 |
@@ -20,6 +20,44 @@ Unity HDRP `PhysicallyBasedSky`、`IllusionRP`（阅读参考，未引入）。
 | Terrain（height-blend 地形材质） | 规划中 | Mishkinis |
 | Water（Gerstner 波） | 规划中 | — |
 | Weather（潮湿系统） | 规划中 | — |
+
+## Atmosphere
+
+Hillaire 2020 的四表结构，加两条给 URP 供光的链路，共七个 RenderGraph pass
+（稳态五个 —— 两张静态表只在参数变化时重算）：
+
+| pass | 产出 | 规格 | 频率 |
+|---|---|---|---|
+| Transmittance | 视线透过率 | 256×64 | 静态 |
+| Multi-Scattering | 多次散射项 | 32×32 | 静态 |
+| Sky-View | 天顶方向天空亮度 | 192×108 | 每帧 |
+| Sky Ambient SH | L2 环境光探针 | SH9 buffer | 每帧 |
+| Sky Reflection (+Copy) | 镜面反射 cubemap | 64²×7 mip | 每帧 |
+| Aerial Perspective | 空气透视 froxel | 32³ | 每帧 |
+
+工作单位是**绝对光度单位**，全链路只有一处曝光换算（`EV100 = 15`）。
+环境光 SH 与反射 cubemap 直接接 Unity 的 `SphericalHarmonicsL2` /
+`RenderSettings.customReflectionTexture`，**不改任何材质 shader** 即可让
+URP 的 Lit 走这套天空照明。
+
+### 验收
+
+数值正确性由 GPU 侧判据 + Editor 菜单驱动，判据一律写在 compute 里，
+C# 只负责摆参数、读回、判阈值。`Window/Vista/` 下三个 `Validate`（LUT / 环境光 SH /
+天空反射）判数学，两个 `Log ... State` 判运行期链路有没有真的接通 ——
+立即模式全绿而运行期没接通是完全可能的，只看自检报告看不出来。
+判据的设计理由与实测数据在 [CHANGELOG.md](CHANGELOG.md)。
+
+耗时（RTX 3060 / D3D11 / **Editor 立即模式摊销计时**，非帧内延迟）：
+
+```
+稳态五 pass 整链  0.494 ms（±3%）　目标 0.300 ms　→ 未达标
+  其中 Sky Reflection  0.391 ms（79%）
+  「只绑不派」对照      0.000 ms　→ 开销 100% 在 GPU 积分侧，不在命令提交侧
+```
+
+反射 pass 超预算的归因（逐 mip dispatch 形状）尚未完成，见 CHANGELOG 的待办。
+这里刻意报未达标的数字：这套计时器的用途是当回归基线，不是出宣传数据。
 
 ## 安装
 
@@ -36,7 +74,6 @@ Runtime/            C# 运行时（Vista.Runtime.asmdef）
 Editor/             C# 编辑器工具（Vista.Editor.asmdef）
 Shaders/            .shader / .compute
 ShaderLibrary/      跨模块共享的 .hlsl
-Documentation~/     不被 Unity 导入的文档（波浪号后缀）
 ```
 
 Shader 引用统一由 `Runtime/Core/VistaRuntimeResources.cs` 通过 `ResourcePath` 声明，
@@ -45,5 +82,5 @@ Shader 引用统一由 `Runtime/Core/VistaRuntimeResources.cs` 通过 `ResourceP
 HLSL 引用路径示例：
 
 ```hlsl
-#include "Packages/com.kkiej.vista/ShaderLibrary/Atmosphere.hlsl"
+#include "Packages/com.kkiej.vista/ShaderLibrary/AtmosphereScattering.hlsl"
 ```
