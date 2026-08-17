@@ -9,11 +9,17 @@ namespace Vista.Editor
     /// 天空镜面反射 cubemap 的自检。
     ///
     /// 与 <see cref="VistaAmbientShSelfTest"/> 分开一个文件的理由与那边分出来时相同：
-    /// 失败原因不重叠。SH 那边验的是「投影 + Unity 的 SH 约定」，这边验三件事 ——
+    /// 失败原因不重叠。SH 那边验的是「投影 + Unity 的 SH 约定」，这边验四件事 ——
     /// 逐面方向约定（含 CopyTexture 的 element→CubemapFace 映射）、跨模块的尺度一致性、
-    /// 以及 mip↔粗糙度这条与 URP 采样端的接口。
+    /// mip↔粗糙度这条与 URP 采样端的接口、以及 wide 滤波核的归约与布线。
     ///
-    /// 三条判据全部在 GPU 上算（见 SkyReflection.compute 的 SkyReflectionVerify），
+    /// 判据 4（wide 核）是**事后补的**，值得记下来：mip1~6 从 narrow 核换成 wide 核
+    /// （一组一纹素、64 条 lane 分摊样本、组内归约）之后，前三条判据全绿且数字逐位不变，
+    /// 因为它们统统采 <c>LOD 0.0</c> —— 也就是只覆盖了没动过的那个核。
+    /// 「改了一条没被任何判据覆盖的路径，而自检仍然全绿」是这类工程里最贵的一种假通过，
+    /// 所以判据 4 拆成两条互不重叠的：4a 只验算术（不碰纹理），4b 只验布线（走硬件采样）。
+    ///
+    /// 四条判据全部在 GPU 上算（见 SkyReflection.compute 的 SkyReflectionVerify），
     /// 这里只负责摆参数、读回、判阈值、把数字排成一份能贴进 CHANGELOG 的报告。
     /// C# 侧刻意**不重算**任何一条判据：重算就得再抄一遍 mip 映射与面方向约定，
     /// 而抄错的那一份会与 shader 里那份走歧 —— 那时自检报的偏差既不是 0
@@ -161,6 +167,30 @@ namespace Vista.Editor
         /// <summary>亮度下限。夜间整张天空都趋 0，相对误差没有意义。</summary>
         const float k_RadianceFloor = 1e-4f;
 
+        /// <summary>
+        /// 判据 4a（wide 核归约等价性）的阈值。两条路径算的是**同一批项**
+        /// （Hammersley2d(i, K) 只依赖 i 与 K，两种切法下 i 的并集恒为 {0…K−1}），
+        /// 全程 fp32、不经纹理存储 —— 所以差别只可能来自浮点求和顺序，
+        /// 量级 n·eps ≈ 256 × 6e-8 ≈ 1.5e-5。
+        ///
+        /// 1e-3 留两个数量级余量，同时仍然远小于任何真正的归约错：
+        /// 少归约一层是 −50%，归一化放在归约之前是几个百分点到几十个百分点，
+        /// 分摊的起点/步长写错是整数倍偏差。它们都不可能挤进 1e-3。
+        /// </summary>
+        const float k_WideReduceTolerance = 1e-3f;
+
+        /// <summary>
+        /// 判据 4b（wide mip 的 round-trip）的阈值。与 <see cref="k_FaceTolerance"/> 同一档，
+        /// 理由也相同：取样点落在 16² 面的内部纹素中心（stride 4 / offset 2），
+        /// 整数 LOD 不做 mip 间插值，双线性权重塌成 1 —— 残余只有 cube 的 fp16 量化
+        /// （相对 ~1e-3）与两条路径的求和顺序（~1e-5）。
+        ///
+        /// 不放到 5%：这条判据的价值在于抓 groupId → (纹素, 面) 的映射错，
+        /// 而映射错在天空这种大范围平滑内容上**未必**产生大偏差 —— 相邻纹素错位
+        /// 只差 1.4°，正午天空上可能只差百分之几。阈值一松就正好放过它。
+        /// </summary>
+        const float k_WideRoundTripTolerance = 0.01f;
+
         static bool Validate(StringBuilder sb)
         {
             sb.AppendLine("── 反射 cubemap round-trip");
@@ -304,6 +334,71 @@ namespace Vista.Editor
               .Append("／阈 ").Append(meanTolerance.ToString("P1")).Append(' ').Append(Mark(okMean))
               .Append("　跨模块（#5a 恒等式）").Append(crossErr.ToString("E2")).Append(' ').Append(Mark(okCross))
               .AppendLine();
+
+            // ---- 判据 4a：wide 核归约等价性（算术判据）----
+            // 为什么这条是补上来的：判据 1 与判据 2 都采 LOD 0，全落在 narrow 核上。
+            // mip1~6 换成 wide 核之后自检照样全绿、数字**逐位不变** —— 因为对新路径零覆盖。
+            // 「改了一条没被任何判据覆盖的代码，而自检仍然全绿」是最贵的一种假通过。
+            float wideWorst = 0f, wideWorstW = 0f;
+            int wideWorstMip = -1, wideMissing = 0, boundaryBad = 0;
+            sb.Append("　 ").Append(label).Append("　wide 归约 |分摊 − 顺序|");
+            for (int m = 1; m < VistaAtmosphereLuts.k_SkyReflectionMipCount; ++m)
+            {
+                Vector4 row = rows[VistaAtmosphereLuts.k_ReflVerifyRowWide + m];
+                int   K       = Mathf.RoundToInt(row.x);
+                float errCol  = row.y;
+                float errW    = row.z;
+                bool  ran     = row.w > 0.5f;
+
+                if (!ran) { wideMissing++; }
+                if (errCol > wideWorst) { wideWorst = errCol; wideWorstMip = m; }
+                wideWorstW = Mathf.Max(wideWorstW, errW);
+
+                // K 的对账：运行时的形状分界写成 mip 序号（`!useSh && mip >= 2`），
+                // 没有在 C# 里重抄一份 VistaSkyReflectionSampleCount。那个 2 与
+                // HLSL 里那个函数是**隐式**绑着的，这一行把它变成会红的判据 ——
+                // K 的定义一改而分界没跟上，症状是某一级性能悄悄退化（不是错图），
+                // 那种回归没人会在画面上发现。
+                bool wantWide = K >= VistaAtmosphereLuts.k_SkyReflectionWideThreshold;
+                if (wantWide != (m >= 2)) boundaryBad++;
+
+                sb.Append("　").Append(m).Append("(K").Append(K).Append(") ")
+                  .Append(errCol.ToString("E1"));
+            }
+            sb.AppendLine();
+
+            bool okWide = wideWorst < k_WideReduceTolerance
+                          && wideWorstW < k_WideReduceTolerance
+                          && wideMissing == 0
+                          && boundaryBad == 0;
+            ok &= okWide;
+            sb.Append("　　 判定：颜色最大 ").Append(wideWorst.ToString("E2"))
+              .Append("（mip ").Append(wideWorstMip < 0 ? "-" : wideWorstMip.ToString()).Append("）")
+              .Append("　权重最大 ").Append(wideWorstW.ToString("E2"))
+              .Append("／阈 ").Append(k_WideReduceTolerance.ToString("E0"))
+              .Append("　未跑 ").Append(wideMissing)
+              .Append("　K↔分界 ").Append(boundaryBad == 0 ? "一致" : "**" + boundaryBad + " 级不一致**")
+              .Append(' ').Append(Mark(okWide)).AppendLine();
+
+            // ---- 判据 4b：wide 核产出的 mip 走硬件采样 round-trip（布线判据）----
+            // 4a 只验算术，这条验"算对了的值有没有落到该落的地方"：
+            // groupId → (纹素, 面) 的映射、UAV 写、逐面 CopyTexture。
+            Vector4 rt = rows[VistaAtmosphereLuts.k_ReflVerifyRowWideRt];
+            float rtErr = rt.x;
+            int rtCnt = Mathf.RoundToInt(rt.y), rtTotal = Mathf.RoundToInt(rt.z);
+            int rtMip = Mathf.RoundToInt(rt.w);
+
+            // 先判点数再判误差。夜间整张天空在亮度地板以下时 cnt 会是 0，
+            // 而"0 个点、最大误差 0.0、通过"正是我在计时器里刚清掉的那种假通过：
+            // 判据必须先否掉退化输入，再谈偏差。
+            bool rtUsable = rtCnt > 0 && rtMip == VistaAtmosphereLuts.k_ReflVerifyWideMip;
+            bool okRt = rtUsable && rtErr < k_WideRoundTripTolerance;
+            ok &= okRt;
+            sb.Append("　　 wide mip").Append(rtMip).Append(" round-trip　最大 ")
+              .Append(rtUsable ? rtErr.ToString("P2") : "不可判定")
+              .Append("／阈 ").Append(k_WideRoundTripTolerance.ToString("P0"))
+              .Append("　有效点 ").Append(rtCnt).Append('/').Append(rtTotal)
+              .Append(' ').Append(Mark(okRt)).AppendLine();
 
             if (!checkConstants)
                 return ok;

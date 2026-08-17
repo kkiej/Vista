@@ -95,15 +95,32 @@ namespace Vista
         /// <summary>
         /// 自检输出的行布局，与 compute 里的 <c>VISTA_SKY_REFL_ROW_*</c> 一一对应。
         /// 0..5 逐面误差，6/7/8 = cube / LUT / SH 的整球均值，9..15 逐 mip 的
-        /// 粗糙度 round-trip，16 = HLSL 侧常量导出。
+        /// 粗糙度 round-trip，16 = HLSL 侧常量导出，17..23 = wide 核归约等价性（判据 4a，
+        /// 下标 = mip，mip0 那行不参与），24 = wide mip 的 round-trip（判据 4b）。
         /// </summary>
         public const int k_ReflVerifyRowFace  = 0;
         public const int k_ReflVerifyRowMean  = 6;
         public const int k_ReflVerifyRowMip   = 9;
         public const int k_ReflVerifyRowConst = k_ReflVerifyRowMip + k_SkyReflectionMipCount;
-        public const int k_ReflVerifyElementCount = k_ReflVerifyRowConst + 1;
-        /// <summary>逐面 6 组 + 均值 1 组 + mip 映射 1 组。与 <c>VISTA_SKY_REFL_VERIFY_GROUPS</c> 一致。</summary>
-        public const int k_ReflVerifyGroupCount = 8;
+        public const int k_ReflVerifyRowWide   = k_ReflVerifyRowConst + 1;
+        public const int k_ReflVerifyRowWideRt = k_ReflVerifyRowWide + k_SkyReflectionMipCount;
+        public const int k_ReflVerifyElementCount = k_ReflVerifyRowWideRt + 1;
+        /// <summary>
+        /// 逐面 6 组 + 均值 1 组 + mip 映射 1 组 + wide 核 1 组。
+        /// 与 <c>VISTA_SKY_REFL_VERIFY_GROUPS</c> 一致。
+        /// </summary>
+        public const int k_ReflVerifyGroupCount = 9;
+
+        /// <summary>
+        /// 判据 4a 里"K ≥ 多少才值得走 wide 核"的门槛，也就是 wide 核的线程数。
+        /// 与 <c>VISTA_SKY_REFL_WIDE_THREADS</c> 一致。
+        /// <see cref="RenderSkyReflection{T}"/> 的分界写成 mip 序号（不重算 K），
+        /// 自检拿 HLSL 导出的 K 与这个门槛对账，把那个隐式绑定变成会红的判据。
+        /// </summary>
+        public const int k_SkyReflectionWideThreshold = 64;
+
+        /// <summary>判据 4b 取样的 mip。与 <c>VISTA_SKY_REFL_VERIFY_WIDE_MIP</c> 一致。</summary>
+        public const int k_ReflVerifyWideMip = 2;
 
         const string k_KernelTransmittance    = "TransmittanceLut";
         const string k_KernelMultiScattering  = "MultiScatteringLut";
@@ -115,6 +132,7 @@ namespace Vista
         const string k_KernelSkyAmbientSh     = "SkyAmbientSh";
         const string k_KernelSkyAmbientShRef  = "SkyAmbientShReference";
         const string k_KernelSkyReflection       = "SkyReflectionFilter";
+        const string k_KernelSkyReflectionWide   = "SkyReflectionFilterWide";
         const string k_KernelSkyReflectionVerify = "SkyReflectionVerify";
 
         RTHandle m_Transmittance;
@@ -148,6 +166,7 @@ namespace Vista
         // 都吃一个 ComputeShader 参数，所以多一份 CS 不需要改接口。
         readonly ComputeShader m_ReflectionCS;
         readonly int m_KernelSkyReflectionIdx       = -1;
+        readonly int m_KernelSkyReflectionWideIdx   = -1;
         readonly int m_KernelSkyReflectionVerifyIdx = -1;
 
         /// <summary>上一次成功烘出静态表时使用的参数副本，用于脏检查。</summary>
@@ -231,8 +250,15 @@ namespace Vista
         /// 这个核挂了，天空、AP、漫反射间接光全都还是对的，只是镜面反射回落到
         /// 场景自带的反射探针（通常是一张静态天空盒），表现为"金属材质不跟着时间变"。
         /// 把它并进 <see cref="isValid"/> 会让"反射核编译失败"表现为"整个天空黑掉"。
+        ///
+        /// **两个滤波核都必须在**，不是"有一个就降级跑"。narrow 核只产 mip0，
+        /// 缺了 wide 核会让 mip1~6 完全没被写过 —— 采样端按粗糙度取到那几级时读到的是
+        /// 未初始化内容（黑或上一帧残留），比干脆回落到场景探针**更糟**：
+        /// 前者是随机的错，后者是可解释的、美术能自己看出来的错。
         /// </summary>
-        public bool isSkyReflectionValid => m_ReflectionCS != null && m_KernelSkyReflectionIdx >= 0;
+        public bool isSkyReflectionValid => m_ReflectionCS != null
+                                            && m_KernelSkyReflectionIdx >= 0
+                                            && m_KernelSkyReflectionWideIdx >= 0;
 
         /// <param name="reflectionCS">
         /// 镜面反射预滤波核。可选 —— 只用大气 LUT 的调用方（LUT 预览窗口、大气数值自检）
@@ -245,6 +271,8 @@ namespace Vista
             {
                 if (m_ReflectionCS.HasKernel(k_KernelSkyReflection))
                     m_KernelSkyReflectionIdx = m_ReflectionCS.FindKernel(k_KernelSkyReflection);
+                if (m_ReflectionCS.HasKernel(k_KernelSkyReflectionWide))
+                    m_KernelSkyReflectionWideIdx = m_ReflectionCS.FindKernel(k_KernelSkyReflectionWide);
                 if (m_ReflectionCS.HasKernel(k_KernelSkyReflectionVerify))
                     m_KernelSkyReflectionVerifyIdx = m_ReflectionCS.FindKernel(k_KernelSkyReflectionVerify);
             }
@@ -575,16 +603,26 @@ namespace Vista
         /// 顺带把原来那个 <c>bindsOnly</c> 收成了本掩码的 <c>0</c> 这一个取值 ——
         /// 两个正交开关退化成一个，少一处组合状态要维护。
         ///
-        /// 为什么需要它：实测这个 pass 占稳态链路的 79%（0.391 ms），而
+        /// 为什么需要它：这个 pass 原先占稳态链路的 79%（0.391 ms），而
         /// <c>mipMask: 0</c> 量到 0.000 ms —— 也就是说开销 100% 在 GPU 积分侧。
         /// 我原先猜是 CPU 侧命令重放（7 次 SetTextureMip 意味着逐 mip 建 UAV view），
-        /// 这个诊断把那个假设否掉了。剩下的问题是「哪几级 mip 吃掉了这 0.391 ms」，
-        /// 而按 dispatch 形状推是不够的：粗 mip 的线程组数掉到 1（只占 28 个 SM 里的 6 个）
-        /// 且 K 涨到 256 次**串行相关**的 LUT 取样，两个方向的效应叠在一起，
-        /// 谁主导只能量。位掩码而不是单个 mip 序号，是因为归因需要两种口径 ——
+        /// 这个诊断把那个假设否掉了。位掩码而不是单个 mip 序号，是因为归因需要两种口径 ——
         /// 单级隔离（<c>1 &lt;&lt; m</c>）与前缀累积（<c>(1 &lt;&lt; m+1) - 1</c>）——
         /// 前者干净但每次重复都打同一级，后者每次重复是真实的混合序列且
-        /// 满掩码那一档必须回到 0.391 ms（一条自洽校验）。一个掩码把两种都表达了。
+        /// 满掩码那一档必须回到整 pass 的耗时（一条自洽校验）。一个掩码把两种都表达了。
+        ///
+        /// 归因结论（RTX 3060 / D3D11，逐级隔离，min of 5×200）：mip3~6 合计 0.351 ms，
+        /// 占 85%，而它们只产出 510/32766 个纹素（1.6%）；吞吐从 mip0 的 2.96 降到
+        /// mip6 的 0.02 G样本/s，每次循环迭代暴露 295 ns —— 一次纹理取样的延迟，
+        /// 完全没被隐藏。**病因是占用率，不是取样总量。** 逐级隔离之和 0.413 ms
+        /// 与满掩码 0.414 ms 几乎相等，说明 7 趟 dispatch 之间没有重叠。
+        /// 修法见下面的形状分界注释（引入 wide 核）。
+        ///
+        /// 引用口径：改完之后**反射单 pass 的数字不可引用** —— 三次复测给出
+        /// 0.095（±37%）／0.101（±5%）／0.076（±132%），已经掉到这台机器的噪声地板下面。
+        /// 可引用的是整链：稳态五 pass 从 0.494 ms（±3%）降到 0.170~0.198 ms（±2~4%）。
+        /// 逐级 iso 现在只能读**占比**，不能读绝对值（多数级都带 ⚠）。
+        /// 这个旋钮留着当回归工具：形状再改一次，同一份报告能立刻说出改到了哪几级。
         ///
         /// 用默认参数而不是复制一份诊断专用的方法：那两份的绑定序列必须永远一致，
         /// 而复制体一旦漏跟一次改动，诊断给出的分解就是错的 ——
@@ -606,14 +644,21 @@ namespace Vista
             view.Bind(d, m_SkyViewWidth, m_SkyViewHeight);
 
             bool useSh = mode == VistaSkyReflectionMode.AmbientSh;
+            // 两个 kernel 各绑一次。辐射来源的绑定是 per-kernel 状态，不是全局 ——
+            // 只绑 narrow 那一个，wide 核读到的会是未绑定资源（D3D11 返回 0，
+            // D3D12/Vulkan 未定义），症状是 mip1~6 全黑而 mip0 正常。
             if (useSh)
             {
                 d.SetBuffer(m_ReflectionCS, m_KernelSkyReflectionIdx,
+                    VistaShaderIDs._VistaSkyAmbientSh, VistaLutBufferSlot.SkyAmbientSh);
+                d.SetBuffer(m_ReflectionCS, m_KernelSkyReflectionWideIdx,
                     VistaShaderIDs._VistaSkyAmbientSh, VistaLutBufferSlot.SkyAmbientSh);
             }
             else
             {
                 d.SetTexture(m_ReflectionCS, m_KernelSkyReflectionIdx,
+                    VistaShaderIDs._VistaSkyViewLut, VistaLutSlot.SkyView);
+                d.SetTexture(m_ReflectionCS, m_KernelSkyReflectionWideIdx,
                     VistaShaderIDs._VistaSkyViewLut, VistaLutSlot.SkyView);
             }
 
@@ -622,6 +667,40 @@ namespace Vista
             for (int mip = 0; mip < k_SkyReflectionMipCount; ++mip)
             {
                 int size = k_SkyReflectionSize >> mip;
+
+                // ---- 形状分界：K ≥ 64 才走 wide ----
+                // 门槛的含义是"64 条 lane 每条至少分到一个样本、没有空转"。
+                // LUT 模式下 K = min(256, 16 << mip)，于是 mip2 起满足（64/128/256/256/256）；
+                // mip1 的 K = 32 只喂得饱一半 lane，SH 模式 K 恒为 16 更喂不饱 ——
+                // 那两种情况一律回 narrow。
+                //
+                // 这个分界是**量出来的，不是推出来的**。第一版写的是 `mip > 0`，
+                // 结果 mip1 从 0.021 退化到 0.041 ms（反而成了最大单项），
+                // 而 mip2 从 0.032 改善到 0.017 —— 分水岭正好落在 K=32 与 K=64 之间。
+                // 原因是 mip1 在 narrow 下本来就是全场吞吐最高的一级（8.95 G样本/s）：
+                // 96 个组、6144 条线程、每条 32 深，延迟早就被别的 warp 藏住了，
+                // wide 只是给它多加了一轮 6 次 barrier 的归约。
+                //
+                // 上面这几个逐级数字**只有 2× 这个量级可信**：单级耗时在 0.01~0.02 ms 档，
+                // 复测离散度到 ±27~130%，绝对值不可引用。之所以还敢下结论，是因为
+                // mip1 的 0.041 vs 0.021 差了一倍、远超那一级的离散度；而改完之后
+                // 反射整 pass 的总数在噪声内**没变**（0.095 ±37% → 0.101 ±5% → 0.076 ±132%），
+                // 所以正确的说法是"mip1 这一级快了 2×，pass 总数没有可测的变化"，
+                // 不是"改快了"。
+                //
+                // 也没有为 K < 64 再切一层「一组多纹素 + 组内分段归约」：按 mip2 达到的
+                // 5.89 G样本/s 折算，mip1 那 196.6k 个样本要 0.033 ms，比 narrow 的
+                // 0.021 还慢 —— 多一套索引换更差的结果。
+                //
+                // 门槛这里写成 mip 序号而不是重算一遍 K：K 的定义在
+                // SkyReflection.hlsl 的 VistaSkyReflectionSampleCount，在运行时抄第二份
+                // 就多一处会走歧的真源。代价是这个 2 与那个函数隐式绑着，
+                // 所以自检的**判据 4a** 会把 HLSL 侧的 K 逐 mip 导出到该行的 .x，
+                // C# 侧拿它跟 k_SkyReflectionWideThreshold 和这里的 `mip >= 2` 对账 ——
+                // K 的定义改了而分界没跟上，那一行会红。
+                // （必须让它会红：症状是某一级性能悄悄退化，不是错图，画面上看不出来。）
+                bool wide = !useSh && mip >= 2;
+                int kernel = wide ? m_KernelSkyReflectionWideIdx : m_KernelSkyReflectionIdx;
 
                 d.SetGlobalVector(VistaShaderIDs._VistaSkyReflectionParams,
                     new Vector4(size, mip, source, 0f));
@@ -632,17 +711,26 @@ namespace Vista
                 // 绑的是 Tex2DArray 中转纹理，不是 cube 本身：Unity 的绑定校验不接受
                 // Cube RT 绑到 RWTexture2DArray（"expected 5, got 4"）。
                 // 见 VistaLutSlot.SkyReflectionArray。
-                d.SetTextureMip(m_ReflectionCS, m_KernelSkyReflectionIdx,
+                d.SetTextureMip(m_ReflectionCS, kernel,
                     VistaShaderIDs._VistaSkyReflectionRW, VistaLutSlot.SkyReflectionArray, mip);
 
-                // z = 6 面。最粗的三级（4²/2²/1²）线程组数都是 1，大量线程被核内的
-                // size 判据挡掉 —— 那三级总共 6×21 个纹素。这句注释原本接着写
-                // "不值得换 dispatch 形状"，现在把那个论断降级为待验证的假设：
-                // 它是**猜**的，而 #10 的归因就是去量它。
-                if ((mipMask & (1 << mip)) != 0)
-                    d.Dispatch(m_ReflectionCS, m_KernelSkyReflectionIdx,
+                if ((mipMask & (1 << mip)) == 0)
+                    continue;
+
+                if (wide)
+                {
+                    // (size·size, 6, 1) 组，**精确覆盖**：一组一纹素，y = 面。
+                    // 精确不只是省一个边界 if —— wide 核里三处 GroupMemoryBarrier 要求
+                    // 之前不存在线程相关的 early return（FXC 的判据是语法上的），
+                    // 所以"整除"是那个核能编过的前提，改这里的形状要连带看核。
+                    d.Dispatch(m_ReflectionCS, kernel, size * size, 6, 1);
+                }
+                else
+                {
+                    d.Dispatch(m_ReflectionCS, kernel,
                         VistaComputeUtils.DivRoundUp(size, 8),
                         VistaComputeUtils.DivRoundUp(size, 8), 6);
+                }
             }
         }
 

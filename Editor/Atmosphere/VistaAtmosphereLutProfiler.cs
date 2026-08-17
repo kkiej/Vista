@@ -602,47 +602,71 @@ namespace Vista.Editor
             // 差别在机理（一个减少要隐藏的延迟量，一个增加隐藏延迟的并行度），
             // 不在作用对象。把预设的分类印成结论，就是让工具替我确认偏见。
             double coarseShare = sumIso > 1e-6 ? coarseMs / sumIso : 0.0;
-            sb.Append("　　 mip3~6（组数=1 的那几级）合计 ").Append(coarseMs.ToString("F3"))
+            sb.Append("　　 mip3~6（K 已饱和到 256、纹素最少的那几级）合计 ").Append(coarseMs.ToString("F3"))
               .Append(" ms，占 ").Append(coarseShare.ToString("P0"))
               .Append("，而它们只产出 ").Append(coarseTexels).Append('/').Append(allTexels)
               .Append(" 个纹素（").Append((coarseTexels / (double)allTexels).ToString("P1")).Append("）")
               .AppendLine();
 
             // 证据一：组数相同（都是 6）时耗时随 K 走。mip3 与 mip4 的组数、
-            // dispatch 形状完全一致，唯一差别是 K 翻倍 —— 若耗时也接近翻倍，
-            // 说明这几级是被**取样循环的延迟**卡住，而不是被取样总量或调度卡住。
-            if (iso[3].Or0() > 1e-4)
+            // dispatch 形状完全一致，唯一差别是 K 翻倍。判定写成双向的 ——
+            // ≈2 指向"被取样循环的延迟卡住"，≈1 指向"K 已经不是自变量了"。
+            // 只印其中一边就是把上一次的病因当成永久结论。
+            double kRatio = 0.0;
+            if (iso[3].Or0() > 1e-4 && mips > 4)
             {
-                double kRatio = iso[4].Or0() / iso[3].Or0();
+                kRatio = iso[4].Or0() / iso[3].Or0();
                 sb.Append("　　 证据 1｜组数同为 6，K 从 128→256：耗时 ")
                   .Append(iso[3].Or0().ToString("F3")).Append("→").Append(iso[4].Or0().ToString("F3"))
-                  .Append(" ms，比 ").Append(kRatio.ToString("F2"))
-                  .AppendLine("（≈2 则耗时正比于 K）");
+                  .Append(" ms，比 ").Append(kRatio.ToString("F2")).Append("　→ ")
+                  .AppendLine(kRatio > 1.6 ? "正比于 K：取样循环的延迟没被隐藏"
+                            : kRatio < 1.25 ? "与 K 基本无关：取样循环已不是自变量"
+                            : "介于两者之间，这一条不做判定");
             }
+
             // 证据二：反过来，工作量降 16 倍而耗时几乎不动 —— 说明纹素数不是自变量。
-            if (iso[6].Or0() > 1e-4)
+            // 每迭代暴露的时间与"一次纹理取样往返"（数百 ns 量级）比：
+            // 同量级 = 延迟全额暴露；低一个数量级 = 已经被别的 warp 藏住了。
+            double nsPerIter = 0.0;
+            if (iso[6].Or0() > 1e-4 && mips > 6)
             {
+                nsPerIter = iso[6].Or0() / NominalSampleCount(6, mode) * 1e6;
                 sb.Append("　　 证据 2｜K 同为 256，纹素 96→6（16×）：耗时 ")
                   .Append(iso[4].Or0().ToString("F3")).Append("→").Append(iso[6].Or0().ToString("F3"))
                   .Append(" ms，仅快 ").Append((iso[4].Or0() / iso[6].Or0()).ToString("F2"))
                   .AppendLine(" 倍（纹素数几乎不是自变量）");
-                sb.Append("　　 　 每次循环迭代暴露 ")
-                  .Append((iso[6].Or0() / 256.0 * 1e6).ToString("F0"))
-                  .AppendLine(" ns —— 一次纹理取样的延迟，完全没被隐藏。");
+                sb.Append("　　 　 每次循环迭代暴露 ").Append(nsPerIter.ToString("F0"))
+                  .Append(" ns　→ ")
+                  .AppendLine(nsPerIter > 150.0 ? "与一次纹理取样往返同量级：延迟完全没被隐藏"
+                            : nsPerIter < 60.0 ? "远小于一次取样往返：延迟已被藏住，这一级剩下的是别的开销"
+                            : "介于两者之间，这一条不做判定");
             }
-            // 证据三：per-dispatch 固定开销的上界。mip0 占满 384 组、K=1，
-            // 它的耗时就是"一趟 dispatch + 一点工作"的量级 —— 若它很小，
-            // 就排除了"7 趟 dispatch 本身的固定开销"这个解释，
-            // 于是修法应当指向占用率，而不是指向合并 dispatch。
-            sb.Append("　　 证据 3｜mip0（384 组、K=1）").Append(iso[0].Or0().ToString("F3"))
-              .Append(" ms → 单趟 dispatch 的固定开销 ≤ ")
-              .Append((iso[0].Or0() * 1000.0).ToString("F0"))
-              .AppendLine(" µs，7 趟合计也只是零头，固定开销不是主因。");
+
+            // 证据三：per-dispatch 的地板。最便宜的那一级的耗时里既含它自己的工作
+            // 也含一趟 dispatch 的固定开销，所以它是**固定开销的上界**；
+            // 乘上趟数再与单级之和比，就得到"整个 pass 里有多少是花在'派发'本身上"。
+            // 这一条的用途在改完形状之后才显出来：工作量被压下去以后，
+            // 地板占比会自动升上来，而它指向的修法（合并 dispatch）与占用率无关。
+            double floorMs = double.MaxValue;
+            for (int m = 0; m < mips; ++m)
+                if (iso[m].Or0() > 1e-4) floorMs = System.Math.Min(floorMs, iso[m].Or0());
+            if (floorMs < double.MaxValue)
+            {
+                double floorTotal = floorMs * mips;
+                double floorShare = sumIso > 1e-6 ? floorTotal / sumIso : 0.0;
+                sb.Append("　　 证据 3｜最便宜的一级 ").Append(floorMs.ToString("F3"))
+                  .Append(" ms（含它自己的工作，所以是单趟固定开销的**上界**）×")
+                  .Append(mips).Append(" 趟 = ").Append(floorTotal.ToString("F3"))
+                  .Append(" ms，占单级之和 ").Append(floorShare.ToString("P0")).Append("　→ ")
+                  .AppendLine(floorShare > 0.5 ? "派发地板已是主项：下一个杠杆是合并 dispatch，不是占用率"
+                            : floorShare < 0.25 ? "派发地板是零头：修法应指向占用率 / 取样量"
+                            : "地板与工作量各占一半，两条修法都只能拿到一半收益");
+            }
 
             sb.Append("　　 全 pass 标称取样 ").Append((totalSamples / 1000.0).ToString("F0"))
               .Append("k，按 iso 之和折算 ")
               .Append((sumIso > 1e-6 ? totalSamples / sumIso / 1e6 : 0.0).ToString("F2"))
-              .AppendLine(" G样本/s（3060 的纹理取样率在数百 G样本/s 量级，差两个数量级）");
+              .AppendLine(" G样本/s（3060 的纹理取样率在数百 G样本/s 量级）");
         }
 
         /// <summary>
