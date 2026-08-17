@@ -1,0 +1,21 @@
+{
+  "name": "com.kkiej.vista",
+  "version": "0.1.0",
+  "displayName": "Vista Rendering",
+  "description": "Large-scale outdoor rendering modules for URP: physically based atmosphere, time-of-day driven lighting, volumetric fog, probe-based global illumination, GPU-driven vegetation, terrain and water.",
+  "unity": "6000.4",
+  "author": {
+    "name": "kkiej"
+  },
+  "keywords": [
+    "urp",
+    "rendering",
+    "atmosphere",
+    "volumetric",
+    "global-illumination",
+    "gpu-driven"
+  ],
+  "dependencies": {
+    "com.unity.render-pipelines.universal": "17.4.0"
+  }
+}

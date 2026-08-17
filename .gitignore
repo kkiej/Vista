@@ -1,0 +1,18 @@
+# UPM package 仓库：.meta 文件必须提交（GUID 稳定性），不要忽略。
+
+# IDE / OS
+.idea/
+.vs/
+.vscode/
+*.user
+*.userprefs
+.DS_Store
+Thumbs.db
+
+# 若在此目录下临时建过 Unity 工程
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Ll]ogs/
+[Uu]serSettings/
