@@ -39,6 +39,13 @@ namespace Vista
         [Tooltip("Aerial Perspective froxel LUT 设置。控制远景雾感的精度与深度范围。")]
         VistaAerialPerspectiveSettings m_AerialPerspective = new VistaAerialPerspectiveSettings();
 
+        [SerializeField]
+        [Tooltip("天空镜面反射 cubemap 的辐射来源。\n"
+               + "SkyViewLut：从 Sky-View LUT 逐 mip GGX 预积分，含地平线的橙红带（PC 默认）。\n"
+               + "AmbientSh：从环境光 SH 重建，零 LUT 依赖、采样数 16（移动端分级）。\n"
+               + "Off：不产出，镜面反射回落到场景自带的反射探针。")]
+        VistaSkyReflectionMode m_SkyReflection = VistaSkyReflectionMode.SkyViewLut;
+
         VistaAtmosphereLuts m_Luts;
         VistaAtmospherePass m_Pass;
 
@@ -47,6 +54,17 @@ namespace Vista
 
         /// <summary>AP froxel 设置。改尺寸会在下一帧重新分配 3D 表，其余立即生效。</summary>
         public VistaAerialPerspectiveSettings aerialPerspective => m_AerialPerspective;
+
+        /// <summary>
+        /// 反射来源模式。可运行时改 —— Demo 视频要在同一帧里对比 PC 与移动端两条路径。
+        /// 切到 Off 之后 cubemap 停止更新但仍留在 RenderSettings 上（内容冻结在最后一帧），
+        /// 这是有意的：拔掉引用会让画面在切换瞬间闪一下场景默认反射，A/B 对比时很干扰。
+        /// </summary>
+        public VistaSkyReflectionMode skyReflection
+        {
+            get => m_SkyReflection;
+            set => m_SkyReflection = value;
+        }
 
         public override void Create()
         {
@@ -62,7 +80,11 @@ namespace Vista
 
             // Create 会在 shader 重编译后重新调用，旧的 RTHandle 必须先还回去
             m_Luts?.Dispose();
-            m_Luts = new VistaAtmosphereLuts(resources.atmosphereLutCS);
+            // 反射核可以为 null（资源没配 / 平台不支持编译）—— 那时 isSkyReflectionValid
+            // 为 false，PrepareSkyReflection 返回 Off，天空/AP/环境光全都照常工作。
+            // 不在这里检查它，是因为把它并进上面那个 return 会让"反射核缺失"
+            // 表现为"整个大气模块不生效"。
+            m_Luts = new VistaAtmosphereLuts(resources.atmosphereLutCS, resources.skyReflectionCS);
             m_Luts.SetSkyViewResolution(m_SkyViewResolution.x, m_SkyViewResolution.y);
 
             m_Pass ??= new VistaAtmospherePass();
@@ -81,7 +103,8 @@ namespace Vista
                 return;
 
             m_Luts.SetSkyViewResolution(m_SkyViewResolution.x, m_SkyViewResolution.y);
-            m_Pass.Setup(m_Luts, m_Parameters, m_AerialPerspective, m_GroundLevelWorldY, m_EV100);
+            m_Pass.Setup(m_Luts, m_Parameters, m_AerialPerspective, m_SkyReflection,
+                         m_GroundLevelWorldY, m_EV100);
             renderer.EnqueuePass(m_Pass);
         }
 

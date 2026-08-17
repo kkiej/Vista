@@ -40,6 +40,16 @@ namespace Vista
         /// <summary>大气 LUT 计算（Transmittance / MultiScattering / SkyView / AerialPerspective）。</summary>
         public ComputeShader atmosphereLutCS => m_AtmosphereLutCS;
 
+        // 单独一个 .compute 而不是塞进 AtmosphereLut.compute：镜面预滤波要
+        // ImageBasedLighting.hlsl（SampleGGXDir / PerceptualRoughnessToMipmapLevel），
+        // 那个头会连带拖进 BSDF.hlsl 一大片 include 图。让已有的九个大气核为了
+        // 两个反射核多编译这些东西，代价是每次改大气 shader 的迭代都变慢。
+        [SerializeField, ResourcePath("Shaders/Atmosphere/SkyReflection.compute")]
+        private ComputeShader m_SkyReflectionCS;
+
+        /// <summary>天空镜面反射 cubemap 的 GGX 预滤波与自检。</summary>
+        public ComputeShader skyReflectionCS => m_SkyReflectionCS;
+
         [SerializeField, ResourcePath("Shaders/Atmosphere/VistaSky.shader")]
         private Shader m_SkyShader;
 

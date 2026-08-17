@@ -6,6 +6,20 @@ using UnityEngine.Rendering;
 namespace Vista
 {
     /// <summary>
+    /// 天空镜面反射 cubemap 的辐射来源。**运行期**开关而不是编译期宏：
+    /// Demo 视频要在同一帧里对比 PC 与移动端两条路径的画面与帧时间。
+    /// </summary>
+    public enum VistaSkyReflectionMode
+    {
+        /// <summary>不产出 cubemap。下游回落到场景自带的反射探针。</summary>
+        Off,
+        /// <summary>逐纹素从 Sky-View LUT 积分（PC）。含地平线那圈高频亮带。</summary>
+        SkyViewLut,
+        /// <summary>从环境光 SH9 重建辐射（移动端）。零 LUT 依赖，但被带限在 l ≤ 2。</summary>
+        AmbientSh,
+    }
+
+    /// <summary>
     /// 大气 LUT 的持有者与调度器。
     ///
     /// 分工：静态表（Transmittance / MultiScattering）只依赖大气参数，脏检查后重算；
@@ -63,6 +77,34 @@ namespace Vista
         public const int k_ShRefGroupCount = k_ShRefNormalCount + k_ShRefMeanCount;
         public const int k_ShRefElementCount = k_ShRefGroupCount * 3;
 
+        // ---- 天空镜面反射 cubemap ----
+
+        /// <summary>
+        /// mip 级数。**被 URP 的采样端定死的**：<c>GlossyEnvironmentReflection</c> 走
+        /// <c>PerceptualRoughnessToMipmapLevel</c> 的单参重载，maxMipLevel 固定为
+        /// <c>UNITY_SPECCUBE_LOD_STEPS = 6</c>，于是 pr ∈ [0,1] 映到 mip ∈ [0,6]，
+        /// 必须存在 0..6 共 7 级。少一级时 pr=1 采到不存在的 mip 被硬件 clamp，
+        /// 表现为"粗糙度 0.8 以上不再继续变模糊"。
+        /// 与 <c>VISTA_SKY_REFLECTION_MIPS</c> 一致，自检核会把 HLSL 侧那份报出来比对。
+        /// </summary>
+        public const int k_SkyReflectionMipCount = 7;
+
+        /// <summary>边长 = 2^6 = 64。由 mip 级数反推，不是挑的（7 级 → 64,32,16,8,4,2,1）。</summary>
+        public const int k_SkyReflectionSize = 1 << (k_SkyReflectionMipCount - 1);
+
+        /// <summary>
+        /// 自检输出的行布局，与 compute 里的 <c>VISTA_SKY_REFL_ROW_*</c> 一一对应。
+        /// 0..5 逐面误差，6/7/8 = cube / LUT / SH 的整球均值，9..15 逐 mip 的
+        /// 粗糙度 round-trip，16 = HLSL 侧常量导出。
+        /// </summary>
+        public const int k_ReflVerifyRowFace  = 0;
+        public const int k_ReflVerifyRowMean  = 6;
+        public const int k_ReflVerifyRowMip   = 9;
+        public const int k_ReflVerifyRowConst = k_ReflVerifyRowMip + k_SkyReflectionMipCount;
+        public const int k_ReflVerifyElementCount = k_ReflVerifyRowConst + 1;
+        /// <summary>逐面 6 组 + 均值 1 组 + mip 映射 1 组。与 <c>VISTA_SKY_REFL_VERIFY_GROUPS</c> 一致。</summary>
+        public const int k_ReflVerifyGroupCount = 8;
+
         const string k_KernelTransmittance    = "TransmittanceLut";
         const string k_KernelMultiScattering  = "MultiScatteringLut";
         const string k_KernelSkyView          = "SkyViewLut";
@@ -72,15 +114,20 @@ namespace Vista
         const string k_KernelApSliceError     = "AerialPerspectiveSliceError";
         const string k_KernelSkyAmbientSh     = "SkyAmbientSh";
         const string k_KernelSkyAmbientShRef  = "SkyAmbientShReference";
+        const string k_KernelSkyReflection       = "SkyReflectionFilter";
+        const string k_KernelSkyReflectionVerify = "SkyReflectionVerify";
 
         RTHandle m_Transmittance;
         RTHandle m_MultiScattering;
         RTHandle m_SkyView;
         RTHandle m_ApScatter;
         RTHandle m_ApTransmittance;
+        RTHandle m_SkyReflection;
+        RTHandle m_SkyReflectionArray;
 
         GraphicsBuffer m_SkyAmbientSh;
         GraphicsBuffer m_SkyAmbientShRef;
+        GraphicsBuffer m_SkyReflectionVerify;
 
         int m_SkyViewWidth  = k_SkyViewWidthDefault;
         int m_SkyViewHeight = k_SkyViewHeightDefault;
@@ -95,6 +142,13 @@ namespace Vista
         readonly int m_KernelApSliceErrorIdx     = -1;
         readonly int m_KernelSkyAmbientShIdx     = -1;
         readonly int m_KernelSkyAmbientShRefIdx  = -1;
+
+        // 反射走**另一个** .compute（见 VistaRuntimeResources 的理由：ImageBasedLighting.hlsl
+        // 的 include 图会拖慢那九个大气核的每次迭代）。IVistaLutDispatcher 的每个方法
+        // 都吃一个 ComputeShader 参数，所以多一份 CS 不需要改接口。
+        readonly ComputeShader m_ReflectionCS;
+        readonly int m_KernelSkyReflectionIdx       = -1;
+        readonly int m_KernelSkyReflectionVerifyIdx = -1;
 
         /// <summary>上一次成功烘出静态表时使用的参数副本，用于脏检查。</summary>
         VistaAtmosphereParameters m_BakedParams;
@@ -131,6 +185,24 @@ namespace Vista
         /// <summary>自检参考解输出。只在 <see cref="EnsureSkyAmbientShReference"/> 之后非 null。</summary>
         public GraphicsBuffer skyAmbientShRefBuffer => m_SkyAmbientShRef;
 
+        /// <summary>
+        /// 天空镜面反射 cubemap（64²、7 级 mip、RGBA16F）。挂到
+        /// <c>RenderSettings.customReflectionTexture</c> 后由 URP 当 <c>unity_SpecCube0</c> 采。
+        /// 未分配过时为 null。
+        /// </summary>
+        public RTHandle skyReflectionCube => m_SkyReflection;
+
+        /// <summary>
+        /// 反射的 UAV 中转纹理（6 层 × 7 级 mip 的 Tex2DArray）。compute 写它，
+        /// 然后逐面 CopyTexture 进 <see cref="skyReflectionCube"/>。
+        /// 存在的理由见 <see cref="VistaLutSlot.SkyReflectionArray"/> 的注释（Unity 不允许
+        /// 把 Cube RT 绑到 RWTexture2DArray）。未分配过时为 null。
+        /// </summary>
+        public RTHandle skyReflectionArray => m_SkyReflectionArray;
+
+        /// <summary>自检报告输出。只在 <see cref="EnsureSkyReflectionVerify"/> 之后非 null。</summary>
+        public GraphicsBuffer skyReflectionVerifyBuffer => m_SkyReflectionVerify;
+
         public int skyViewWidth  => m_SkyViewWidth;
         public int skyViewHeight => m_SkyViewHeight;
 
@@ -154,8 +226,29 @@ namespace Vista
         /// </summary>
         public bool isSkyAmbientShValid => isValid && m_KernelSkyAmbientShIdx >= 0;
 
-        public VistaAtmosphereLuts(ComputeShader lutCS)
+        /// <summary>
+        /// 反射 cubemap 是否可用。第四个独立开关，理由同上一条 ——
+        /// 这个核挂了，天空、AP、漫反射间接光全都还是对的，只是镜面反射回落到
+        /// 场景自带的反射探针（通常是一张静态天空盒），表现为"金属材质不跟着时间变"。
+        /// 把它并进 <see cref="isValid"/> 会让"反射核编译失败"表现为"整个天空黑掉"。
+        /// </summary>
+        public bool isSkyReflectionValid => m_ReflectionCS != null && m_KernelSkyReflectionIdx >= 0;
+
+        /// <param name="reflectionCS">
+        /// 镜面反射预滤波核。可选 —— 只用大气 LUT 的调用方（LUT 预览窗口、大气数值自检）
+        /// 传 null 即可，那时 <see cref="isSkyReflectionValid"/> 为 false，其余功能不受影响。
+        /// </param>
+        public VistaAtmosphereLuts(ComputeShader lutCS, ComputeShader reflectionCS = null)
         {
+            m_ReflectionCS = reflectionCS;
+            if (m_ReflectionCS != null)
+            {
+                if (m_ReflectionCS.HasKernel(k_KernelSkyReflection))
+                    m_KernelSkyReflectionIdx = m_ReflectionCS.FindKernel(k_KernelSkyReflection);
+                if (m_ReflectionCS.HasKernel(k_KernelSkyReflectionVerify))
+                    m_KernelSkyReflectionVerifyIdx = m_ReflectionCS.FindKernel(k_KernelSkyReflectionVerify);
+            }
+
             m_LutCS = lutCS;
             if (m_LutCS == null) return;
             if (m_LutCS.HasKernel(k_KernelTransmittance))
@@ -279,6 +372,45 @@ namespace Vista
                 GraphicsBuffer.Target.Structured, k_ShRefElementCount, sizeof(float) * 4)
             {
                 name = "VistaSkyAmbientShRef",
+            };
+            return true;
+        }
+
+        /// <summary>
+        /// 记录期调用：按需分配反射 cubemap，并把请求的模式**解析成实际可用的模式**。
+        ///
+        /// 返回解析后的模式而不是 bool，是因为这里有一次真实的降级：
+        /// <see cref="VistaSkyReflectionMode.AmbientSh"/> 需要 SH 缓冲存在，而 SH 有它自己的
+        /// 有效性开关。让调用方去做这个判断，等于把"两个模块的可用性如何组合"复制到 pass 里，
+        /// 而 pass 还要拿这个结论去决定声明哪些资源依赖 —— 两处判断走歧的症状是
+        /// RenderGraph 抛"资源未声明"，或者更糟：读到一个未绑定的 StructuredBuffer。
+        /// </summary>
+        public VistaSkyReflectionMode PrepareSkyReflection(VistaSkyReflectionMode mode)
+        {
+            if (mode == VistaSkyReflectionMode.Off || !isSkyReflectionValid)
+                return VistaSkyReflectionMode.Off;
+
+            // SH 模式退到 LUT 模式而不是退到 Off：退到 Off 意味着镜面反射回落到场景自带的
+            // 静态反射探针，画面上是"金属不跟时间变"；退到 LUT 只是多花 0.03 ms，
+            // 而画面完全正确。移动端分级本来就是性能取舍，不是正确性前提。
+            if (mode == VistaSkyReflectionMode.AmbientSh && (!isSkyAmbientShValid || m_SkyAmbientSh == null))
+                mode = VistaSkyReflectionMode.SkyViewLut;
+
+            AllocateSkyReflectionIfNeeded();
+            return mode;
+        }
+
+        /// <summary>
+        /// 仅供 Editor 自检：按需分配反射自检报告缓冲（17 × float4）。
+        /// </summary>
+        public bool EnsureSkyReflectionVerify()
+        {
+            if (!isSkyReflectionValid || m_KernelSkyReflectionVerifyIdx < 0) return false;
+
+            m_SkyReflectionVerify ??= new GraphicsBuffer(
+                GraphicsBuffer.Target.Structured, k_ReflVerifyElementCount, sizeof(float) * 4)
+            {
+                name = "VistaSkyReflectionVerify",
             };
             return true;
         }
@@ -417,6 +549,104 @@ namespace Vista
                 VistaShaderIDs._VistaSkyAmbientShRefRW, VistaLutBufferSlot.SkyAmbientShReference);
             // 一个法线一个线程组，外加两组全天球均值。
             d.Dispatch(m_LutCS, m_KernelSkyAmbientShRefIdx, k_ShRefGroupCount, 1, 1);
+        }
+
+        // ====================================================================
+        //  天空镜面反射 cubemap（逐帧）
+        //
+        //  LUT 模式读 SkyView（SRV），SH 模式读 SH 缓冲（SRV）；两种模式都只写
+        //  cubemap（UAV）。**七级 mip 全在同一个 pass 里**：每级都独立地从源积分，
+        //  级与级之间没有依赖，这张 cubemap 全程只有 UAV 一个状态。
+        //  见 SkyReflection.compute 的头注（为什么不做渐进预滤波）。
+        // ====================================================================
+
+        /// <summary>
+        /// 逐 mip 一趟 dispatch，GGX 预积分整张反射 cubemap。
+        /// <paramref name="mode"/> 必须是 <see cref="PrepareSkyReflection"/> 返回的那个值 ——
+        /// 传原始请求值会在 SH 不可用时去读一个未绑定的 buffer。
+        /// </summary>
+        public void RenderSkyReflection<T>(
+            T d, in VistaAtmosphereViewData view, VistaSkyReflectionMode mode)
+            where T : struct, IVistaLutDispatcher
+        {
+            if (!isSkyReflectionValid || m_SkyReflection == null || m_SkyReflectionArray == null) return;
+            if (mode == VistaSkyReflectionMode.Off) return;
+
+            // 两种模式共用一个 Bind，不按模式分支。SH 模式确实用不到 _VistaViewPosKm /
+            // _VistaSkyViewLutSize（它不采 LUT），但省下这几个 SetGlobalVector 换来的是
+            // "两条路径各推一套参数"，而漏推只会在其中一条上出错 —— 那种错在切模式做
+            // A/B 对比时才暴露，恰好是 Demo 视频里最不想踩的时机。
+            view.Bind(d, m_SkyViewWidth, m_SkyViewHeight);
+
+            bool useSh = mode == VistaSkyReflectionMode.AmbientSh;
+            if (useSh)
+            {
+                d.SetBuffer(m_ReflectionCS, m_KernelSkyReflectionIdx,
+                    VistaShaderIDs._VistaSkyAmbientSh, VistaLutBufferSlot.SkyAmbientSh);
+            }
+            else
+            {
+                d.SetTexture(m_ReflectionCS, m_KernelSkyReflectionIdx,
+                    VistaShaderIDs._VistaSkyViewLut, VistaLutSlot.SkyView);
+            }
+
+            float source = useSh ? 1f : 0f;   // 与 VISTA_SKY_REFLECTION_SRC_* 对应
+
+            for (int mip = 0; mip < k_SkyReflectionMipCount; ++mip)
+            {
+                int size = k_SkyReflectionSize >> mip;
+
+                d.SetGlobalVector(VistaShaderIDs._VistaSkyReflectionParams,
+                    new Vector4(size, mip, source, 0f));
+
+                // 必须指到具体 mip。不指的话默认写 mip 0，七趟全打在同一级上，
+                // 其余六级保持分配后的未初始化内容 —— 见 IVistaLutDispatcher.SetTextureMip。
+                //
+                // 绑的是 Tex2DArray 中转纹理，不是 cube 本身：Unity 的绑定校验不接受
+                // Cube RT 绑到 RWTexture2DArray（"expected 5, got 4"）。
+                // 见 VistaLutSlot.SkyReflectionArray。
+                d.SetTextureMip(m_ReflectionCS, m_KernelSkyReflectionIdx,
+                    VistaShaderIDs._VistaSkyReflectionRW, VistaLutSlot.SkyReflectionArray, mip);
+
+                // z = 6 面。最粗的三级（4²/2²/1²）线程组数都是 1，大量线程被核内的
+                // size 判据挡掉 —— 那三级总共 6×21 个纹素，不值得换 dispatch 形状。
+                d.Dispatch(m_ReflectionCS, m_KernelSkyReflectionIdx,
+                    VistaComputeUtils.DivRoundUp(size, 8),
+                    VistaComputeUtils.DivRoundUp(size, 8), 6);
+            }
+        }
+
+        /// <summary>
+        /// 仅供 Editor 自检：逐面 round-trip / 均值恒等式 / mip↔粗糙度映射。
+        /// **必须在 <see cref="RenderSkyReflection{T}"/> 与 <see cref="RenderSkyAmbientSh{T}"/>
+        /// 之后调用**（要把 cubemap 当 SRV 读回来，并与 SH 的 L_00·Y00 对照）。
+        /// </summary>
+        public void RenderSkyReflectionVerify<T>(T d, in VistaAtmosphereViewData view)
+            where T : struct, IVistaLutDispatcher
+        {
+            if (!isSkyReflectionValid || m_KernelSkyReflectionVerifyIdx < 0) return;
+            if (m_SkyReflection == null || m_SkyReflectionVerify == null) return;
+
+            view.Bind(d, m_SkyViewWidth, m_SkyViewHeight);
+
+            // 自检永远按 LUT 模式的口径比对：判据 1 要的是"cube mip0 == LUT"，
+            // 而 SH 模式下 cube 本来就不该等于 LUT（它带限在 l≤2，正是 #5b 存在的理由）。
+            // size 传满级边长，mip 传 0 —— 组 7 会把这个 size 报出来给 C# 比常量。
+            d.SetGlobalVector(VistaShaderIDs._VistaSkyReflectionParams,
+                new Vector4(k_SkyReflectionSize, 0f, 0f, 0f));
+
+            d.SetTexture(m_ReflectionCS, m_KernelSkyReflectionVerifyIdx,
+                VistaShaderIDs._VistaSkyViewLut, VistaLutSlot.SkyView);
+            // 同一张 cubemap 在这里是 **SRV**（TEXTURECUBE），绑到只读那个名字上 ——
+            // 绑到 RW 名字上会让硬件双线性与 mip 采样整个失效，而判据 1 恰好靠它们。
+            d.SetTexture(m_ReflectionCS, m_KernelSkyReflectionVerifyIdx,
+                VistaShaderIDs._VistaSkyReflection, VistaLutSlot.SkyReflection);
+            d.SetBuffer(m_ReflectionCS, m_KernelSkyReflectionVerifyIdx,
+                VistaShaderIDs._VistaSkyAmbientSh, VistaLutBufferSlot.SkyAmbientSh);
+            d.SetBuffer(m_ReflectionCS, m_KernelSkyReflectionVerifyIdx,
+                VistaShaderIDs._VistaSkyReflectionVerifyRW, VistaLutBufferSlot.SkyReflectionVerify);
+
+            d.Dispatch(m_ReflectionCS, m_KernelSkyReflectionVerifyIdx, k_ReflVerifyGroupCount, 1, 1);
         }
 
         // ====================================================================
@@ -597,6 +827,31 @@ namespace Vista
             RenderSkyAmbientShReference(new VistaImmediateLutDispatcher(cmd, this), view);
         }
 
+        /// <summary>
+        /// 立即模式的反射 cubemap。调用前需先 <see cref="PrepareSkyReflection"/>，
+        /// 并把它的返回值原样传进来。
+        /// </summary>
+        public void RenderSkyReflection(
+            CommandBuffer cmd, in VistaAtmosphereViewData view, VistaSkyReflectionMode mode)
+        {
+            if (cmd == null) throw new ArgumentNullException(nameof(cmd));
+            if (!isSkyReflectionValid || mode == VistaSkyReflectionMode.Off) return;
+
+            RenderSkyReflection(new VistaImmediateLutDispatcher(cmd, this), view, mode);
+            // 立即模式不需要显式 barrier：原生 CommandBuffer 的状态转换由图形层自动插，
+            // 所以 dispatch 与 copy 录在同一个 cmd 里是安全的（与三张静态表能不能同 pass
+            // 是同一条区别 —— 那个约束只存在于 RenderGraph）。
+            CopySkyReflectionToCube(cmd);
+            cmd.SetGlobalTexture(VistaShaderIDs._VistaSkyReflection, m_SkyReflection);
+        }
+
+        /// <summary>立即模式的反射自检。调用前需先 <see cref="EnsureSkyReflectionVerify"/>。</summary>
+        public void RenderSkyReflectionVerify(CommandBuffer cmd, in VistaAtmosphereViewData view)
+        {
+            if (cmd == null) throw new ArgumentNullException(nameof(cmd));
+            RenderSkyReflectionVerify(new VistaImmediateLutDispatcher(cmd, this), view);
+        }
+
         // ====================================================================
         //  分配
         // ====================================================================
@@ -643,6 +898,83 @@ namespace Vista
                 name: "VistaSkyViewLut");
         }
 
+        void AllocateSkyReflectionIfNeeded()
+        {
+            if (m_SkyReflection != null) return;
+
+            m_SkyReflection = RTHandles.Alloc(
+                k_SkyReflectionSize, k_SkyReflectionSize,
+                // fp16：与 SkyView 同一份数据同一个量级（天顶约 5e3、日面附近 1e5），
+                // 圆盘不进这张图，所以不会碰 65504 上限。理由与 AllocateSkyViewIfNeeded 相同。
+                format: GraphicsFormat.R16G16B16A16_SFloat,
+                // **slices: 1，不是 6。** RTHandles.Alloc 把 slices 直接塞给
+                // RenderTextureDescriptor.volumeDepth，而 Cube 维度下六个面不是 volume 切片，
+                // volumeDepth 必须留在 1（core 自己的 PathTracing/CubemapRender.cs:152-160
+                // 建 Cube RT 时就是 volumeDepth = 1）。写 6 的话描述符自相矛盾。
+                slices: 1,
+                // **Trilinear 而不是 Bilinear**：URP 的 GlossyEnvironmentReflection 用
+                // SAMPLE_TEXTURECUBE_LOD 传一个连续的 mip 值（粗糙度算出来的），
+                // Bilinear 会把它吸附到最近一级 —— 症状是粗糙度渐变的物体上出现横向"档位",
+                // 尤其在 0.34（mip3）附近，因为 mip↔粗糙度是非线性的、中段最密。
+                filterMode: FilterMode.Trilinear,
+                // Clamp：cubemap 的 uv 在面内，越界由硬件的跨面寻址处理，
+                // 但 Repeat 会在面边缘绕回同一面的另一侧，表现为接缝处的镜像条纹。
+                wrapMode: TextureWrapMode.Clamp,
+                dimension: TextureDimension.Cube,
+                // **不开 enableRandomWrite。** 它现在只是 CopyTexture 的目标 + SRV。
+                // 开着也能跑，但那会让"这张图是 compute 直接写的"这个已经被验伪的假设
+                // 留在代码里 —— 下一个人（包括三个月后的我）会照它去 debug。
+                useMipMap: true,
+                // 七级 mip 全是自己积出来的。开 autoGenerateMips 会在每次渲染到它之后
+                // 由驱动做一遍 box downsample，把 mip1..6 覆盖成"mip0 的模糊"——
+                // 那正是被否掉的渐进预滤波方案的近似，而且是在背后悄悄发生的。
+                autoGenerateMips: false,
+                name: "VistaSkyReflectionCube");
+
+            // UAV 中转：与 cube 逐字段同规格（尺寸/格式/mip 级数必须一致，
+            // 否则 CopyTexture 会在运行时报 "dimensions must match"）。
+            // slices 这里**才是** 6 —— Tex2DArray 的层数就是 volumeDepth。
+            m_SkyReflectionArray = RTHandles.Alloc(
+                k_SkyReflectionSize, k_SkyReflectionSize,
+                format: GraphicsFormat.R16G16B16A16_SFloat,
+                slices: 6,
+                // 中转纹理不会被采样，filterMode 无关紧要 —— 但也不留 Point：
+                // 它在 RenderDoc / Frame Debugger 里是排查反射问题的第一站，
+                // 预览图跟着 cube 的滤波模式走比较不容易看错。
+                filterMode: FilterMode.Trilinear,
+                wrapMode: TextureWrapMode.Clamp,
+                dimension: TextureDimension.Tex2DArray,
+                enableRandomWrite: true,
+                useMipMap: true,
+                autoGenerateMips: false,
+                name: "VistaSkyReflectionArray");
+        }
+
+        /// <summary>
+        /// 把 UAV 中转纹理逐面搬进 cubemap。
+        ///
+        /// 六次调用而不是一次整体拷：<c>CopyTexture(src, srcElement, dst, dstElement)</c>
+        /// 一次只搬一个 element，但它搬的是那个 element 的**全部 mip**（见
+        /// core 的 IUnsafeCommandBuffer.cs:440 的文档），所以 6 次而不是 42 次。
+        ///
+        /// element 序号直接当 CubemapFace 用（0=+X 1=-X 2=+Y 3=-Y 4=+Z 5=-Z），
+        /// 与核里 VistaSkyReflectionTexelToDirection 的 face 参数是同一个约定。
+        /// 这一层映射对不对**不靠我记**：自检判据 1 是逐面比对 cube 的 SRV 采样值与
+        /// LUT 值，任何一面搬错位置都会让那一面单独炸红。
+        ///
+        /// 需要原生 CommandBuffer：CopyTexture 只存在于 IUnsafeCommandBuffer，
+        /// ComputeCommandBuffer / RasterCommandBuffer 上都没有 —— 所以 RenderGraph 侧
+        /// 必须是 AddUnsafePass。（同一类不对称还有 RequestAsyncReadback 与 SetGlobalBuffer。）
+        /// </summary>
+        public void CopySkyReflectionToCube(CommandBuffer cmd)
+        {
+            if (cmd == null) throw new ArgumentNullException(nameof(cmd));
+            if (m_SkyReflection == null || m_SkyReflectionArray == null) return;
+
+            for (int face = 0; face < 6; ++face)
+                cmd.CopyTexture(m_SkyReflectionArray, face, m_SkyReflection, face);
+        }
+
         public void Dispose()
         {
             m_Transmittance?.Release();
@@ -651,6 +983,10 @@ namespace Vista
             m_MultiScattering = null;
             m_SkyView?.Release();
             m_SkyView = null;
+            m_SkyReflection?.Release();
+            m_SkyReflection = null;
+            m_SkyReflectionArray?.Release();
+            m_SkyReflectionArray = null;
             ReleaseAerialPerspective();
             // GraphicsBuffer 是 IDisposable 而非 RTHandle，漏掉它不会有 RTHandle 那种
             // "泄漏检测"日志，只会安静地涨显存 —— Editor 里反复域重载时尤其明显。
@@ -658,6 +994,8 @@ namespace Vista
             m_SkyAmbientSh = null;
             m_SkyAmbientShRef?.Dispose();
             m_SkyAmbientShRef = null;
+            m_SkyReflectionVerify?.Dispose();
+            m_SkyReflectionVerify = null;
             m_BakedParams = null;
         }
 

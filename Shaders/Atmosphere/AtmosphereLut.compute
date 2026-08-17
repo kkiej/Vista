@@ -20,7 +20,7 @@
 
 // 不含 gles3：整套 LUT 走 compute + RWTexture。移动端目标是 Vulkan / Metal，
 // GLES3.x 上改用 fragment shader 写 LUT 的降级路径（见 CHANGELOG）。
-#pragma only_renderers d3d11 d3d12 vulkan metal playstation xboxone xboxseries switch
+#pragma only_renderers d3d11 vulkan metal playstation xboxone xboxseries switch
 
 #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
 #include "Packages/com.kkiej.vista/ShaderLibrary/AtmosphereDef.hlsl"

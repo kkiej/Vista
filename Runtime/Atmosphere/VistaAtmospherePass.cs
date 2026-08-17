@@ -34,17 +34,39 @@ namespace Vista
             public VistaAtmosphereLuts luts;
             public VistaAtmosphereViewData view;
             public VistaAerialPerspectiveSettings apSettings;
+            public VistaSkyReflectionMode reflectionMode;
             public TextureHandle transmittance;
             public TextureHandle multiScattering;
             public TextureHandle skyView;
             public TextureHandle apScatter;
             public TextureHandle apTransmittance;
+            public TextureHandle skyReflection;
+            public TextureHandle skyReflectionArray;
             public BufferHandle skyAmbientSh;
         }
+
+        /// <summary>
+        /// 把 pass data 里的 handle 打包给 dispatcher。抽成一个方法而不是在六个 render func
+        /// 里各写一遍字段赋值：这些 handle 的**集合**是全局的（每个 pass 只声明自己那几个，
+        /// 其余留 default），所以每处都必须是完全一样的一行。抄六遍的东西迟早有一处漏掉新字段，
+        /// 而漏掉的症状是那张表在某个 pass 里绑成 null。
+        /// </summary>
+        static VistaLutHandles Handles(LutPassData d) => new VistaLutHandles
+        {
+            transmittance   = d.transmittance,
+            multiScattering = d.multiScattering,
+            skyView         = d.skyView,
+            apScatter       = d.apScatter,
+            apTransmittance = d.apTransmittance,
+            skyReflection   = d.skyReflection,
+            skyReflectionArray = d.skyReflectionArray,
+            skyAmbientSh    = d.skyAmbientSh,
+        };
 
         VistaAtmosphereLuts m_Luts;
         VistaAtmosphereParameters m_Parameters;
         VistaAerialPerspectiveSettings m_ApSettings;
+        VistaSkyReflectionMode m_ReflectionMode = VistaSkyReflectionMode.SkyViewLut;
         float m_GroundLevelWorldY;
         float m_EV100;
 
@@ -69,11 +91,13 @@ namespace Vista
 
         public void Setup(VistaAtmosphereLuts luts, VistaAtmosphereParameters parameters,
                           VistaAerialPerspectiveSettings apSettings,
+                          VistaSkyReflectionMode reflectionMode,
                           float groundLevelWorldY, float ev100)
         {
             m_Luts = luts;
             m_Parameters = parameters;
             m_ApSettings = apSettings;
+            m_ReflectionMode = reflectionMode;
             m_GroundLevelWorldY = groundLevelWorldY;
             m_EV100 = ev100;
         }
@@ -90,6 +114,8 @@ namespace Vista
             bool staticDirty = m_Luts.PrepareLuts(m_Parameters);
             bool apEnabled = m_ApSettings != null && m_Luts.PrepareAerialPerspective(m_ApSettings);
             bool shEnabled = m_Luts.PrepareSkyAmbientSh();
+            // 解析后的模式，不是请求的模式：SH 不可用时它会退到 LUT（见 PrepareSkyReflection）。
+            var reflectionMode = m_Luts.PrepareSkyReflection(m_ReflectionMode);
 
             var view = VistaAtmosphereViewData.Create(
                 m_Parameters,
@@ -108,6 +134,10 @@ namespace Vista
             var skyView         = renderGraph.ImportTexture(m_Luts.skyViewLut);
             var apScatter       = apEnabled ? renderGraph.ImportTexture(m_Luts.apScatterLut) : default;
             var apTransmittance = apEnabled ? renderGraph.ImportTexture(m_Luts.apTransmittanceLut) : default;
+            var skyReflection   = reflectionMode != VistaSkyReflectionMode.Off
+                ? renderGraph.ImportTexture(m_Luts.skyReflectionCube) : default;
+            var skyReflectionArray = reflectionMode != VistaSkyReflectionMode.Off
+                ? renderGraph.ImportTexture(m_Luts.skyReflectionArray) : default;
             // ImportBuffer 而不是把持久 GraphicsBuffer 直接交给 dispatcher：
             // ComputeCommandBuffer.SetComputeBufferParam 有直收 GraphicsBuffer 的重载，
             // 所以那样写**能编译能跑**，但图不知道这个 pass 碰了它，不会插 barrier。
@@ -119,6 +149,14 @@ namespace Vista
             // 时序不依赖图的提交点。
             if (shEnabled)
                 m_AmbientProbe.Update(m_Luts.skyAmbientShBuffer, cameraData.cameraType);
+
+            // 反射 cubemap 与 RenderSettings 的挂接。**只挂一次引用**，之后每帧只改内容 ——
+            // 与环境光 SH 那条链路不同，这里没有任何逐帧的 CPU 开销，也不需要读回。
+            // 放在记录期而不是分配处：分配在 PrepareSkyReflection 里，那儿不知道相机类型，
+            // 而反射探针烘焙相机不该顺手改全局 RenderSettings。
+            if (reflectionMode != VistaSkyReflectionMode.Off
+                && cameraData.cameraType is CameraType.Game or CameraType.SceneView)
+                BindReflectionToRenderSettings();
 
             if (staticDirty)
             {
@@ -132,9 +170,8 @@ namespace Vista
                     // 图看不到依赖就会把 pass 剪掉。
                     builder.AllowPassCulling(false);
                     builder.SetRenderFunc((LutPassData d, ComputeGraphContext ctx) =>
-                        d.luts.RenderTransmittanceLut(new VistaGraphLutDispatcher(
-                            ctx.cmd, d.transmittance, d.multiScattering, d.skyView,
-                            d.apScatter, d.apTransmittance, d.skyAmbientSh)));
+                        d.luts.RenderTransmittanceLut(
+                            new VistaGraphLutDispatcher(ctx.cmd, Handles(d))));
                 }
 
                 using (var builder = renderGraph.AddComputePass<LutPassData>(
@@ -147,9 +184,8 @@ namespace Vista
                     builder.UseTexture(multiScattering, AccessFlags.Write);
                     builder.AllowPassCulling(false);
                     builder.SetRenderFunc((LutPassData d, ComputeGraphContext ctx) =>
-                        d.luts.RenderMultiScatteringLut(new VistaGraphLutDispatcher(
-                            ctx.cmd, d.transmittance, d.multiScattering, d.skyView,
-                            d.apScatter, d.apTransmittance, d.skyAmbientSh)));
+                        d.luts.RenderMultiScatteringLut(
+                            new VistaGraphLutDispatcher(ctx.cmd, Handles(d))));
                 }
             }
 
@@ -181,9 +217,8 @@ namespace Vista
                 builder.AllowPassCulling(false);
 
                 builder.SetRenderFunc((LutPassData d, ComputeGraphContext ctx) =>
-                    d.luts.RenderSkyViewLut(new VistaGraphLutDispatcher(
-                        ctx.cmd, d.transmittance, d.multiScattering, d.skyView,
-                        d.apScatter, d.apTransmittance, d.skyAmbientSh), d.view));
+                    d.luts.RenderSkyViewLut(
+                        new VistaGraphLutDispatcher(ctx.cmd, Handles(d)), d.view));
             }
 
             // 排在 SkyView 之后：这个核**采样** SkyView（SRV），而 SkyView pass 里它是 UAV。
@@ -216,14 +251,84 @@ namespace Vista
 
                     builder.SetRenderFunc((LutPassData d, ComputeGraphContext ctx) =>
                     {
-                        d.luts.RenderSkyAmbientSh(new VistaGraphLutDispatcher(
-                            ctx.cmd, d.transmittance, d.multiScattering, d.skyView,
-                            d.apScatter, d.apTransmittance, d.skyAmbientSh), d.view);
+                        d.luts.RenderSkyAmbientSh(
+                            new VistaGraphLutDispatcher(ctx.cmd, Handles(d)), d.view);
                         // BufferHandle -> GraphicsBuffer 的隐式转换在 execute 阶段查
                         // RenderGraphResourceRegistry.current，这里正好在 execute 里。
                         ctx.cmd.SetGlobalBuffer(VistaShaderIDs._VistaSkyAmbientSh,
                                                 (GraphicsBuffer)d.skyAmbientSh);
                     });
+                }
+            }
+
+            // 第六个 pass：反射 cubemap。同样排在 SkyView 之后（LUT 模式采它），
+            // 且在 SH pass 之后（SH 模式读那份 buffer）。两个模式各只依赖其中一条 ——
+            // 所以下面的 UseTexture / UseBuffer 是按模式声明的，不是无条件都声明：
+            // 无条件声明会让 LUT 模式在 SH 核缺失时拿到一个 default BufferHandle，
+            // 而 UseBuffer 对 default handle 会抛。
+            //
+            // 分两个 pass（compute 积分 + unsafe 拷贝）而不是一个：CopyTexture 只存在于
+            // IUnsafeCommandBuffer，ComputeCommandBuffer 上没有。这不是绕路 ——
+            // 中转纹理与 cube 之间本来就是"写完再读"，跨 pass 正好让图去插那道 barrier。
+            if (reflectionMode != VistaSkyReflectionMode.Off)
+            {
+                using (var builder = renderGraph.AddComputePass<LutPassData>(
+                           "Vista Sky Reflection", out var data))
+                {
+                    data.luts = m_Luts;
+                    data.view = view;
+                    data.reflectionMode = reflectionMode;
+                    data.skyView = skyView;
+                    data.skyReflectionArray = skyReflectionArray;
+
+                    if (reflectionMode == VistaSkyReflectionMode.AmbientSh)
+                    {
+                        data.skyAmbientSh = skyAmbientSh;
+                        builder.UseBuffer(skyAmbientSh, AccessFlags.Read);
+                    }
+                    else
+                    {
+                        builder.UseTexture(skyView, AccessFlags.Read);
+                    }
+
+                    // 七级 mip 一次声明。RenderGraph 跟踪的是整张资源的状态，
+                    // 而这张图全程只有 UAV 一个状态（每级都独立地从源积分，级间无依赖）——
+                    // 这正是"不做渐进预滤波"换来的东西：七趟 dispatch 挤在一个 pass 里，
+                    // 零 barrier。见 SkyReflection.compute 的头注。
+                    builder.UseTexture(skyReflectionArray, AccessFlags.Write);
+
+                    // view.Bind + _VistaSkyReflectionParams 都是全局
+                    builder.AllowGlobalStateModification(true);
+                    // 消费者是 unity_SpecCube0，图里看不见。
+                    builder.AllowPassCulling(false);
+
+                    builder.SetRenderFunc((LutPassData d, ComputeGraphContext ctx) =>
+                        d.luts.RenderSkyReflection(
+                            new VistaGraphLutDispatcher(ctx.cmd, Handles(d)), d.view, d.reflectionMode));
+                }
+
+                using (var builder = renderGraph.AddUnsafePass<LutPassData>(
+                           "Vista Sky Reflection Copy", out var data))
+                {
+                    data.luts = m_Luts;
+
+                    builder.UseTexture(skyReflectionArray, AccessFlags.Read);
+                    builder.UseTexture(skyReflection, AccessFlags.Write);
+
+                    // 全局纹理主要给自定义 shader 用；URP 的标准材质走的是
+                    // unity_SpecCube0，那条路由 RenderSettings.customReflectionTexture 接。
+                    // 挂在**拷贝**之后而不是积分之后：积分完 cube 里还是上一帧的内容。
+                    builder.SetGlobalTextureAfterPass(skyReflection, VistaShaderIDs._VistaSkyReflection);
+                    builder.AllowGlobalStateModification(true);
+                    builder.AllowPassCulling(false);
+
+                    // 拷贝走的是 LUT 自己持有的持久 RTHandle，而不是从 handle 解析回资源。
+                    // 这是安全的**因为**两张图都在上面 UseTexture 声明过 —— 图知道这个 pass
+                    // 读写了它们，barrier 与执行顺序都是对的；被绕过的只有 handle→资源
+                    // 那一步查表，而对 ImportTexture 进来的资源那一步本来就是恒等映射。
+                    builder.SetRenderFunc((LutPassData d, UnsafeGraphContext ctx) =>
+                        d.luts.CopySkyReflectionToCube(
+                            CommandBufferHelpers.GetNativeCommandBuffer(ctx.cmd)));
                 }
             }
 
@@ -257,10 +362,33 @@ namespace Vista
                 builder.AllowPassCulling(false);
 
                 builder.SetRenderFunc((LutPassData d, ComputeGraphContext ctx) =>
-                    d.luts.RenderAerialPerspectiveLut(new VistaGraphLutDispatcher(
-                        ctx.cmd, d.transmittance, d.multiScattering, d.skyView,
-                        d.apScatter, d.apTransmittance, d.skyAmbientSh), d.view, d.apSettings));
+                    d.luts.RenderAerialPerspectiveLut(
+                        new VistaGraphLutDispatcher(ctx.cmd, Handles(d)), d.view, d.apSettings));
             }
+        }
+
+        /// <summary>
+        /// 把反射 cubemap 接到 <c>RenderSettings.customReflectionTexture</c>，让 URP 的
+        /// <c>GlossyEnvironmentReflection</c> 把它当 <c>unity_SpecCube0</c> 采 ——
+        /// 不需要改任何材质 shader，这是选"产出真 cubemap"而不是"给材质塞一个自定义
+        /// 全局 + 改 shader"的全部理由。
+        ///
+        /// 只在引用变化时写。RenderSettings 的赋值是**场景状态**，逐帧无条件写在 Editor 里
+        /// 会反复触发场景比较（实测环境光那几个属性不会置脏，但没有理由去赌每个属性都一样）。
+        /// 内容更新走的是 RT 本身，与这里无关。
+        /// </summary>
+        void BindReflectionToRenderSettings()
+        {
+            var cube = m_Luts.skyReflectionCube;
+            if (cube == null || cube.rt == null) return;
+
+            if (!ReferenceEquals(RenderSettings.customReflectionTexture, cube.rt))
+                RenderSettings.customReflectionTexture = cube.rt;
+            // 必须同时切 Custom：留在 Skybox 模式下，引擎会去烘 RenderSettings.skybox
+            // 那张材质的反射探针，我们这张图根本不会被采 —— 症状是"反射看着对，
+            // 但完全不跟太阳走"，而且没有任何报错。
+            if (RenderSettings.defaultReflectionMode != DefaultReflectionMode.Custom)
+                RenderSettings.defaultReflectionMode = DefaultReflectionMode.Custom;
         }
 
         /// <summary>

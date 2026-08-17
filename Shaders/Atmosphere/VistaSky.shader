@@ -37,7 +37,7 @@ Shader "Vista/Sky"
             #pragma fragment Frag
             #pragma target 3.5
             // 不含 gles：SkyView LUT 由 compute 产出，GLES3.x 走降级路径（见 CHANGELOG）
-            #pragma only_renderers d3d11 d3d12 vulkan metal playstation xboxone xboxseries switch
+            #pragma only_renderers d3d11 vulkan metal playstation xboxone xboxseries switch
 
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
             #include "Packages/com.kkiej.vista/ShaderLibrary/AtmosphereScattering.hlsl"

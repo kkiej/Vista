@@ -12,6 +12,28 @@ namespace Vista
         SkyView,
         ApScatter,
         ApTransmittance,
+        /// <summary>
+        /// 天空镜面反射 cubemap。**只做 SRV**（自检核按 TEXTURECUBE 读它，
+        /// 运行时挂到 unity_SpecCube0）。写走 <see cref="SkyReflectionArray"/>。
+        /// </summary>
+        SkyReflection,
+        /// <summary>
+        /// 反射的 UAV 目标：一张 6 层 × 7 级 mip 的 Tex2DArray，内容与 cubemap 逐面一致，
+        /// dispatch 完由 CopyTexture 逐面搬进 cube。唯一一个需要按 mip 绑定的槽位。
+        ///
+        /// 为什么不直接把 Cube RT 绑到 <c>RWTexture2DArray</c>：Unity 的绑定校验拒绝它 ——
+        ///   Property (_VistaSkyReflectionRW) ... has mismatching output texture dimension
+        ///   (expected 5, got 4)
+        /// （5 = Tex2DArray = HLSL 声明，4 = Cube = 绑上来的 RT）。硬件层面 cube 的 UAV view
+        /// 就是 2D array view，但 Unity 不给这条路：core / URP 两个包里没有任何 compute
+        /// 写 cubemap 的先例，引擎自己的那条路（Runtime/PathTracing/Environment/CubemapRender.cs）
+        /// 是 SetRenderTarget 逐面**光栅**。
+        /// 于是要么改成光栅（要重写 GGX 积分核 + 逐面逐 mip 的 attachment 管理），
+        /// 要么多一张中转纹理。选后者：GGX 积分、mip↔粗糙度反函数、逐面方向约定
+        /// 这三处最贵最容易错的东西一个字都不用动，代价是 6×64²×7级 fp16 ≈ 0.4 MB 显存。
+        /// 而且它顺带**加强**了自检 —— 判据 1 现在还同时验证 element→CubemapFace 的映射。
+        /// </summary>
+        SkyReflectionArray,
     }
 
     /// <summary>
@@ -25,6 +47,8 @@ namespace Vista
         SkyAmbientSh,
         /// <summary>仅 Editor 自检使用（参考解输出）。运行时路径不分配它。</summary>
         SkyAmbientShReference,
+        /// <summary>仅 Editor 自检使用（反射 round-trip 报告）。运行时路径不分配它。</summary>
+        SkyReflectionVerify,
     }
 
     /// <summary>
@@ -42,6 +66,17 @@ namespace Vista
     public interface IVistaLutDispatcher
     {
         void SetTexture(ComputeShader cs, int kernelIndex, int nameID, VistaLutSlot slot);
+
+        /// <summary>
+        /// 绑定某一级 mip。反射的 UAV 目标每级 mip 是一趟独立 dispatch，
+        /// 而 UAV 绑定必须指到具体 mip —— 不指的话两条路径的默认行为都是 mip 0，
+        /// 于是七趟 dispatch 全写在 mip0 上、其余六级保持清空后的黑，
+        /// 症状是"粗糙度一上去反射就变黑"。
+        ///
+        /// 单独开一个方法而不是给上面那个加默认参数：默认参数会让"忘了传 mip"
+        /// 这件事悄悄编译过去，而它恰好就是上面那个症状的成因。
+        /// </summary>
+        void SetTextureMip(ComputeShader cs, int kernelIndex, int nameID, VistaLutSlot slot, int mipLevel);
 
         /// <summary>
         /// Buffer 的情况和纹理**不对称**，而且这个不对称本身就是加这层抽象的理由：
@@ -75,6 +110,9 @@ namespace Vista
         public void SetTexture(ComputeShader cs, int kernelIndex, int nameID, VistaLutSlot slot)
             => m_Cmd.SetComputeTextureParam(cs, kernelIndex, nameID, Resolve(slot));
 
+        public void SetTextureMip(ComputeShader cs, int kernelIndex, int nameID, VistaLutSlot slot, int mipLevel)
+            => m_Cmd.SetComputeTextureParam(cs, kernelIndex, nameID, Resolve(slot), mipLevel);
+
         public void SetBuffer(ComputeShader cs, int kernelIndex, int nameID, VistaLutBufferSlot slot)
             => m_Cmd.SetComputeBufferParam(cs, kernelIndex, nameID, Resolve(slot));
 
@@ -90,18 +128,21 @@ namespace Vista
         // 让它在绑定处直接炸掉，比兜底安静地跑出错误画面便宜得多。
         RTHandle Resolve(VistaLutSlot slot) => slot switch
         {
-            VistaLutSlot.Transmittance   => m_Luts.transmittanceLut,
-            VistaLutSlot.MultiScattering => m_Luts.multiScatteringLut,
-            VistaLutSlot.SkyView         => m_Luts.skyViewLut,
-            VistaLutSlot.ApScatter       => m_Luts.apScatterLut,
-            VistaLutSlot.ApTransmittance => m_Luts.apTransmittanceLut,
-            _                            => null,
+            VistaLutSlot.Transmittance      => m_Luts.transmittanceLut,
+            VistaLutSlot.MultiScattering    => m_Luts.multiScatteringLut,
+            VistaLutSlot.SkyView            => m_Luts.skyViewLut,
+            VistaLutSlot.ApScatter          => m_Luts.apScatterLut,
+            VistaLutSlot.ApTransmittance    => m_Luts.apTransmittanceLut,
+            VistaLutSlot.SkyReflection      => m_Luts.skyReflectionCube,
+            VistaLutSlot.SkyReflectionArray => m_Luts.skyReflectionArray,
+            _                               => null,
         };
 
         GraphicsBuffer Resolve(VistaLutBufferSlot slot) => slot switch
         {
             VistaLutBufferSlot.SkyAmbientSh          => m_Luts.skyAmbientShBuffer,
             VistaLutBufferSlot.SkyAmbientShReference => m_Luts.skyAmbientShRefBuffer,
+            VistaLutBufferSlot.SkyReflectionVerify   => m_Luts.skyReflectionVerifyBuffer,
             _                                        => null,
         };
     }
@@ -115,27 +156,34 @@ namespace Vista
         readonly TextureHandle m_SkyView;
         readonly TextureHandle m_ApScatter;
         readonly TextureHandle m_ApTransmittance;
+        readonly TextureHandle m_SkyReflection;
+        readonly TextureHandle m_SkyReflectionArray;
         readonly BufferHandle m_SkyAmbientSh;
 
-        public VistaGraphLutDispatcher(ComputeCommandBuffer cmd,
-                                       TextureHandle transmittance,
-                                       TextureHandle multiScattering,
-                                       TextureHandle skyView,
-                                       TextureHandle apScatter,
-                                       TextureHandle apTransmittance,
-                                       BufferHandle skyAmbientSh)
+        /// <summary>
+        /// 用 <see cref="VistaLutHandles"/> 打包而不是继续加位置参数：这个构造在每个
+        /// pass 的 render func 里都要写一遍（现在六处），八个同类型的 <c>TextureHandle</c>
+        /// 位置参数一旦写错顺序，编译器什么都不会说，而症状是"某张表里出现了另一张表的内容"。
+        /// 打包之后顺序错误变成字段名错误，编译期就挡住了。
+        /// </summary>
+        public VistaGraphLutDispatcher(ComputeCommandBuffer cmd, in VistaLutHandles handles)
         {
             m_Cmd = cmd;
-            m_Transmittance = transmittance;
-            m_MultiScattering = multiScattering;
-            m_SkyView = skyView;
-            m_ApScatter = apScatter;
-            m_ApTransmittance = apTransmittance;
-            m_SkyAmbientSh = skyAmbientSh;
+            m_Transmittance = handles.transmittance;
+            m_MultiScattering = handles.multiScattering;
+            m_SkyView = handles.skyView;
+            m_ApScatter = handles.apScatter;
+            m_ApTransmittance = handles.apTransmittance;
+            m_SkyReflection = handles.skyReflection;
+            m_SkyReflectionArray = handles.skyReflectionArray;
+            m_SkyAmbientSh = handles.skyAmbientSh;
         }
 
         public void SetTexture(ComputeShader cs, int kernelIndex, int nameID, VistaLutSlot slot)
             => m_Cmd.SetComputeTextureParam(cs, kernelIndex, nameID, Resolve(slot));
+
+        public void SetTextureMip(ComputeShader cs, int kernelIndex, int nameID, VistaLutSlot slot, int mipLevel)
+            => m_Cmd.SetComputeTextureParam(cs, kernelIndex, nameID, Resolve(slot), mipLevel);
 
         // Resolve 返回 BufferHandle，靠 BufferHandle -> GraphicsBuffer 的隐式转换落到
         // SetComputeBufferParam 上。那个转换是在 execute 阶段查
@@ -152,12 +200,14 @@ namespace Vista
 
         TextureHandle Resolve(VistaLutSlot slot) => slot switch
         {
-            VistaLutSlot.Transmittance   => m_Transmittance,
-            VistaLutSlot.MultiScattering => m_MultiScattering,
-            VistaLutSlot.SkyView         => m_SkyView,
-            VistaLutSlot.ApScatter       => m_ApScatter,
-            VistaLutSlot.ApTransmittance => m_ApTransmittance,
-            _                            => default,
+            VistaLutSlot.Transmittance      => m_Transmittance,
+            VistaLutSlot.MultiScattering    => m_MultiScattering,
+            VistaLutSlot.SkyView            => m_SkyView,
+            VistaLutSlot.ApScatter          => m_ApScatter,
+            VistaLutSlot.ApTransmittance    => m_ApTransmittance,
+            VistaLutSlot.SkyReflection      => m_SkyReflection,
+            VistaLutSlot.SkyReflectionArray => m_SkyReflectionArray,
+            _                               => default,
         };
 
         // 参考解那张只在 Editor 立即模式下存在，运行时图里没有对应资源 ——
@@ -169,5 +219,22 @@ namespace Vista
             VistaLutBufferSlot.SkyAmbientSh => m_SkyAmbientSh,
             _                               => default,
         };
+    }
+
+    /// <summary>
+    /// 一帧内所有 LUT 的 RenderGraph handle。纯数据打包，没有行为 ——
+    /// 存在的唯一目的是让 <see cref="VistaGraphLutDispatcher"/> 的构造在六个 pass
+    /// 里都写成一行，且顺序错误在编译期被字段名挡住。
+    /// </summary>
+    public struct VistaLutHandles
+    {
+        public TextureHandle transmittance;
+        public TextureHandle multiScattering;
+        public TextureHandle skyView;
+        public TextureHandle apScatter;
+        public TextureHandle apTransmittance;
+        public TextureHandle skyReflection;
+        public TextureHandle skyReflectionArray;
+        public BufferHandle skyAmbientSh;
     }
 }

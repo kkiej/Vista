@@ -51,5 +51,14 @@ namespace Vista
         public static readonly int _VistaSkyAmbientShRW          = Shader.PropertyToID("_VistaSkyAmbientShRW");
         // 自检专用：参考解（逐法线的辐照度对照）
         public static readonly int _VistaSkyAmbientShRefRW       = Shader.PropertyToID("_VistaSkyAmbientShRefRW");
+
+        // ---- Atmosphere: 天空镜面反射 cubemap ----
+        // 注意 RW 那个在 HLSL 里是 RWTexture2DArray（cube 的 UAV view 就是 2D array view），
+        // 而只读那个是 TEXTURECUBE。同一张资源、两种 view，绑定点必须分开。
+        public static readonly int _VistaSkyReflection            = Shader.PropertyToID("_VistaSkyReflection");
+        public static readonly int _VistaSkyReflectionRW          = Shader.PropertyToID("_VistaSkyReflectionRW");
+        public static readonly int _VistaSkyReflectionParams      = Shader.PropertyToID("_VistaSkyReflectionParams");
+        // 自检专用：逐面 round-trip / 均值恒等式 / mip↔粗糙度映射
+        public static readonly int _VistaSkyReflectionVerifyRW    = Shader.PropertyToID("_VistaSkyReflectionVerifyRW");
     }
 }

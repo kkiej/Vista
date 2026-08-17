@@ -1,0 +1,397 @@
+// Vista 天空镜面反射 cubemap。
+//
+// 产出一张 64²、7 级 mip 的 Cube RenderTexture，直接挂到
+// RenderSettings.customReflectionTexture，于是 URP 的 GlossyEnvironmentReflection
+// 会把它当 unity_SpecCube0 采 —— 不需要改任何材质 shader。
+//
+// 核：
+//   SkyReflectionFilter   逐 mip 一趟 dispatch，从 SkyView LUT（或 SH）GGX 预积分
+//   SkyReflectionVerify   仅 Editor 自检
+//
+// ---- 为什么不做「渐进预滤波」（读 mip N−1 写 mip N）----
+// 那是 cubemap 预滤波的标准做法（HDRP 的 IBLFilterGGX、Karis 2013 的 PrefilterEnvMap
+// 实现都是），但它要求同一张资源在同一趟里既当 SRV 又当 UAV。RenderGraph 跟踪的是
+// **整张资源**的状态，一个 pass 内一个资源只有一个状态 —— 这与三张静态大气表必须
+// 拆 pass 是同一类未定义行为（见 CHANGELOG 的坑）。要绕开只有三条路：
+//   a) 把源 mip 也按 UAV 读 —— 状态统一了，但丢掉硬件双线性与跨面无缝滤波，
+//      结果是 cube 接缝处出现可见的硬边。
+//   b) 两张纹理 ping-pong（HDRP 的形态）—— 正确，但显存翻倍，且需要在图里
+//      GenerateMips。
+//   c) 拆成 7 个 pass 串行 —— 正确，但 7 个 pass 各自只有几百个纹素的工作量，
+//      全是调度开销。
+// 而**每级 mip 直接从 SkyView LUT 积分**把问题整类消掉：这张 cubemap 全程纯写、
+// 只有 UAV 一个状态，零 barrier、零 ping-pong、7 趟 dispatch 挤在一个 pass 里。
+// 质量还严格更好：没有 box-filter 的近似、没有跨级累积的误差、mip0 是精确镜面，
+// 而且接缝在结构上不可能出现（每个纹素积的都是真实世界方向）。
+//
+// 能这么做的前提是开销够低。需要滤波的纹素只有 mip1~6 共
+//   6 面 × (1024+256+64+16+4+1) = 8190 个
+// 配上随 mip 上升的采样数（见 VistaSkyReflectionSampleCount）总计约 376k 次
+// LUT 双线性取样 —— 不是 raymarch，只是取样。加上 mip0 的 24.6k 次，总计约 0.4M。
+
+#pragma kernel SkyReflectionFilter
+#pragma kernel SkyReflectionVerify
+
+// 与 AtmosphereLut.compute 同一份平台列表：整条 LUT 链路都是 compute + RWTexture，
+// GLES3.x 上要走 fragment 降级路径（见 CHANGELOG）。
+// 没有 d3d12 这个 token —— D3D12 走的就是 d3d11 的编译目标，写上只会换来一条
+// "Unrecognized renderer" 警告。
+#pragma only_renderers d3d11 vulkan metal playstation xboxone xboxseries switch
+
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+#include "Packages/com.kkiej.vista/ShaderLibrary/AtmosphereDef.hlsl"
+#include "Packages/com.kkiej.vista/ShaderLibrary/AtmosphereScattering.hlsl"
+#include "Packages/com.kkiej.vista/ShaderLibrary/SphericalHarmonics.hlsl"
+#include "Packages/com.kkiej.vista/ShaderLibrary/SkyReflection.hlsl"
+
+// x = 当前 mip 的边长，y = mip 序号，z = 辐射来源（VISTA_SKY_REFLECTION_SRC_*），w = 未用。
+//
+// 边长由 C# 传进来而不是核内用 VISTA_SKY_REFLECTION_SIZE >> mip 算：
+// C# 侧无论如何都要有这个数（dispatch 尺寸、分配尺寸），两边各算一遍就有走歧的余地。
+// 传进来之后 HLSL 侧那个 define 只剩一个用处 —— 让自检核把它**报出来**给 C# 比对，
+// 于是"两边不一致"变成一条会红的断言，而不是一个安静的错。
+float4 _VistaSkyReflectionParams;
+
+// UAV 目标是一张 6 层 × 7 级 mip 的 **Tex2DArray**，z = 面序号；dispatch 完由 C# 侧
+// 逐面 CopyTexture 搬进真正的 Cube RT。
+//
+// 原本这里直接绑 Cube RT（硬件上 cube 的 UAV view 就是 2D array view）。Unity 不允许：
+//   Compute shader (SkyReflection): Property (_VistaSkyReflectionRW) at kernel index (0)
+//   has mismatching output texture dimension (expected 5, got 4)
+// 5 = Tex2DArray（这行声明），4 = Cube（绑上来的 RT）。也就是说 core 里那个
+// "Cube RT + enableRandomWrite"的先例（Runtime/PathTracing/Environment/CubemapRender.cs:152-160）
+// 只说明**分配**合法 —— 它自己是用 SetRenderTarget 逐面光栅进去的，从没把它当 compute UAV 绑。
+// 整个 core + URP 里没有任何 compute 写 cubemap 的先例，这条路是不存在的。
+//
+// 于是走中转纹理（当时就写在这儿的兜底方案），代价是 6×64²×7 级 fp16 ≈ 0.4 MB。
+// 另一条路是照 HDRP IBLFilterGGX 改成光栅（SetRenderAttachment 带 mipLevel/depthSlice），
+// 那要重写这个核；中转纹理让 GGX 积分、mip↔粗糙度反函数、逐面方向约定一个字都不用改。
+// 顺带的好处：自检判据 1 现在还同时验证 element→CubemapFace 的映射 ——
+// 搬错面的症状是那一面单独炸红，而不是"六面都对但整体转了 90°"这种要看图才发现的错。
+RWTexture2DArray<float4> _VistaSkyReflectionRW;
+
+// ============================================================================
+//  滤波核
+// ============================================================================
+
+/// 按当前模式取某个方向上的天空亮度。两种来源共用下面同一套 GGX 积分 ——
+/// 唯一的差别就是这一个函数，这正是"两条路径必须共用同一套 mip→粗糙度映射"
+/// 的落地形式：消费端（材质 shader）是同一份代码，采出来的两张图必须可互换。
+float3 VistaSkyReflectionRadiance(uint source, float3 dir,
+                                  float3 posKm, float3 sunDir,
+                                  float3 sh[VISTA_SH_COEFF_COUNT])
+{
+    if (source == VISTA_SKY_REFLECTION_SRC_SH)
+        return max(VistaShRadiance(sh, dir), 0.0);   // L2 重建在暗部会过冲到负值
+    return VistaSampleSkyViewLut(posKm, dir, sunDir);
+}
+
+// 8×8×1，z = 面。最粗的几级（4²、2²、1²）会有大量线程被 size 判据挡掉，
+// 但那几级总共只有 6×21 个纹素，浪费的是几十个线程，不值得为它换一套 dispatch 形状。
+[numthreads(8, 8, 1)]
+void SkyReflectionFilter(uint3 id : SV_DispatchThreadID)
+{
+    uint size   = (uint)_VistaSkyReflectionParams.x;
+    uint mip    = (uint)_VistaSkyReflectionParams.y;
+    uint source = (uint)_VistaSkyReflectionParams.z;
+
+    if (id.x >= size || id.y >= size)
+        return;
+
+    uint   face = id.z;
+    float3 R    = VistaSkyReflectionTexelToDirection(id.xy, size, face);
+
+    float3 posKm  = _VistaViewPosKm.xyz;
+    float3 sunDir = _VistaSunDirection.xyz;
+
+    // 循环外读一次。SH 模式下每个纹素 9 次 buffer 取样，放进采样循环就是 ×K。
+    //
+    // 只在 SH 模式下读，而不是无条件读：LUT 模式下这个 buffer **不会被绑定** ——
+    // 让"从 LUT 积分"这条路径对 SH 模块零依赖，才能在 SH 核挂掉时反射照常工作
+    // （isSkyReflectionValid 与 isSkyAmbientShValid 是两个独立开关，就是为了这个）。
+    // 未绑定的 StructuredBuffer 被读到，在 D3D11 上返回 0、在 D3D12/Vulkan 上是未定义的。
+    // 所以这里必须是真分支，不能写成 `cond ? load : 0` —— 三元式会被编译成 select，
+    // 取样照样发生。
+    //
+    // 手写这个循环而不是调 VistaLoadSkyAmbientSh：那个函数的参数是 `out float3 sh[9]`，
+    // 而 out 数组走的是 copy-out 语义 —— 放在 if 里调，FXC 的数据流会丢掉
+    // "分支外已经清零过"这件事，报 "use of potentially uninitialized variable"。
+    // 库函数本身没问题（它的其他调用点都是无条件的），改库去迁就这一处才是本末倒置。
+    float3 sh[VISTA_SH_COEFF_COUNT];
+    [unroll]
+    for (uint c = 0u; c < VISTA_SH_COEFF_COUNT; ++c)
+        sh[c] = 0.0;
+
+    if (source == VISTA_SKY_REFLECTION_SRC_SH)
+    {
+        [unroll]
+        for (uint c2 = 0u; c2 < VISTA_SH_COEFF_COUNT; ++c2)
+            sh[c2] = _VistaSkyAmbientSh[c2].rgb;
+    }
+
+    // pr 是**感知**粗糙度，α 是线性粗糙度。SampleGGXDir 要的是 α ——
+    // 这里传错的症状与"mip→粗糙度映射写错"完全一样（某个粗糙度区间偏锐/偏糊），
+    // 而 α = pr² 这一步很容易在重构时被顺手删掉。
+    float pr    = VistaMipToPerceptualRoughness((float)mip);
+    float alpha = pr * pr;
+
+    uint  K = VistaSkyReflectionSampleCount(mip, source);
+    float3x3 localToWorld = GetLocalFrame(R);
+
+    // Karis 2013 的 PrefilterEnvMap 累加：N = V = R（把"从 R 方向看"当作
+    // "法线就是 R、视线也是 R"），权重取 NdotL 并最后归一化。
+    // 这是各向同性近似 —— 真实的 GGX lobe 依赖 NdotV，掠射时会拉长成各向异性。
+    // 采样端（URP 的 GlossyEnvironmentReflection）用的是不带 NdotR 的单参重载，
+    // 也就是说**它本来就假设这张图是各向同性预滤波的**。跟着它走，而不是做得
+    // "更物理"然后与采样端的假设错开 —— 后者的症状是掠射角反射整体偏暗。
+    float3 sum    = 0.0;
+    float  weight = 0.0;
+
+    for (uint i = 0u; i < K; ++i)
+    {
+        // Hammersley 而不是 Fibonacci：这里是**二维**低差异序列（GGX 的 (θ, φ) 重要性
+        // 采样要两个 u），Fibonacci 螺旋给的是球面方向，用不上。
+        // SH 那边反过来 —— 它要的是均匀球面方向集，所以用 Fibonacci。
+        float2 u = Hammersley2d(i, K);
+
+        float3 L;
+        float  NdotL, NdotH, VdotH;
+        SampleGGXDir(u, R, localToWorld, alpha, L, NdotL, NdotH, VdotH);
+
+        // mip0（α = 0）时 SampleGGXDir 的 cosθ = sqrt((1−u)/(1−u)) ≡ 1，于是 H ≡ R、
+        // L ≡ R、NdotL ≡ 1 —— 一个样本就是**精确**的镜面值，不是近似。
+        // 所以 mip0 不需要单独的分支。(u = (0,0)，不会踩到 0/0。)
+        if (NdotL <= 0.0)
+            continue;   // 高粗糙度下 lobe 会甩到 R 的背半球，那部分不属于这个方向的反射
+
+        sum    += VistaSkyReflectionRadiance(source, L, posKm, sunDir, sh) * NdotL;
+        weight += NdotL;
+    }
+
+    // K 很小且 α 很大时理论上可能全被剔掉。退回镜面值而不是写 0：
+    // 一个黑纹素在 cubemap 里会被下游当成"这个方向没有天空"，
+    // 表现为反射上的黑点，比稍微锐一点难看得多。
+    float3 result = (weight > 0.0)
+        ? sum / weight
+        : VistaSkyReflectionRadiance(source, R, posKm, sunDir, sh);
+
+    // 太阳圆盘不进这张图（VistaSampleSkyViewLut 本来就不含它）。两个理由：
+    //   1) URP 的平行光已经给了解析 GGX 高光，圆盘再进反射就是重复计一次；
+    //   2) 圆盘亮度 1e9 量级，fp16 上限 65504，进来直接饱和成 Inf，
+    //      而 Inf 会经预滤波的归一化污染整片纹素。
+    _VistaSkyReflectionRW[uint3(id.xy, face)] = float4(result, 1.0);
+}
+
+// ============================================================================
+//  自检核（仅 Editor 调用）
+//
+//  验三件事，三者的失败模式互不重叠：
+//
+//   1) 逐面 round-trip（**方位判据**）：mip0 每个纹素的值就是该方向的 LUT 值
+//      （K=1 精确镜面），所以"用硬件 SAMPLE_TEXTURECUBE_LOD 在该纹素中心采出来的值"
+//      必须等于"直接问 LUT 的值"，只差 fp16 量化。
+//      这一项是**朝向无关**的：不管 cube 的面序 / v 轴朝向的"正确约定"是什么，
+//      只要写入端与采样端不一致就会立刻炸 —— 也就是说我不需要赌自己记对了约定。
+//      逐**面**分别报误差，是因为约定错通常只错其中几个面，
+//      单报一个全局最大值只能告诉你"坏了"，逐面能直接告诉你坏在哪。
+//      取样点故意落在 stride 8、偏移 4 的纹素中心上：避开边缘纹素，
+//      于是完全不涉及跨面滤波，比较是精确的（阈值可以卡到 1%）。
+//
+//   2) 均值恒等式（**尺度判据**，跨模块）：cubemap 在整球上的平均亮度
+//      必须等于 SH 的 L_00·Y00 —— 两者是同一片天空的同一个方向无关量，
+//      而它们经由**完全不同**的两条链路算出来（一条走 cube 纹素 + 硬件滤波，
+//      一条走 Fibonacci 投影 + 4π/N 权重）。这一项同时交叉验证了 #5a 与 #5b：
+//      任何一边的整体缩放错都会让它红，而单看任何一边都看不出来。
+//      顺带用同一批方向直接问 LUT 得到第三个值，用来区分"cube 错了"与"SH 错了"。
+//
+//   3) mip↔粗糙度 round-trip（**约定判据**）：把 VistaMipToPerceptualRoughness
+//      的结果再喂回 URP 自己的 PerceptualRoughnessToMipmapLevel，必须回到原 mip。
+//      与 #5a 标定 Unity 的 SH 归一化约定是同一个套路：**不推理，去测**。
+//      URP 哪天改了那条曲线，这里会红，而不是等到看图发现"金属反射糊了一档"。
+//      同一行顺便把 HLSL 侧的 SIZE / MIPS / LOD_STEPS 报出来给 C# 比对常量。
+// ============================================================================
+
+#define VISTA_SKY_REFL_VERIFY_THREADS 64u
+/// 逐面取样的步长与偏移：texel (x·8+4, y·8+4)，8×8 = 64 个点，正好一个线程一个。
+/// 偏移 4 让取样点远离边缘纹素（0 与 size−1），跨面滤波不参与比较。
+#define VISTA_SKY_REFL_VERIFY_STRIDE 8u
+#define VISTA_SKY_REFL_VERIFY_OFFSET 4u
+/// 均值组的方向数。与 SH 投影用同一个 Fibonacci 序列，但**不必**同样多 ——
+/// 这里比的是两个已经各自收敛的均值，不是要让某条恒等式在有限样本下精确成立。
+#define VISTA_SKY_REFL_VERIFY_MEAN_SAMPLES 1024u
+
+// 组划分：0..5 逐面，6 均值，7 mip 映射。
+#define VISTA_SKY_REFL_VERIFY_FACE_GROUPS 6u
+#define VISTA_SKY_REFL_VERIFY_MEAN_GROUP  6u
+#define VISTA_SKY_REFL_VERIFY_MIP_GROUP   7u
+#define VISTA_SKY_REFL_VERIFY_GROUPS      8
+
+// 输出缓冲的行布局。**显式的行基址，不用组号做算术** ——
+// 一开始我写的是 MEAN_GROUP + i / MIP_GROUP + 3 + m，看着简洁，实际在第 9 行留了个洞，
+// 而 C# 侧按"紧凑排列"去读就会整段错位。行基址与组号是两件不同的事，别复用同一个数。
+// 与 C# 侧的 VistaAtmosphereLuts.k_ReflVerify* 一一对应。
+#define VISTA_SKY_REFL_ROW_FACE  0u                                    // 0..5
+#define VISTA_SKY_REFL_ROW_MEAN  6u                                    // 6=cube 7=lut 8=sh
+#define VISTA_SKY_REFL_ROW_MIP   9u                                    // 9..9+MIPS-1
+#define VISTA_SKY_REFL_ROW_CONST (VISTA_SKY_REFL_ROW_MIP + (uint)VISTA_SKY_REFLECTION_MIPS)
+
+TEXTURECUBE(_VistaSkyReflection);
+RWStructuredBuffer<float4> _VistaSkyReflectionVerifyRW;
+
+groupshared float3 gs_VerifyA[VISTA_SKY_REFL_VERIFY_THREADS];
+groupshared float3 gs_VerifyB[VISTA_SKY_REFL_VERIFY_THREADS];
+groupshared float  gs_VerifyMax[VISTA_SKY_REFL_VERIFY_THREADS];
+groupshared float  gs_VerifySum[VISTA_SKY_REFL_VERIFY_THREADS];
+groupshared float  gs_VerifyCnt[VISTA_SKY_REFL_VERIFY_THREADS];
+
+float3 VistaSampleSkyReflection(float3 dir, float mip)
+{
+    return SAMPLE_TEXTURECUBE_LOD(_VistaSkyReflection, sampler_LinearClamp, dir, mip).rgb;
+}
+
+/// 逐通道最大偏差 / 三通道最大值。分母用三通道的最大值而不是各通道自己：
+/// 日落时蓝通道接近 0，用它当分母会让相对误差爆到几百，而那点绝对偏差在画面上
+/// 根本看不见 —— 自检会因此长期红着，等于废掉。与 SH 自检的 RelErr 同一个理由。
+float VistaVerifyRelErr(float3 a, float3 b)
+{
+    float scale = max(max(b.x, b.y), max(b.z, 1e-4));
+    float d = max(abs(a.x - b.x), max(abs(a.y - b.y), abs(a.z - b.z)));
+    return d / scale;
+}
+
+// ---- 为什么三个判据是"全组陪跑"而不是各自 early-return ----
+// 最自然的写法是 `if (group == MEAN_GROUP) { ...; return; }` 三段并列。FXC 拒绝它：
+//   error: thread sync operation must be in non-varying flow control
+// SV_GroupID 在组内是常量，但 FXC 的判据是**语法上**的 —— 只要 barrier 之前存在
+// 任何以线程相关值为条件的 return，它就认定后续 barrier 处于 varying flow control。
+// （被点名的是 groupThreadId / tid，因为归约末尾的 `if (tid > 0) return;` 也算。）
+// 这不是保守过度：DXIL 层面 barrier 要求整组到齐，提前退出的线程永远到不了。
+//
+// 所以三段判据顺序排开，barrier 一律留在顶层无条件流里，让八个组全部走完全部 barrier：
+// 出结果的组由 `if (group == ...)` 决定**写不写**，而不是决定**走不走**。
+// 代价是每组多跑两趟 64 线程 6 次迭代的归约 —— 自检核本来就是一次性的，不值一提。
+// 备选是拆成三个 kernel，但那样 C# 侧要维护三次 dispatch 与三套绑定，
+// 而这个核的三条判据是**互相印证**的（见上面的头注），拆开反而弱化了它。
+[numthreads(64, 1, 1)]
+void SkyReflectionVerify(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
+{
+    uint tid   = groupThreadId.x;
+    uint group = groupId.x;
+
+    uint   size   = (uint)_VistaSkyReflectionParams.x;
+    float3 posKm  = _VistaViewPosKm.xyz;
+    float3 sunDir = _VistaSunDirection.xyz;
+
+    // ---- 判据 1：逐面 round-trip（组 0..5 出结果）----
+    float err = 0.0;
+    float cnt = 0.0;
+    if (group < VISTA_SKY_REFL_VERIFY_FACE_GROUPS)
+    {
+        uint2 texel = uint2(tid % VISTA_SKY_REFL_VERIFY_STRIDE,
+                            tid / VISTA_SKY_REFL_VERIFY_STRIDE)
+                    * VISTA_SKY_REFL_VERIFY_STRIDE + VISTA_SKY_REFL_VERIFY_OFFSET;
+
+        if (texel.x < size && texel.y < size)
+        {
+            float3 dir  = VistaSkyReflectionTexelToDirection(texel, size, group);
+            float3 cube = VistaSampleSkyReflection(dir, 0.0);
+            float3 lut  = VistaSampleSkyViewLut(posKm, dir, sunDir);
+            // 亮度过低的方向跳过：分母趋 0 时相对误差没有意义（夜间整张天空都会这样）。
+            if (max(max(lut.x, lut.y), lut.z) > 1e-4)
+            {
+                err = VistaVerifyRelErr(cube, lut);
+                cnt = 1.0;
+            }
+        }
+    }
+
+    gs_VerifyMax[tid] = err;
+    gs_VerifySum[tid] = err;
+    gs_VerifyCnt[tid] = cnt;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll]
+    for (uint stride = VISTA_SKY_REFL_VERIFY_THREADS / 2u; stride > 0u; stride >>= 1u)
+    {
+        if (tid < stride)
+        {
+            gs_VerifyMax[tid]  = max(gs_VerifyMax[tid], gs_VerifyMax[tid + stride]);
+            gs_VerifySum[tid] += gs_VerifySum[tid + stride];
+            gs_VerifyCnt[tid] += gs_VerifyCnt[tid + stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (group < VISTA_SKY_REFL_VERIFY_FACE_GROUPS && tid == 0u)
+    {
+        float count = gs_VerifyCnt[0];
+        _VistaSkyReflectionVerifyRW[VISTA_SKY_REFL_ROW_FACE + group] = float4(
+            gs_VerifyMax[0],
+            count > 0.0 ? gs_VerifySum[0] / count : 0.0,
+            count,
+            (float)group);
+    }
+
+    // ---- 判据 2：均值恒等式（组 6 出结果）----
+    float3 accCube = 0.0;
+    float3 accLut  = 0.0;
+    if (group == VISTA_SKY_REFL_VERIFY_MEAN_GROUP)
+    {
+        for (uint s = tid; s < VISTA_SKY_REFL_VERIFY_MEAN_SAMPLES;
+                  s += VISTA_SKY_REFL_VERIFY_THREADS)
+        {
+            float3 dir = VistaFibonacciSphereDir(s, VISTA_SKY_REFL_VERIFY_MEAN_SAMPLES);
+            accCube += VistaSampleSkyReflection(dir, 0.0);
+            accLut  += VistaSampleSkyViewLut(posKm, dir, sunDir);
+        }
+    }
+
+    // 上一段归约的最后一次 barrier 已经过去，这里直接覆写另一对 groupshared 数组。
+    // 用 A/B 而不是复用 Max/Sum：类型不同（float3 vs float），而且并存能让
+    // Frame Debugger 里一次看到两段中间量。
+    gs_VerifyA[tid] = accCube;
+    gs_VerifyB[tid] = accLut;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll]
+    for (uint stride2 = VISTA_SKY_REFL_VERIFY_THREADS / 2u; stride2 > 0u; stride2 >>= 1u)
+    {
+        if (tid < stride2)
+        {
+            gs_VerifyA[tid] += gs_VerifyA[tid + stride2];
+            gs_VerifyB[tid] += gs_VerifyB[tid + stride2];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (group == VISTA_SKY_REFL_VERIFY_MEAN_GROUP && tid == 0u)
+    {
+        float inv = 1.0 / (float)VISTA_SKY_REFL_VERIFY_MEAN_SAMPLES;
+        float3 sh[VISTA_SH_COEFF_COUNT];
+        VistaLoadSkyAmbientSh(sh);
+
+        _VistaSkyReflectionVerifyRW[VISTA_SKY_REFL_ROW_MEAN + 0u] =
+            float4(gs_VerifyA[0] * inv, 0.0);                 // cube 均值
+        _VistaSkyReflectionVerifyRW[VISTA_SKY_REFL_ROW_MEAN + 1u] =
+            float4(gs_VerifyB[0] * inv, 0.0);                 // LUT 均值（同方向集）
+        _VistaSkyReflectionVerifyRW[VISTA_SKY_REFL_ROW_MEAN + 2u] =
+            float4(VistaShAmbientMean(sh), 0.0);              // SH 的 L_00·Y00
+    }
+
+    // ---- 判据 3：mip↔粗糙度 round-trip + 常量导出（组 7，单线程，无归约）----
+    if (group == VISTA_SKY_REFL_VERIFY_MIP_GROUP && tid == 0u)
+    {
+        for (uint m = 0u; m < (uint)VISTA_SKY_REFLECTION_MIPS; ++m)
+        {
+            float pr   = VistaMipToPerceptualRoughness((float)m);
+            float back = PerceptualRoughnessToMipmapLevel(pr);
+            _VistaSkyReflectionVerifyRW[VISTA_SKY_REFL_ROW_MIP + m] =
+                float4((float)m, pr, back, abs(back - (float)m));
+        }
+        // HLSL 侧对这三个常量的实际取值。C# 侧比对自己那份 ——
+        // 两边任何一边改了另一边没跟上，这一行会红。
+        _VistaSkyReflectionVerifyRW[VISTA_SKY_REFL_ROW_CONST] =
+            float4((float)VISTA_SKY_REFLECTION_SIZE,
+                   (float)VISTA_SKY_REFLECTION_MIPS,
+                   (float)UNITY_SPECCUBE_LOD_STEPS,
+                   (float)size);
+    }
+}
