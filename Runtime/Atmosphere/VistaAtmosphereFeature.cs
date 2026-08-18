@@ -49,8 +49,40 @@ namespace Vista
         VistaAtmosphereLuts m_Luts;
         VistaAtmospherePass m_Pass;
 
+        /// <summary>
+        /// 当前生效的大气模块。场景侧的组件（<see cref="VistaTimeOfDay"/>）靠它拿到
+        /// 大气参数与曝光值。
+        ///
+        /// ── 为什么用静态注册，而不是让组件自己存一份参数 ──
+        ///
+        /// 太阳的直射光色 = lux · T(大气参数) · exposure / π。这三样里有两样住在
+        /// RendererFeature 上。若让组件自己也存一份，两份必然漂移，症状是
+        /// **天空是一套大气、物体的受光是另一套大气** —— 日落时天空红了但物体偏黄，
+        /// 而且没有任何报错。这类"两份真相"的 bug 在 #7 里已经吃过教训。
+        ///
+        /// 也不走"遍历 URP asset 找 rendererData"：URP 没有公开取 renderer data 列表的 API，
+        /// 只能反射私有字段，换版本就断。
+        ///
+        /// 这套形状不是自创：<c>RenderSettings.sun</c>、<c>UniversalRenderPipeline.asset</c>、
+        /// HDRP 的 <c>VolumeManager.instance</c> 都是同一个模式 ——
+        /// 「渲染侧的唯一配置源，场景侧只读」。
+        ///
+        /// 取不到时组件**显式报警**，不静默回落到地球默认值：回落会让"忘挂 feature"
+        /// 表现为"光色差一点点"，那是最难查的一类问题。
+        /// </summary>
+        public static VistaAtmosphereFeature current { get; private set; }
+
         /// <summary>大气参数。运行时改会在下一帧触发静态 LUT 重烘。</summary>
         public VistaAtmosphereParameters parameters => m_Parameters;
+
+        /// <summary>
+        /// 整条管线共用的曝光值 (EV100)。场景侧算平行光强度要用同一个数 ——
+        /// 天空走 GPU 的 <c>VISTA_EXPOSURE</c>，平行光走 CPU 的这个，两者必须同源。
+        /// </summary>
+        public float ev100 => m_EV100;
+
+        /// <summary>世界空间中对应星球表面的 Y 值 (m)。求透射率要把海拔换成半径。</summary>
+        public float groundLevelWorldY => m_GroundLevelWorldY;
 
         /// <summary>AP froxel 设置。改尺寸会在下一帧重新分配 3D 表，其余立即生效。</summary>
         public VistaAerialPerspectiveSettings aerialPerspective => m_AerialPerspective;
@@ -68,6 +100,12 @@ namespace Vista
 
         public override void Create()
         {
+            // 注册放在最前面，早于下面那个 return。
+            // 组件只需要 parameters / ev100 / groundLevelWorldY，这三样都不依赖 compute。
+            // 若 compute 缺失就连注册也跳过，故障会从"天空没了"升级成
+            // "天空没了 + 平行光还悄悄回落到地球默认值"，多一层混淆。
+            current = this;
+
             var resources = VistaRuntimeResources.Get();
             if (resources == null || resources.atmosphereLutCS == null)
             {
@@ -110,6 +148,12 @@ namespace Vista
 
         protected override void Dispose(bool disposing)
         {
+            // 只在"当前就是自己"时摘牌。判等不能省：Create 会在 shader 重编译后重新调用，
+            // 而 Unity 的调用顺序是「新实例 Create → 旧实例 Dispose」，
+            // 无条件清空会把刚注册好的新实例抹掉，症状是重编译后平行光突然失去大气参数。
+            if (current == this)
+                current = null;
+
             // 先清读回、再放 buffer：VistaSkyAmbientProbe.Dispose 里会 WaitForCompletion，
             // 反过来就是让在飞的读回从已释放的显存里搬数据。
             m_Pass?.ambientProbe?.Dispose();
