@@ -49,6 +49,8 @@ namespace Vista
         SkyAmbientShReference,
         /// <summary>仅 Editor 自检使用（反射 round-trip 报告）。运行时路径不分配它。</summary>
         SkyReflectionVerify,
+        /// <summary>仅 Editor 自检使用（banding 签名采样结果）。运行时路径不分配它。</summary>
+        SkyViewBanding,
     }
 
     /// <summary>
@@ -143,6 +145,7 @@ namespace Vista
             VistaLutBufferSlot.SkyAmbientSh          => m_Luts.skyAmbientShBuffer,
             VistaLutBufferSlot.SkyAmbientShReference => m_Luts.skyAmbientShRefBuffer,
             VistaLutBufferSlot.SkyReflectionVerify   => m_Luts.skyReflectionVerifyBuffer,
+            VistaLutBufferSlot.SkyViewBanding        => m_Luts.skyViewBandingBuffer,
             _                                        => null,
         };
     }

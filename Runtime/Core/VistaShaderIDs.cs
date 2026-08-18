@@ -52,6 +52,12 @@ namespace Vista
         // 自检专用：参考解（逐法线的辐照度对照）
         public static readonly int _VistaSkyAmbientShRefRW       = Shader.PropertyToID("_VistaSkyAmbientShRefRW");
 
+        // ---- Atmosphere: banding 签名（仅 Editor 自检）----
+        // 走的是**运行时那个采样入口**，所以它读 _VistaSkyViewLut（SRV），
+        // 而不是 _VistaSkyViewLutRW —— 同一张纹理同时绑 UAV 与 SRV 是 UB。
+        public static readonly int _VistaSkyBandingParams         = Shader.PropertyToID("_VistaSkyBandingParams");
+        public static readonly int _VistaSkyBandingRW             = Shader.PropertyToID("_VistaSkyBandingRW");
+
         // ---- Atmosphere: 天空镜面反射 cubemap ----
         // 注意 RW 那个在 HLSL 里是 RWTexture2DArray（cube 的 UAV view 就是 2D array view），
         // 而只读那个是 TEXTURECUBE。同一张资源、两种 view，绑定点必须分开。

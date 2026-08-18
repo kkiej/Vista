@@ -122,6 +122,21 @@ namespace Vista
         /// <summary>判据 4b 取样的 mip。与 <c>VISTA_SKY_REFL_VERIFY_WIDE_MIP</c> 一致。</summary>
         public const int k_ReflVerifyWideMip = 2;
 
+        /// <summary>
+        /// banding 签名核 mode 0 的固定方向数：4 个仰角环 × 16 个方位。
+        /// 与 <c>VISTA_BANDING_RINGS</c> / <c>VISTA_BANDING_AZIMUTHS</c> 一致。
+        /// </summary>
+        public const int k_SkyBandingRings    = 4;
+        public const int k_SkyBandingAzimuths = 16;
+        public const int k_SkyBandingDirCount = k_SkyBandingRings * k_SkyBandingAzimuths;
+
+        /// <summary>
+        /// 签名缓冲容量。mode 0 只用前 64 个，mode 1（沿大圆走弧）可以用满 ——
+        /// 一次分配吃住两种 mode，省掉"换 mode 要重分配"这个状态。
+        /// 256 × float4 = 4 KB，不值得为它做动态尺寸。
+        /// </summary>
+        public const int k_SkyBandingMaxCount = 256;
+
         const string k_KernelTransmittance    = "TransmittanceLut";
         const string k_KernelMultiScattering  = "MultiScatteringLut";
         const string k_KernelSkyView          = "SkyViewLut";
@@ -131,6 +146,7 @@ namespace Vista
         const string k_KernelApSliceError     = "AerialPerspectiveSliceError";
         const string k_KernelSkyAmbientSh     = "SkyAmbientSh";
         const string k_KernelSkyAmbientShRef  = "SkyAmbientShReference";
+        const string k_KernelSkyBanding       = "SkyViewBandingSignature";
         const string k_KernelSkyReflection       = "SkyReflectionFilter";
         const string k_KernelSkyReflectionWide   = "SkyReflectionFilterWide";
         const string k_KernelSkyReflectionVerify = "SkyReflectionVerify";
@@ -146,6 +162,7 @@ namespace Vista
         GraphicsBuffer m_SkyAmbientSh;
         GraphicsBuffer m_SkyAmbientShRef;
         GraphicsBuffer m_SkyReflectionVerify;
+        GraphicsBuffer m_SkyViewBanding;
 
         int m_SkyViewWidth  = k_SkyViewWidthDefault;
         int m_SkyViewHeight = k_SkyViewHeightDefault;
@@ -160,6 +177,7 @@ namespace Vista
         readonly int m_KernelApSliceErrorIdx     = -1;
         readonly int m_KernelSkyAmbientShIdx     = -1;
         readonly int m_KernelSkyAmbientShRefIdx  = -1;
+        readonly int m_KernelSkyBandingIdx       = -1;
 
         // 反射走**另一个** .compute（见 VistaRuntimeResources 的理由：ImageBasedLighting.hlsl
         // 的 include 图会拖慢那九个大气核的每次迭代）。IVistaLutDispatcher 的每个方法
@@ -221,6 +239,9 @@ namespace Vista
 
         /// <summary>自检报告输出。只在 <see cref="EnsureSkyReflectionVerify"/> 之后非 null。</summary>
         public GraphicsBuffer skyReflectionVerifyBuffer => m_SkyReflectionVerify;
+
+        /// <summary>banding 签名采样输出。只在 <see cref="EnsureSkyViewBanding"/> 之后非 null。</summary>
+        public GraphicsBuffer skyViewBandingBuffer => m_SkyViewBanding;
 
         public int skyViewWidth  => m_SkyViewWidth;
         public int skyViewHeight => m_SkyViewHeight;
@@ -298,6 +319,8 @@ namespace Vista
                 m_KernelSkyAmbientShIdx = m_LutCS.FindKernel(k_KernelSkyAmbientSh);
             if (m_LutCS.HasKernel(k_KernelSkyAmbientShRef))
                 m_KernelSkyAmbientShRefIdx = m_LutCS.FindKernel(k_KernelSkyAmbientShRef);
+            if (m_LutCS.HasKernel(k_KernelSkyBanding))
+                m_KernelSkyBandingIdx = m_LutCS.FindKernel(k_KernelSkyBanding);
         }
 
         /// <summary>
@@ -443,6 +466,21 @@ namespace Vista
             return true;
         }
 
+        /// <summary>
+        /// 仅供 Editor 自检：按需分配 banding 签名缓冲（256 × float4）。
+        /// </summary>
+        public bool EnsureSkyViewBanding()
+        {
+            if (!isValid || m_KernelSkyBandingIdx < 0) return false;
+
+            m_SkyViewBanding ??= new GraphicsBuffer(
+                GraphicsBuffer.Target.Structured, k_SkyBandingMaxCount, sizeof(float) * 4)
+            {
+                name = "VistaSkyViewBanding",
+            };
+            return true;
+        }
+
         // ====================================================================
         //  执行期（GPU dispatch）
         //
@@ -577,6 +615,45 @@ namespace Vista
                 VistaShaderIDs._VistaSkyAmbientShRefRW, VistaLutBufferSlot.SkyAmbientShReference);
             // 一个法线一个线程组，外加两组全天球均值。
             d.Dispatch(m_LutCS, m_KernelSkyAmbientShRefIdx, k_ShRefGroupCount, 1, 1);
+        }
+
+        /// <summary>
+        /// 仅供 Editor 自检：按一组固定方向采样**已烘好的** Sky-View 表，把结果写进
+        /// <see cref="skyViewBandingBuffer"/>。**必须在 <see cref="RenderSkyViewLut{T}"/> 之后调**。
+        ///
+        /// 关键约束：这个核绑的是 <c>_VistaSkyViewLut</c>（SRV），**不绑 RW 名字** ——
+        /// 它要走的正是天空盒 shader 运行时那个硬件双线性入口，因为 banding 是
+        /// **采样之后**才出现的现象（表里的值可以完全单调，而双线性 + 参数化 warp +
+        /// fp16 存储叠起来仍能产出可见台阶）。绑成 UAV 就得手写取样，测的对象就跑掉了。
+        /// </summary>
+        /// <param name="mode">0 = 64 个固定世界方向（扫太阳用）；1 = 沿正对太阳的竖直大圆走弧。</param>
+        /// <param name="arcStartDeg">mode 1 的起始仰角。</param>
+        /// <param name="arcStepDeg">mode 1 的仰角步长。</param>
+        /// <param name="count">采样点数，上限 <see cref="k_SkyBandingMaxCount"/>。</param>
+        public void RenderSkyViewBanding<T>(
+            T d, in VistaAtmosphereViewData view,
+            int mode, float arcStartDeg, float arcStepDeg, int count)
+            where T : struct, IVistaLutDispatcher
+        {
+            if (!isValid || m_KernelSkyBandingIdx < 0 || m_SkyViewBanding == null) return;
+
+            count = Mathf.Clamp(count, 1, k_SkyBandingMaxCount);
+
+            // Bind 推的是 _VistaViewPosKm / _VistaSunDirection / _VistaSkyViewLutSize，
+            // 而 VistaSampleSkyViewLut 三个都要用。少推一次就会采到上一次的太阳方向 ——
+            // 而这个自检恰好是在**扫太阳**，那种错的症状是"曲线整体平移一格"，
+            // 二阶差分几乎不受影响，于是报告照样全绿。
+            view.Bind(d, m_SkyViewWidth, m_SkyViewHeight);
+
+            d.SetGlobalVector(VistaShaderIDs._VistaSkyBandingParams,
+                new Vector4(mode, arcStartDeg, arcStepDeg, count));
+
+            d.SetTexture(m_LutCS, m_KernelSkyBandingIdx,
+                VistaShaderIDs._VistaSkyViewLut, VistaLutSlot.SkyView);
+            d.SetBuffer(m_LutCS, m_KernelSkyBandingIdx,
+                VistaShaderIDs._VistaSkyBandingRW, VistaLutBufferSlot.SkyViewBanding);
+            d.Dispatch(m_LutCS, m_KernelSkyBandingIdx,
+                VistaComputeUtils.DivRoundUp(count, 64), 1, 1);
         }
 
         // ====================================================================
@@ -945,6 +1022,16 @@ namespace Vista
             RenderSkyAmbientShReference(new VistaImmediateLutDispatcher(cmd, this), view);
         }
 
+        /// <summary>立即模式的 banding 签名采样。调用前需先 <see cref="EnsureSkyViewBanding"/>。</summary>
+        public void RenderSkyViewBanding(
+            CommandBuffer cmd, in VistaAtmosphereViewData view,
+            int mode, float arcStartDeg, float arcStepDeg, int count)
+        {
+            if (cmd == null) throw new ArgumentNullException(nameof(cmd));
+            RenderSkyViewBanding(new VistaImmediateLutDispatcher(cmd, this), view,
+                mode, arcStartDeg, arcStepDeg, count);
+        }
+
         /// <summary>
         /// 立即模式的反射 cubemap。调用前需先 <see cref="PrepareSkyReflection"/>，
         /// 并把它的返回值原样传进来。
@@ -1114,6 +1201,8 @@ namespace Vista
             m_SkyAmbientShRef = null;
             m_SkyReflectionVerify?.Dispose();
             m_SkyReflectionVerify = null;
+            m_SkyViewBanding?.Dispose();
+            m_SkyViewBanding = null;
             m_BakedParams = null;
         }
 

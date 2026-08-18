@@ -17,6 +17,7 @@
 #pragma kernel AerialPerspectiveSliceError
 #pragma kernel SkyAmbientSh
 #pragma kernel SkyAmbientShReference
+#pragma kernel SkyViewBandingSignature
 
 // 不含 gles3：整套 LUT 走 compute + RWTexture。移动端目标是 Vulkan / Metal，
 // GLES3.x 上改用 fragment shader 写 LUT 的降级路径（见 CHANGELOG）。
@@ -782,4 +783,86 @@ void SkyAmbientShReference(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_
     _VistaSkyAmbientShRefRW[ni * 3u + 0u] = float4(n, 0.0);
     _VistaSkyAmbientShRefRW[ni * 3u + 1u] = float4(refValue, 0.0);
     _VistaSkyAmbientShRefRW[ni * 3u + 2u] = float4(shValue, 0.0);
+}
+
+// ============================================================================
+//  Sky-View 带状（banding）签名核（仅 Editor 调用）
+//
+//  回答的问题是"太阳从 0° 扫到 90° 的过程中，天空会不会出现可见的台阶"。
+//
+//  ---- 为什么必须从**烘好的表里采样**，而不是自己解析积分 ----
+//  banding 是**采样之后**的现象。表里的数值可以完全单调、完全平滑，而
+//  「双线性插值 + 两段分支的参数化 warp + fp16 存储」这三样叠起来仍然能在
+//  画面上产出可见台阶。所以这个核**只调 VistaSampleSkyViewLut** ——
+//  也就是天空盒 shader 在运行时用的那一个入口，走同一个 sampler_LinearClamp、
+//  同一套 ParamsToUv。若这里改成自己积分一遍，测的就变成了积分器的平滑性，
+//  被测对象整个跑掉，而且报告会一路全绿（解析积分当然平滑）。
+//
+//  ---- 为什么方向固定在世界空间 ----
+//  太阳仰角是被扫的自变量。如果观察方向也随太阳转，那么逐仰角的一阶差分里
+//  同时混进了"表变了"与"我在看别的地方"两种贡献，二者无法分离。
+//  固定世界方向之后，每个方向的亮度是仰角的**一元函数**，差分才有意义。
+//
+//  mode 0（判据 A，时间轴）：64 个固定方向 = 4 个仰角环 × 16 个方位。
+//    方位 0 正对太阳（太阳在 +Z 方位），方位 8 是反日点；
+//    仰角环 2° 覆盖日晕与暮光带（这里变化最剧烈），70° 覆盖天顶附近。
+//  mode 1（判据 B / C，空间轴）：沿正对太阳的竖直大圆，从 arcStart 起
+//    以 arcStep 为步长走 count 步。arcStep 给大 → 判据 B（跨纹素，测分辨率）；
+//    arcStep 给到远小于一个纹素 → 判据 C（纹素内部，双线性在此严格线性，
+//    理论二阶差分恒为 0，所以实测到的就是纯 fp16 + 插值算术的**噪声地板**）。
+//    判据 C 的存在是这套测试能下结论的前提：阶数 p≈0 既可能是台阶、
+//    也可能是量化地板，只有拿到实测地板才能把这两者分开。
+//
+//  输出 _VistaSkyBandingRW[i] = float4(L.rgb, 亮度)。
+//  rgb 一并存是为了在报告里能说出"是哪个通道在跳" —— 只跳蓝通道指向
+//  Rayleigh 项，跳红指向长路径 Mie/透射率，修法完全不同。
+// ============================================================================
+
+// x = mode，y = arcStart（度），z = arcStep（度），w = 方向数
+float4 _VistaSkyBandingParams;
+
+RWStructuredBuffer<float4> _VistaSkyBandingRW;
+
+#define VISTA_BANDING_RINGS      4u
+#define VISTA_BANDING_AZIMUTHS   16u
+#define VISTA_BANDING_DIR_COUNT  (VISTA_BANDING_RINGS * VISTA_BANDING_AZIMUTHS)
+
+[numthreads(64, 1, 1)]
+void SkyViewBandingSignature(uint3 id : SV_DispatchThreadID)
+{
+    uint count = (uint)_VistaSkyBandingParams.w;
+    if (id.x >= count)
+        return;
+
+    uint mode = (uint)_VistaSkyBandingParams.x;
+
+    float elevDeg, azDeg;
+    if (mode == 0u)
+    {
+        // 4 项局部数组 + 动态索引：FXC 会展开成条件链，代价可忽略。
+        // 写成算术式（如 2·4^ring）反而会让"为什么是这四个角"这件事看不出来。
+        float ringElev[VISTA_BANDING_RINGS] = { 2.0, 10.0, 30.0, 70.0 };
+        uint ring = id.x / VISTA_BANDING_AZIMUTHS;
+        uint az   = id.x % VISTA_BANDING_AZIMUTHS;
+        elevDeg = ringElev[min(ring, VISTA_BANDING_RINGS - 1u)];
+        azDeg   = (float)az * (360.0 / (float)VISTA_BANDING_AZIMUTHS);
+    }
+    else
+    {
+        // 正对太阳的竖直大圆：方位固定 0，仰角线性推进。
+        elevDeg = _VistaSkyBandingParams.y + (float)id.x * _VistaSkyBandingParams.z;
+        azDeg   = 0.0;
+    }
+
+    float el = radians(elevDeg);
+    float az = radians(azDeg);
+    // 与 VistaAtmosphereSelfTest.MakeView 同一套约定：Y 为 up，太阳在 +Z 方位。
+    float3 rayDir = float3(sin(az) * cos(el), sin(el), cos(az) * cos(el));
+
+    float3 L = VistaSampleSkyViewLut(_VistaViewPosKm.xyz, rayDir, _VistaSunDirection.xyz);
+
+    // 亮度用 Rec.709。差分在标量上做，是因为"可见台阶"是亮度上的事；
+    // 但通道分解要留着（见头部注释）。
+    float lum = dot(L, float3(0.2126, 0.7152, 0.0722));
+    _VistaSkyBandingRW[id.x] = float4(L, lum);
 }
