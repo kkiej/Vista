@@ -280,6 +280,33 @@
      数值上确实是量化 —— 但 B 那一项（1.885e-3）也只在地板的 1.8 倍上，
      两者同一量级，所以"是量化不是分辨率"这个说法其实分不开；能说的是两项都看不见。
 
+- **两条引擎出口的曝光级 + 场景全局状态的保存/还原/复位**
+  （`VistaSkyAmbientProbe.Publish`、`VistaAtmospherePass.BindReflectionToRenderSettings`、
+  `IVistaRenderSettingsClient` + `VistaRenderSettingsGuard`、
+  `Window/Vista/Reset Scene Ambient & Reflection`）。
+  起因是一句用户报告：「我的场景里的物体怎么没有阴影了」。阴影其实一直是对的
+  —— 详细归因见「坑」的第一条。
+  - 曝光在**交接点**乘，不进 SH 投影核、也不烘进 cubemap：GPU 侧
+    `_VistaSkyAmbientSh` 与反射 cubemap 一律留在**绝对光度量**（cd/m²），
+    因为自检的参考解、Step 3 的雾、Step 4 的 PRT relight 全部按绝对量对账；
+    折进核里会让那些判据跟着 EV100 漂。
+  - SH 那条按系数逐个乘（`SphericalHarmonicsL2` 反射查不到 `op_Multiply`，
+    只有索引器，所以是 `[c, i]` 双层循环）；反射那条挂在
+    `RenderSettings.reflectionIntensity` —— 那是引擎给 custom reflection 留的唯一乘子。
+  - 三层生命周期：`Dispose`/`Teardown` 还原（挡"关掉 feature"）、
+    `EditorSceneManager.sceneSaving` 前还原（挡"运行中 Ctrl+S 把 Custom 落盘"）、
+    显式复位菜单（挡"基线本身就是脏的"，见「坑」）。每层挡的是不同的洞，
+    少任何一层都会留下可落盘的路径。
+  - 还原按**场景**校验（存 `Scene` 结构而不是 `scene.handle` —— Unity 6000.4 把
+    handle 换成了 `SceneHandle`，到 int 的隐式转换已废弃）。拿 A 场景的原值去还原
+    B 场景比不还原更糟：那是静默的数据破坏，而不还原至少留着一份可辨认的值。
+  - 验收：Play 模式实测 `ambientMode = Custom`、
+    `c_0 = (0.1302, 0.1412, 0.1643)` = `5119.606 × 2.5431e-5`（EV100=15），
+    与绝对量口径精确对上；平行光 3.14159 对环境光 ~0.13，直接光是环境光的约 24 倍。
+    守卫的端到端验证：实时状态 `defaultReflectionMode = Custom` +
+    `reflectionIntensity = 2.54313e-5` + cubemap 已绑定时执行一次真实
+    `SaveScene`，磁盘仍为 `m_AmbientMode: 0` / `m_DefaultReflectionMode: 0`。
+
 ### 取舍
 
 - **单位用 km 而不是 m**。地球半径 6360 km 写成 6.36e6 后，froxel raymarch 里的 `r*r`
@@ -287,6 +314,20 @@
   世界空间(m) 只在边界处乘 `_VistaGround.w = 0.001` 转换。
 - **积分采样数 40 而非 Bruneton 的 500**。这张表只在参数变化时重算，采样数不进帧开销；
   40 段梯形法的误差已经压到 3e-3，再加采样是浪费烘焙时间。
+- **曝光只在"交出引擎"的那一层乘，GPU 侧资源一律留绝对光度量。**
+  另一种写法是让 SH 投影核与反射滤波核直接输出已曝光的值，出口就不用管了 ——
+  少一处容易漏的乘法（而这次正是漏在那里）。不选它的理由是判据会全部失效：
+  自检的参考解、Step 3 的雾、Step 4 的 PRT relight 都按绝对量对账，
+  折进核里之后每一条阈值都会跟着 EV100 漂，改一次曝光就要重标一遍全部自检。
+  代价是"出口"成了必须逐个点清的清单（当前两个：`ambientProbe`、
+  `reflectionIntensity`），所以把它写进了「坑」里当成纪律，而不是靠记性。
+- **接受"Vista 用绝对光度量、宿主工程用 Unity 常规单位"两制共存，不去改宿主的灯。**
+  Project-ARPG 里现成的灯和材质都是常规单位。理论上更干净的做法是把整个工程
+  换成物理单位（灯改 lux、相机走物理曝光），但那会动到所有已调好的场景，
+  而收益只在"数字更自洽"。既然曝光已经在交接点补上，两制在**画面**上是一致的
+  （实测环境光 ~0.13 对平行光 3.14，比例正常），就把边界留在交接点。
+  这条待与 Task #8（TimeOfDay 平行光接入）一起复核 —— 那时大气的太阳要真的去驱动
+  场景里的平行光，两制的接缝会正式落到一个具体的转换系数上。
 - **Transmittance 用 fp16**。值域 [0,1]，且下游只做乘法不做累加，没有精度累积。
   256×64×8B = 128 KB。
 - **多次散射用各向同性近似 + 等比级数，不做完整 Monte Carlo**。完整解要在每一阶重解
@@ -560,6 +601,77 @@
 
 ### 坑
 
+- **绝对光度量的管线里，"少乘一次曝光"的症状是"阴影不见了"，而不是"画面太亮"。**
+  `VISTA_EXPOSURE` 全工程只在 `VistaSky.shader` 里乘了一处；两条**引擎出口**
+  （SH → `RenderSettings.ambientProbe`、cubemap → `customReflectionTexture`）
+  发的是裸的绝对量。它们的消费者是 URP Lit 的 `unity_SHAr` 与
+  `GlossyEnvironmentReflection` —— 不是 Vista 的 shader，身上没有曝光级。
+  于是环境光重建值 1.4e3~8.2e3，而工程里的平行光是 Unity 常规单位
+  （`m_Intensity: 3.14159`），比值 1600~2600 倍：直接光只占最终亮度的约 0.04%，
+  低于 1% 的 Weber 可见阈（判据来自 Task #6）。shadowmap 全程正确、
+  Frame Debugger 里一切正常，但阴影**在数值上被淹没了**。
+  这类 bug 的排查代价来自它的伪装：报出来的现象（"没有阴影"）与病因
+  （"环境光单位不对"）在概念上毫无关联，很容易直接去查阴影距离、级联、
+  `m_Shadows.m_Type`。教训：**混合单位制的边界必须显式列出来**，
+  凡是把值交给引擎/第三方 shader 的地方都是一个边界，一个都不能漏。
+  同理，只在自家 shader 里乘曝光的做法只有在"所有消费者都是自家 shader"时才成立 ——
+  一旦要接引擎的现成路径，这个前提就不再成立。
+- **"实测这个属性不会置脏"这类断言，会在代码里放很久然后被发现是错的。**
+  `BindReflectionToRenderSettings` 原先带一句注释："实测环境光那几个属性不会置脏"。
+  实测（`Log Ambient Probe State` 报 `isDirty`）是 **True**。这是本项目记过的
+  *stale-assertion* 模式的又一个实例（上一个是计时器里硬编码的判定文本）。
+  处置不是把注释改对就完了 —— 是让代码**不再依赖**任何"不会置脏"的前提，
+  一律走保存/还原。凡是靠"某个引擎行为恰好如此"来省掉清理逻辑的设计，
+  都欠着一次这样的返工。
+- **`RenderSettings` 是"逐场景序列化"+"域重载不丢"的组合，这两条加起来会伪造出
+  "改动没生效"。** 修完曝光后重编译，`Log Ambient Probe State` 仍印 5119 ——
+  看起来像改动没编进去。两个原因叠在一起：(a) `read_console` 的 `count`
+  返回的是**最旧**的匹配（已记过的坑，这次又踩了），读到的是上一次的报告；
+  (b) `RenderSettings` 是原生状态，域重载不会清，而 Edit 模式下 Game view
+  不重绘就没有新的回读完成，于是内存里那份陈旧的绝对量探针一直挂着。
+  确认手段：先 grep 场景 YAML —— `ambientProbe` **不在**序列化字段里
+  （只有 `m_UseRadianceAmbientProbe: 0`），所以磁盘上找不到它；
+  然后进 Play 模式强制出真帧才拿到 0.1302。
+  顺带一条：Edit 模式下**反射出口是同步写、环境光出口是异步回读**，
+  完全可能出现"`defaultReflectionMode` 已 Custom 而 `ambientMode` 还是 Skybox"
+  的中间态；诊断只报环境光那一条会把这种偏态误判成"链路没通"。
+  所以 `Log Ambient Probe State` 现在两条出口一起报。
+  进 Play 模式后也要**等几帧**：回读本身 2~3 帧，刚进去就读会拿到全零。
+- **"保存前还原"挡不住"基线本身是脏的"。** 守卫还原的是"本次运行首次写入前扣下的
+  原值"。如果某个场景在守卫存在之前就已经把 `m_AmbientMode: 4` /
+  `m_DefaultReflectionMode: 1` 写进了磁盘，那么这次打开场景扣下来的"原值"
+  就是被污染的那一份 —— 守卫会忠实地把 Custom 还原回去，**越保存越干净不会发生**。
+  这种状态**无法自动分辨**（Custom 也可能是用户有意设的），只能由人显式复位。
+  于是加了 `ForgetBaselines()`（只丢基线、不写回）与
+  `Window/Vista/Reset Scene Ambient & Reflection`。顺序是硬性的：
+  丢基线必须在保存**之前**，否则守卫会在写盘前把脏基线还原回去，
+  表现为"复位了也保存了，磁盘上还是 Custom"。
+- **验证一次"保存不会写入 Custom"，先得确认那次保存真的写盘了。**
+  第一版验证是点 `File/Save` 然后 grep 磁盘 —— 看到 `0` 就以为守卫生效。
+  但当时 `isDirty = False`（前一步的复位刚保存过），`File/Save` 是空操作，
+  这个"通过"什么都没证明。这是本项目一直在追的 *false-pass* 模式。
+  改成显式 `EditorSceneManager.SaveScene`（无条件写盘），并在保存前先把
+  实时状态打出来确认它确实是 `Custom` + `2.54e-5` + cubemap 已绑定，
+  测试才有内容。**判据的前提条件本身也需要被测量**，不能假定它成立。
+- **改了口径就要回头查所有按旧口径标定过的阈值。** 探针改成"交接时乘曝光"之后，
+  `Log Ambient Probe State` 里那句"链路已接通"的门限 `c_0 > 1e-3` 是照**绝对量**
+  定的，直接沿用会在低太阳角/夜间把正常链路判成未接通
+  （1 cd/m² × 2.54e-5 = 2.5e-5 < 1e-3）—— 一个**自己造出来的假失败**。
+  修法是把门限按曝光归一，且曝光从 `_VistaSunDirection.w` 读（与运行时同一个来源），
+  不在自检里重算一遍 EV100：重算就是第二份真值，迟早走歧。
+- **`Scene.handle` 在 Unity 6000.4 已换成 `SceneHandle`**，到 `int` 的隐式转换
+  标记为废弃（CS0618）。存 `Scene` 结构本身即可 —— 它自带 `==` 且比的就是句柄，
+  既躲开废弃 API，也不用跟着 `SceneHandle` 的表示形式改。
+- **`MenuItem` 路径里的 `&` 要写成 `&&`**，而通过 MCP 的 `execute_menu_item`
+  调用时传的也必须是带双写的那份（`Reset Scene Ambient && Reflection`），
+  传单个 `&` 会报"菜单项无效"。
+- **本次的既定残留：装了大气模块的场景在 Editor 里会长期挂 `*`。**
+  写 `ambientProbe` 会置脏，太阳一动就再脏一次。**不**用
+  `EditorSceneManager.ClearSceneDirtiness` 去消它 —— 那会连带清掉用户自己未保存
+  改动的脏标记，关闭时不再提示保存，是拿数据丢失换一个星号。
+  受影响面已实测：扫过的约 29 个场景里只有 `Assets/Scenes/Demo.unity` 被污染过
+  （已复位为 `0 | 0`）；`World_02` 的 Trilight、
+  `PolygonFantasyHeroCharacters/Demo_RandomCharacter` 的 Flat 都是原有设置，与 Vista 无关。
 - `Categorization.CategoryInfo`（Graphics Settings 面板分组用的特性）是**引擎内部 API**，
   只对 Unity 官方 SRP 包开放（`InternalsVisibleTo` 白名单）。第三方 package 实现
   `IRenderPipelineResources` 时不能加这个特性，否则 CS0246。纯显示层，去掉无影响。

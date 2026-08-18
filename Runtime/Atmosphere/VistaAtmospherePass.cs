@@ -2,6 +2,7 @@ using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.RenderGraphModule;
 using UnityEngine.Rendering.Universal;
+using UnityEngine.SceneManagement;
 
 namespace Vista
 {
@@ -22,7 +23,7 @@ namespace Vista
     /// 仍然分开，是因为质量分级要能单独关掉 AP（移动端低档只留天空盒），
     /// 而"能不能少排一个 pass"在这个量级上不值一提。
     /// </summary>
-    public sealed class VistaAtmospherePass : ScriptableRenderPass
+    public sealed class VistaAtmospherePass : ScriptableRenderPass, IVistaRenderSettingsClient
     {
         /// <summary>
         /// 各 pass 共用一份 pass data。字段各 pass 只填自己声明过的那几个 —— 没填的
@@ -79,6 +80,15 @@ namespace Vista
         /// <summary>供 <see cref="VistaAtmosphereFeature"/> 在 Dispose 时清理在飞的读回请求。</summary>
         public VistaSkyAmbientProbe ambientProbe => m_AmbientProbe;
 
+        // 反射那条出口改过的场景全局状态。理由与环境光那半完全一致，见
+        // VistaSkyAmbientProbe 里字段处的说明（含"为什么要记场景、以及为什么存
+        // Scene 而不是 scene.handle"）。
+        bool m_HasSavedReflection;
+        Scene m_SavedReflectionScene;
+        Texture m_SavedReflectionTexture;
+        DefaultReflectionMode m_SavedReflectionMode;
+        float m_SavedReflectionIntensity;
+
         public VistaAtmospherePass()
         {
             // 越早越好：LUT 不依赖任何屏幕空间资源，而下游（天空盒、雾、不透明物的
@@ -87,6 +97,12 @@ namespace Vista
             renderPassEvent = RenderPassEvent.BeforeRenderingPrePasses;
             // 本 pass 不碰相机颜色/深度，声明出来避免 URP 为它准备 RT
             requiresIntermediateTexture = false;
+
+#if UNITY_EDITOR
+            // 在构造期注册、而不是等到第一次写 RenderSettings：注册本身极便宜，
+            // 而"先写了一帧、还没注册、用户正好在这一帧保存"这条缝隙没有必要留着。
+            VistaRenderSettingsGuard.Register(this);
+#endif
         }
 
         public void Setup(VistaAtmosphereLuts luts, VistaAtmosphereParameters parameters,
@@ -148,7 +164,7 @@ namespace Vista
             // 读回请求是 CPU 侧 API，与图无关；而且这样它拿到的必然是"上一帧已完成"的内容，
             // 时序不依赖图的提交点。
             if (shEnabled)
-                m_AmbientProbe.Update(m_Luts.skyAmbientShBuffer, cameraData.cameraType);
+                m_AmbientProbe.Update(m_Luts.skyAmbientShBuffer, cameraData.cameraType, view.exposure);
 
             // 反射 cubemap 与 RenderSettings 的挂接。**只挂一次引用**，之后每帧只改内容 ——
             // 与环境光 SH 那条链路不同，这里没有任何逐帧的 CPU 开销，也不需要读回。
@@ -156,7 +172,7 @@ namespace Vista
             // 而反射探针烘焙相机不该顺手改全局 RenderSettings。
             if (reflectionMode != VistaSkyReflectionMode.Off
                 && cameraData.cameraType is CameraType.Game or CameraType.SceneView)
-                BindReflectionToRenderSettings();
+                BindReflectionToRenderSettings(view.exposure);
 
             if (staticDirty)
             {
@@ -374,13 +390,25 @@ namespace Vista
         /// 全局 + 改 shader"的全部理由。
         ///
         /// 只在引用变化时写。RenderSettings 的赋值是**场景状态**，逐帧无条件写在 Editor 里
-        /// 会反复触发场景比较（实测环境光那几个属性不会置脏，但没有理由去赌每个属性都一样）。
+        /// 会反复触发场景比较。（原先这里写的是"实测环境光那几个属性不会置脏"——
+        /// 那句是错的，Log Ambient Probe State 实测写 ambientProbe 会让场景 isDirty=true。
+        /// 现在不依赖任何"不会置脏"的假设，一律走保存/还原。）
         /// 内容更新走的是 RT 本身，与这里无关。
         /// </summary>
-        void BindReflectionToRenderSettings()
+        void BindReflectionToRenderSettings(float exposure)
         {
             var cube = m_Luts.skyReflectionCube;
             if (cube == null || cube.rt == null) return;
+
+            var scene = SceneManager.GetActiveScene();
+            if (!m_HasSavedReflection || m_SavedReflectionScene != scene)
+            {
+                m_SavedReflectionScene   = scene;
+                m_SavedReflectionTexture = RenderSettings.customReflectionTexture;
+                m_SavedReflectionMode    = RenderSettings.defaultReflectionMode;
+                m_SavedReflectionIntensity = RenderSettings.reflectionIntensity;
+                m_HasSavedReflection = true;
+            }
 
             if (!ReferenceEquals(RenderSettings.customReflectionTexture, cube.rt))
                 RenderSettings.customReflectionTexture = cube.rt;
@@ -389,6 +417,63 @@ namespace Vista
             // 但完全不跟太阳走"，而且没有任何报错。
             if (RenderSettings.defaultReflectionMode != DefaultReflectionMode.Custom)
                 RenderSettings.defaultReflectionMode = DefaultReflectionMode.Custom;
+
+            // cubemap 里存的是**绝对光度量**（与自检的对账口径一致，不能改），
+            // 而采它的是 URP 的 GlossyEnvironmentReflection —— 不是 Vista 的 shader，
+            // 没有曝光级。reflectionIntensity 是引擎给 custom reflection 留的唯一乘子，
+            // 曝光就挂在这里。
+            //
+            // 不把曝光烘进 cubemap 的理由和 SH 那条一样：烘进去之后，反射自检的
+            // round-trip / 均值恒等式全部会跟着 EV100 漂，那些判据就废了。
+            if (RenderSettings.reflectionIntensity != exposure)
+                RenderSettings.reflectionIntensity = exposure;
+        }
+
+        /// <summary>
+        /// 还原被本 pass 与环境光出口改过的场景全局状态。
+        /// 两个调用方：feature 的 <c>Dispose</c>（经 <see cref="Teardown"/>），
+        /// 以及场景保存前的守卫（见 <c>VistaRenderSettingsGuard</c>）。
+        /// 调用后 <c>m_HasSavedReflection</c> 归零，下一帧会重新扣一份原值再写 ——
+        /// 所以守卫可以反复调它。
+        /// </summary>
+        public void RestoreRenderSettings()
+        {
+            if (m_HasSavedReflection && SceneManager.GetActiveScene() == m_SavedReflectionScene)
+            {
+                RenderSettings.customReflectionTexture = m_SavedReflectionTexture;
+                RenderSettings.defaultReflectionMode   = m_SavedReflectionMode;
+                RenderSettings.reflectionIntensity     = m_SavedReflectionIntensity;
+            }
+            m_HasSavedReflection = false;
+
+            m_AmbientProbe.RestoreRenderSettings();
+        }
+
+        /// <summary>
+        /// 只丢基线、不写回。见 <see cref="IVistaRenderSettingsClient"/>。
+        ///
+        /// 与 <see cref="RestoreRenderSettings"/> 的差别只在"要不要写回"，但那一点决定了
+        /// 复位工具能否生效：复位把实时值改干净之后，若走还原路径就等于把脏基线又写回去，
+        /// 于是"复位 + 保存"落盘的仍然是 Custom。
+        /// </summary>
+        public void ForgetRenderSettingsBaseline()
+        {
+            m_HasSavedReflection = false;
+            m_AmbientProbe.ForgetRenderSettingsBaseline();
+        }
+
+        /// <summary>
+        /// 永久退场：还原状态并从保存守卫上摘下来。
+        /// 与 <see cref="RestoreRenderSettings"/> 分开是因为守卫**不能**顺手摘掉自己 ——
+        /// 摘了之后这个 pass 后续的写入就再也不会在保存前被还原，
+        /// 表现为"第一次 Ctrl+S 是干净的，之后每次都把 Custom 存进去"。
+        /// </summary>
+        public void Teardown()
+        {
+            RestoreRenderSettings();
+#if UNITY_EDITOR
+            VistaRenderSettingsGuard.Unregister(this);
+#endif
         }
 
         /// <summary>

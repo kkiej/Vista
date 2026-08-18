@@ -59,6 +59,18 @@ namespace Vista.Editor
             sb.Append("　 ambientMode = ").Append(RenderSettings.ambientMode)
               .Append("（预期 Custom）").AppendLine();
 
+            // 反射那条出口一起报。它与环境光是**两条独立**的出口：反射在
+            // RecordRenderGraph 里同步写，环境光要等 AsyncGPUReadback 回来才写，
+            // 所以完全可能出现"反射已 Custom、环境光还是 Skybox"的中间态
+            // （Edit 模式下相机不连续渲时尤其常见）。只报一条会把这种偏态看成
+            // "链路没通"，然后照着错误的方向排查。
+            sb.Append("　 defaultReflectionMode = ").Append(RenderSettings.defaultReflectionMode)
+              .Append("　reflectionIntensity = ").Append(RenderSettings.reflectionIntensity.ToString("G6"))
+              .Append("（预期 Custom + 曝光值，EV100=15 时 ≈2.54e-5）")
+              .Append("　customReflection = ")
+              .Append(RenderSettings.customReflectionTexture == null ? "(null)" : "已绑定")
+              .AppendLine();
+
             var probe = RenderSettings.ambientProbe;
             var c0 = new Vector3(probe[0, 0], probe[1, 0], probe[2, 0]);
             sb.Append("　 ambientProbe c_0 = ").Append(Fmt(c0))
@@ -71,6 +83,12 @@ namespace Vista.Editor
             // 直射的地面反弹（≈ albedo·E☉·sin(elev)·T/π，正午在数千量级、且偏暖）。
             // 于是 y 矩为负、且 |R| > |G| >> |B|（蓝天与暖地面在 y 矩上几乎抵消）。
             // 把这三个数打出来，下次看到负号不用再重新推一遍。
+            //
+            // 注意口径：这里读的是 RenderSettings.ambientProbe，也就是**已乘曝光**的那份
+            // （见 VistaSkyAmbientProbe.Publish）。上面那些 cd/m² 数字是 GPU 侧
+            // _VistaSkyAmbientSh 的绝对量口径，两者相差 exposure = 1/(1.2·2^EV100)，
+            // EV100=15 时约 2.54e-5。所以这里印出来的量级应该在 0.0x~0.x，
+            // 若看到 1e3 量级就说明曝光那一乘漏了 —— 那正是"阴影看不见"的成因。
             var dirs = new[] { Vector3.up, Vector3.down, Vector3.forward };
             var outs = new Color[dirs.Length];
             probe.Evaluate(dirs, outs);
@@ -81,8 +99,15 @@ namespace Vista.Editor
 
             // 只判"有没有被驱动过"，不判数值：数值正确性是 Run() 的职责，
             // 这里若也去比对就得再复现一遍参考解，两份判据迟早走歧。
+            //
+            // 阈值要按曝光归一。原先的 1e-3 是照**绝对量**定的；探针改成"交接时乘曝光"
+            // 之后，直接沿用会在低太阳角/夜间把正常链路判成"未接通"
+            // （c_0 ≈ 1 cd/m² × 2.54e-5 = 2.5e-5 < 1e-3）。
+            // 曝光从全局常量读，跟运行时同一个来源，不在这里重算一遍 EV100。
+            float exposure = Shader.GetGlobalVector("_VistaSunDirection").w;
+            float driveFloor = 1e-3f * (exposure > 0f ? exposure : 1f);
             bool driven = RenderSettings.ambientMode == AmbientMode.Custom
-                          && (c0.x + c0.y + c0.z) > 1e-3f;
+                          && (c0.x + c0.y + c0.z) > driveFloor;
             sb.Append("　 判定：链路").Append(driven ? "已接通 OK" : "**未接通**").AppendLine();
             if (!driven)
                 sb.AppendLine("　 排查顺序：feature 是否装进当前 Renderer → Frame Debugger 里"

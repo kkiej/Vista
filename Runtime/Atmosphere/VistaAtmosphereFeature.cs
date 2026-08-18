@@ -113,6 +113,11 @@ namespace Vista
             // 先清读回、再放 buffer：VistaSkyAmbientProbe.Dispose 里会 WaitForCompletion，
             // 反过来就是让在飞的读回从已释放的显存里搬数据。
             m_Pass?.ambientProbe?.Dispose();
+            // 反射那条出口的场景全局状态 + 从保存守卫上摘下来。必须在 m_Luts.Dispose 之前：
+            // customReflectionTexture 指着 m_Luts 里那张 cube RT，先释放 RT 就等于
+            // 把一个已销毁的 Texture 留在 RenderSettings 里，Editor 下表现为
+            // 反射变黑 + 偶发的 "Texture has been destroyed" 报错。
+            m_Pass?.Teardown();
             m_Luts?.Dispose();
             m_Luts = null;
         }
