@@ -181,6 +181,34 @@
   wide 核是照这个结论开的方。改完之后同一份报告给出 32 ns/迭代（延迟已藏住）、
   per-dispatch 地板占 59%（瓶颈换人了）。
 
+- **帧内延迟交叉验证（模型 A）**：`Window/Vista/Cross-Check LUT Timing (Play Mode)`。
+  自动进 play 模式、丢前 45 帧、对七个 pass 名各起一对 `ProfilerRecorder`
+  （GPU 一份 + CPU 一份）采 300 帧、逐帧取最小值，然后自动退出并打报告。
+  刻意**不放 MonoBehaviour 进场景**：`EditorApplication.update` 在 play 模式里照样每
+  tick 触发，读 recorder 不需要在渲染线程上 —— 量性能的工具改被量的对象是这类 harness
+  最容易犯的错。跨域重载的"这次是为了采样"用 `SessionState` 存（静态字段会被清）。
+  RTX 3060 + D3D11 实测（Scene View + Game View 各渲染一次，下表已按出现次数 2 折算成单次）：
+
+    | pass | 模型 A 单次 | 模型 B | 备注 |
+    | --- | --- | --- | --- |
+    | Sky-View | 0.036 | 0.059 ±18% | |
+    | Sky Ambient SH | 0.010 | 0.016 ±24% | |
+    | Sky Reflection | **0.093（±9%）** | 0.076 ⚠±132% | 模型 A 反而可引用 |
+    | Sky Reflection Copy | 0.031 | 0.030 ±17% | |
+    | Aerial Perspective | 0.036 | 0.035 ±18% | |
+    | **稳态五 pass** | **0.206（中位 0.212）** | 0.170~0.198 | 阈 0.300 → 达标 |
+    | Transmittance / Multi-Scattering | 300 帧 **0 样本** | 0.044（净） | 脏标记生效 |
+
+  只判**方向**不判差值：两个模型量的不是同一件事，差多少没有先验；能判的是
+  "A 不应该比 B 小"（帧内延迟 ≥ 允许重叠的吞吐下界）。实测 A/B = 1.21，方向对，
+  差额就是 pass 边界 / barrier / 无重叠的代价。若某项 A < B，报告把它判成
+  **工具错而不是性能事实**（marker 被合并 / 被剪 / 相机数不同）——
+  这个方向单独判，是因为它指向的修法完全不同。
+  **必须一起给出去的限制**：RenderGraph 的逐 pass marker 被
+  `#if DEVELOPMENT_BUILD || UNITY_EDITOR` 包着（core `RenderGraph.cs:2868-2884`），
+  Release 构建里这些 marker 不存在 —— 这套数字是 Editor 口径，不是发行版性能。
+  没有绕过的办法，所以写在报告正文里，而不是留给引用的人自己发现。
+
 ### 取舍
 
 - **单位用 km 而不是 m**。地球半径 6360 km 写成 6.36e6 后，froxel raymarch 里的 `r*r`
@@ -398,11 +426,34 @@
   换回约 0.03 ms —— 而整链已经是 0.170 / 0.300 ms。**在已达标的链路上为 0.03 ms 引入
   一处形状复杂度不划算**，把它记在这里比做掉它更有价值：留着当"下次预算收紧时先动谁"的
   已定位杠杆。
-- **计时用「模型 B 为主 + 模型 A 交叉验证」，且只对外引用整链数字。**
+- **计时用「模型 B 为主 + 模型 A 交叉验证」；逐 pass 绝对值只从模型 A 引，模型 B 只读占比。**
   模型 B = Edit 模式立即提交、N 次背靠背摊销；它测的是**吞吐**，相邻 dispatch 允许重叠，
-  所以逐 pass 值是下界、只能读占比。模型 A（Play 模式 `ProfilerRecorder`）才给帧内延迟
-  与 RenderGraph 真实 barrier 成本，留作交叉验证（见待办）。两个模型都不是"随手加个
-  Stopwatch"：立即模式的状态转换由图形层插，**不是** RenderGraph 那批 barrier。
+  所以逐 pass 值是下界。模型 A（Play 模式 `ProfilerRecorder`）测**帧内延迟**，跑在真正的
+  RenderGraph 图上，是唯一把 barrier / pass 边界 / 资源状态转换算进去的口径。两个模型都不是
+  "随手加个 Stopwatch"：立即模式的状态转换由图形层插，**不是** RenderGraph 那批 barrier。
+  这条分工原本写成"只对外引用整链数字"，跑完模型 A 之后改了 —— 理由见下一条。
+- **同一个 pass，两套口径的可引用性可以反过来。** 反射 pass 在模型 B 里离散度 ±5%~±132%
+  （0.076 / 0.095 / 0.101 三次复测），判成不可引用；在模型 A 里是 0.093 ms，
+  min 0.186 / max 0.202（±9%），完全可引用。原因不是"模型 A 更准"，而是这个量级上
+  **两个模型的误差来源不同**：模型 B 要从摊销值里扣一个 0.161 ms 的固定开销，被测量
+  （0.09 ms）比扣减项还小，扣减自身的误差就主导了结果；模型 A 直接读 300 个真实帧的
+  marker，不做任何扣减。所以"哪个数字能引用"是**按口径和量级判的**，不是按工具判的。
+  推论：模型 B 的逐 pass 数在 0.01~0.02 ms 档一律只读占比，绝对值去模型 A 拿。
+- **静态表的判定方向要掉过来：稳态里"没有样本"才是对的。** 第一版把七个 pass 一视同仁，
+  凡是取不到样本就报"pass 名走歧 / pass 被剪"，于是两张静态表（Transmittance /
+  Multi-Scattering）在 300 帧里 0 样本被判成失败 —— 而那恰恰是脏标记正常工作的证据。
+  真正该报警的是反向：这两行**有**样本 = 静态表每帧重算，白烧约 0.044 ms/帧，
+  **画面完全正常，只有计时器能看见**。这类"期望缺席"必须显式建模成正判据；
+  否则工具每次都对着正确行为报警，人很快就学会忽略它的警告 —— 那时它就不再是判据了。
+- **多相机求和不能悄悄除掉。** Editor 里 Scene View 与 Game View 各渲染一次，
+  开了 `SumAllSamplesInFrame` 之后一行的值是**两次之和**。除以出现次数是合法的，
+  但合法性有前提：LUT 尺寸全是定值（256×64 / 32×32 / 192×108 / 64²×7 / 32³）、
+  与相机分辨率无关，每帧只有一份大气参数，所以两次渲染做同样的工作量。
+  报告把出现次数（min~max）、原始和、单次值、以及这条前提**一起打出来**：
+  出现次数在帧间变动（min≠max）时连"稳态"都不成立，那时除法直接不做。
+  先试过用 `ExecuteMenuItem("Window/General/Game")` 把 Game 置前来消掉第二个相机，
+  这台机器的停靠布局下无效（Scene 与 Game 不在同一区域），于是保留除法分支 —— 
+  能消掉假设当然更好，消不掉就把假设写在数字旁边，而不是让它隐含在结论里。
 - **每项取 M 轮的最小值，不取平均。** 噪声在这里是单向的 —— Editor 重绘、驱动争用只会
   **加**时间，不会减。平均会把偶发的重绘平摊进结果，min 是对"无争用真实耗时"的一致估计。
   min 与 max 同时上报，离散度 > 25% 的行标 ⚠ 并**不参与判定、不对外引用**：
@@ -644,6 +695,26 @@
   计时器因此改成开跑前**探测**（≤250 ms），探测不过就退回 `GraphicsBuffer.GetData()`
   的硬同步，并把这件事印在报告头上。教训是一句可以直接复用的话：
   **能力查询 ≠ 该原语在当前线程模型下可用。**
+- **`ProfilerRecorder` 抓 `ProfilerMarker` 必须给 `SumAllSamplesInFrame`，
+  而"逐样本"这个默认口径根本不支持。** 不给的话 `StartNew` 直接抛
+  `NotSupportedException: ... only with SumAllSamplesInFrame or CollectOnlyOnCurrentThread`。
+  另一个选项在这里没用：RenderGraph 的 pass marker 记在**渲染线程**上，
+  从主线程按"当前线程"收集会是空的。于是口径被 API 强制成"一个样本 = 一帧的总和"——
+  这不是我选的，是唯一能跑的那条。附带后果是多相机会被求和（见「取舍」）。
+  两个次级坑：① 我凭印象写的 `WrapAroundBuffer` 不存在，真名是
+  `WrapAroundWhenCapacityReached`（枚举成员表用 `unity_reflect` 查出来的，
+  不查就是三处 CS0117）；② 第一版没 fail-fast，异常在 `s_Started = true` 之前抛，
+  于是每个 Editor tick 重试一次，控制台被同一条填满，真正有用的信息
+  （第一条的类型与位置）被埋在几十条重复里 —— 起 recorder 失败是**配置错**，
+  重试不会好，必须立刻收摊并退出 play。
+- **`ProfilerRecorderSample` 除了 `Value` 还有 `Count`。** 我原来为了知道"这一帧同名
+  marker 出现了几次"，打算再起一组不带 `SumAllSamplesInFrame` 的 recorder 去做
+  sum/single 的比值 —— 而 `Count` 就是被求和的样本个数，一个字段解决的事不该用两倍
+  采样开销去换。查一遍结构体成员比设计一个绕路的机制便宜得多。
+- **"期望缺席"被判成失败，比漏判更糟。** 第一版报告对七个 pass 一视同仁，
+  两张静态表在 300 帧里 0 样本被打成"pass 名走歧 / pass 被剪"。工具对着正确行为报警，
+  代价是人学会忽略它的警告；判据的价值全在"红了一定有事"。修法见「取舍」里
+  静态表那条：方向掉过来判，缺席=通过，有样本=报警。
 - **"改了一条没有任何判据覆盖的路径，而自检仍然全绿"——最贵的一种假通过。**
   mip1~6 从 narrow 核换到 wide 核之后，自检四条判据（当时是三条）全绿、
   而且数字**逐位不变**。原因是判据 ① 与 ② 都采 `LOD 0.0`，也就是全落在 narrow 核上；
@@ -670,11 +741,9 @@
   差一个数量级：估算按取样率算，忽略了粗糙那几级每组只有一条线程、延迟完全裸露。
   拷贝那一条的担心（多一个 pass 边界的 barrier）没有成立，实测 0.030 ms。
 - **模型 A 交叉验证：Play 模式 `ProfilerRecorder`（`ProfilerCategory.Render` +
-  `GpuRecorder`）对七个 pass 名逐个取数**，用来给帧内延迟与 RenderGraph 真实 barrier
-  成本 —— 模型 B 给不出这两个。已知限制：RenderGraph 的逐 pass marker 被
-  `#if DEVELOPMENT_BUILD || UNITY_EDITOR` 包着（core `RenderGraph.cs:2868-2884`），
-  Release 构建里根本没有这些 marker，所以这条路只在 Editor / Development 里成立。
-  若 Editor 的 GPU recorder 取不到值或把 marker 并成一项，就照实记录，不补数字。
+  `GpuRecorder`）对七个 pass 名逐个取数** —— **已完成**，见 Added 的
+  `VistaLutGpuRecorderCrossCheck` 一节。结论与预期一致（A/B = 1.21），
+  并且意外地把"反射单 pass 不可引用"这条限制**解除**了。
 - 合并 mip3~6 的 dispatch（per-dispatch 地板已占反射 pass 的 59%）。
   已定位、已估价（约 0.03 ms）、主动搁置，理由见「取舍」。
 - SH 模式（移动端路径）的反射耗时**完全没测**。计时器目前只跑 LUT 模式，
