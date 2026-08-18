@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using UnityEngine;
 using UnityEngine.Experimental.Rendering;
 using UnityEngine.Rendering;
@@ -56,6 +56,13 @@ namespace Vista
 
         /// <summary>与 compute 里的 VISTA_ROUNDTRIP_SCALE 一致。</summary>
         public const float k_RoundTripScale = 4096f;
+
+        /// <summary>
+        /// 与 compute 里的 <c>VISTA_AP_ERR_SCALE</c> 一致。
+        /// AP 透射率的插值误差实测在 1e-6 量级，落在 fp16 的次正规区里；
+        /// 存之前放大、读回来再除，否则"误差极小"与"通道没写"读不出区别。
+        /// </summary>
+        public const float k_ApErrorScale = 4096f;
 
         /// <summary>SH9。与 <c>VISTA_SH_COEFF_COUNT</c> 一致。</summary>
         public const int k_ShCoeffCount = 9;
@@ -864,6 +871,14 @@ namespace Vista
         {
             if (!isAerialPerspectiveValid || m_ApScatter == null) return;
 
+            // 逐视图常量也要在这里推。AP 的三个核都要读相机位置与太阳方向，
+            // 而这条链路**不能**假定 Sky-View 先跑过：本方法自己的注释就写着
+            // 「与 Sky-View 之间没有依赖，两者可以并行」，一旦真的重排或并行，
+            // AP 读到的就是上一个绑定者留下的视图。多相机下更直接 —— 反射探针
+            // 那六个面各绑一次自己的视图，主相机的 AP 排在后面就会拿到探针的位置。
+            // （这个 bug 是 Task #7 换视角复核时暴露的：换了相机高度与太阳仰角，
+            //   误差曲线一个数都没变，因为核根本没看到新视图。）
+            view.Bind(d, m_SkyViewWidth, m_SkyViewHeight);
             view.BindAerialPerspective(d, settings);
 
             d.SetTexture(m_LutCS, m_KernelApIdx,
@@ -893,6 +908,8 @@ namespace Vista
         {
             if (!isAerialPerspectiveValid || m_KernelApRoundTripIdx < 0 || m_ApScatter == null) return;
 
+            // 与正式核同理，逐视图常量必须自己推一遍，不能指望别的 pass 先绑过。
+            view.Bind(d, m_SkyViewWidth, m_SkyViewHeight);
             view.BindAerialPerspective(d, settings);
 
             d.SetTexture(m_LutCS, m_KernelApRoundTripIdx,
@@ -904,8 +921,10 @@ namespace Vista
         /// <summary>
         /// 仅供 Editor 自检：切片分布质量测量。**必须在 <see cref="RenderAerialPerspectiveLut{T}"/>
         /// 之后调用**，因为它要把散射表当 SRV 读回来做对照。
-        /// 结果写进 apTransmittanceLut 的 (0, 0, slice) 一列，
-        /// RGBA = 切片中心相对误差、切片中点相对误差、中心距离(km)、中点距离(km)。
+        /// 结果写进 apTransmittanceLut 的两列（<c>y = 0</c>，要求表宽 ≥ 4）：
+        /// <c>(0, 0, i)</c> = errCenter、errMid、参考解灰度亮度、LUT 灰度亮度；
+        /// <c>(3, 0, i)</c> = errMidT·<see cref="k_ApErrorScale"/>、参考解灰度 T、LUT 灰度 T、参考解中点亮度。
+        /// 另有 <c>(1, 0, 0)</c> / <c>(2, 0, 0)</c> 两个区间诊断（见核内注释）。
         /// 调完必须再跑一次正式核覆盖回去。
         /// </summary>
         public void RenderApSliceError<T>(
@@ -914,6 +933,8 @@ namespace Vista
         {
             if (!isAerialPerspectiveValid || m_KernelApSliceErrorIdx < 0 || m_ApScatter == null) return;
 
+            // 与正式核同理，逐视图常量必须自己推一遍，不能指望别的 pass 先绑过。
+            view.Bind(d, m_SkyViewWidth, m_SkyViewHeight);
             view.BindAerialPerspective(d, settings);
 
             d.SetTexture(m_LutCS, m_KernelApSliceErrorIdx,

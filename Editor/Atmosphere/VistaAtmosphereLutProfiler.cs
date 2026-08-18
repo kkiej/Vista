@@ -322,14 +322,18 @@ namespace Vista.Editor
                 // ---- 稳态五 pass 整链 ----
                 // 直接测五个串起来，而不是把五个单测加起来：加法会把单测里吃到的
                 // dispatch 重叠红利也加进去，得出一个比实际更低的"合计"。
-                System.Action<CommandBuffer> steadyChain = cmd =>
+                // 工厂而不是直接写死 ap：下面 AP 定档那一节要把同一条链在不同切片数下
+                // 各测一遍，链的其余四 pass 必须逐字相同，否则差值就不能归因给 AP。
+                System.Func<VistaAerialPerspectiveSettings, System.Action<CommandBuffer>> chainWith =
+                    a => cmd =>
                 {
                     luts.RenderSkyViewLut(D(cmd, luts), view);
                     if (shOk)   luts.RenderSkyAmbientSh(D(cmd, luts), view);
                     if (reflOk) { luts.RenderSkyReflection(D(cmd, luts), view, mode);
                                   luts.CopySkyReflectionToCube(cmd); }
-                    if (apOk)   luts.RenderAerialPerspectiveLut(D(cmd, luts), view, ap);
+                    if (apOk)   luts.RenderAerialPerspectiveLut(D(cmd, luts), view, a);
                 };
+                var steadyChain = chainWith(ap);
                 var tSteady = Per(syncMode, baseline, steadyChain);
 
                 double sumSteady = tSky.min + tSh.Or0() + tRefl.Or0() + tCopy.Or0() + tAp.Or0();
@@ -401,6 +405,9 @@ namespace Vista.Editor
                 {
                     sb.AppendLine("　 harness 自校验：跳过（fence 不可用，只有一条同步路径）。");
                 }
+
+                if (apOk)
+                    ReportApDepthCost(sb, syncMode, baseline, luts, view, chainWith, tSteady, tAp);
 
                 sb.AppendLine("── 模型说明（引用数字时必须一起给）");
                 sb.AppendLine("　 1) 这是**吞吐**不是帧内延迟：N 次背靠背允许相邻 dispatch 重叠。"
@@ -670,7 +677,120 @@ namespace Vista.Editor
         }
 
         /// <summary>
+        /// AP 切片数 / 分布的**成本**侧，为 #7 的定档服务。
+        ///
+        /// 为什么不能拿自检里的"每柱行进步数"交差：那是个**标称**量。AP 核是一个线程
+        /// 走一整柱（见 AerialPerspective.hlsl），同一个 warp 里的 32 根柱子步数不同时
+        /// 会被最长的那根拖住，而 VISTA_AP_STEPS_MAX 又会把长柱截断 —— 标称步数与
+        /// 实测耗时不必成比例。精度那一侧有 20 行实测，成本这一侧不该只有一个代理量。
+        ///
+        /// 两个口径都测，理由同逐 mip 归因那处：
+        ///   iso   单独测 AP：N 次背靠背之间只有 UAV 写-写关系，驱动通常不为此串行化，
+        ///         所以它是**下界**。但同一个偏低作用在每一个配置上，配置之间的**比值**
+        ///         仍然可信 —— 这一列只用来读"切片数翻倍要多花多少"。
+        ///   chain 把该配置换进稳态五 pass 整链再测：链内有真实的 SRV/UAV 依赖，重叠被
+        ///         挡住。这才是能对外引用、能与 0.300 ms 预算比的绝对值。
+        ///
+        /// 报告里同时印显存，因为 AP 的两张 RGBAHalf 3D 表是这套方案里**唯一**随质量档
+        /// 线性涨的常驻显存，而它小到常被忽略（32³ 才 512 KB）—— 印出来是为了让
+        /// "为什么不干脆开 64 片"这个问题有数字可答，而不是靠印象。
+        /// </summary>
+        static void ReportApDepthCost(
+            StringBuilder sb, SyncMode syncMode, Sample baseline, VistaAtmosphereLuts luts,
+            VistaAtmosphereViewData view,
+            System.Func<VistaAerialPerspectiveSettings, System.Action<CommandBuffer>> chainWith,
+            Sample tSteadyDefault, Sample tApDefault)
+        {
+            // 候选取自 #7 精度扫描里的四个焦点：最省的 d=16 Log、同深度但把切片重分布的
+            // d=16 Pow k=3（精度追上 d=32 Log 的那一档）、中档 d=24、以及 PC 备选 d=32 的
+            // 两种分布。再加 d=64 Log 作为"切片数—耗时"曲线的远端锚点：没有它就无法判断
+            // 这条曲线到底是线性的还是有拐点，而"翻倍很便宜"恰恰是要被证伪的直觉。
+            var configs = new (string label, int depth,
+                               VistaAerialPerspectiveSettings.Distribution dist, float k, float nearKm)[]
+            {
+                ("d=16 Log 20m ", 16, VistaAerialPerspectiveSettings.Distribution.Logarithmic, 2f, 0.02f),
+                ("d=16 Pow k=3 ", 16, VistaAerialPerspectiveSettings.Distribution.Power,       3f, 0.02f),
+                ("d=24 Log 20m ", 24, VistaAerialPerspectiveSettings.Distribution.Logarithmic, 2f, 0.02f),
+                ("d=32 Log 20m ", 32, VistaAerialPerspectiveSettings.Distribution.Logarithmic, 2f, 0.02f),
+                ("d=32 Pow k=3 ", 32, VistaAerialPerspectiveSettings.Distribution.Power,       3f, 0.02f),
+                ("d=64 Log 20m ", 64, VistaAerialPerspectiveSettings.Distribution.Logarithmic, 2f, 0.02f),
+            };
+
+            sb.AppendLine("── AP 切片数定档·成本侧（iso 是下界，只读配置间比值；chain 是可引用的绝对值）");
+
+            var isoMs = new double[configs.Length];
+            var chainMs = new double[configs.Length];
+
+            for (int i = 0; i < configs.Length; ++i)
+            {
+                var c = configs[i];
+                var s = new VistaAerialPerspectiveSettings
+                {
+                    resolution   = new Vector3Int(32, 32, c.depth),
+                    distribution = c.dist,
+                    powerExponent = c.k,
+                    nearDistanceKm = c.nearKm,
+                };
+                // 分配在计时窗口之外。深度变了才会真的重建纹理（Equals 只比尺寸）。
+                if (!luts.PrepareAerialPerspective(s))
+                {
+                    sb.AppendLine("　　 ✘ PrepareAerialPerspective 失败，成本侧中止。");
+                    return;
+                }
+
+                var iso   = Per(syncMode, baseline,
+                                cmd => luts.RenderAerialPerspectiveLut(D(cmd, luts), view, s));
+                var chain = Per(syncMode, baseline, chainWith(s));
+                isoMs[i]   = iso.Or0();
+                chainMs[i] = chain.Or0();
+
+                // 两张 RGBAHalf（散射 + 彩色透射率），每纹素 8 B。
+                double kb = 2.0 * s.width * s.height * s.depth * 8.0 / 1024.0;
+                double apShare = chain.Or0() > 1e-6 ? iso.Or0() / chain.Or0() : 0.0;
+
+                sb.Append("　　 ").Append(c.label)
+                  .Append("iso ").Append(iso.Or0().ToString("F3")).Append(" ms")
+                  .Append("　chain ").Append(chain.Fmt())
+                  .Append("　显存 ").Append(kb.ToString("F0")).Append(" KB")
+                  .Append("　AP 占链 ").Append(apShare.ToString("P0"));
+                if (chain.valid && chain.spread > 0.25) sb.Append("　⚠±").Append(chain.spread.ToString("P0"));
+                sb.AppendLine();
+            }
+
+            // ---- 曲线形状：翻倍到底贵不贵 ----
+            // d=16→32→64 三点。只报比值不下结论的原因：这条曲线的斜率会被
+            // VISTA_AP_STEPS_MAX 的截断改变，而截断点随 far/near 变 —— 现在量到的
+            // 斜率只对当前 far=32 km 成立，写成"AP 耗时随切片数亚线性"就越界了。
+            double r16to32 = isoMs[0] > 1e-4 ? isoMs[3] / isoMs[0] : 0.0;
+            double r32to64 = isoMs[3] > 1e-4 ? isoMs[5] / isoMs[3] : 0.0;
+            sb.Append("　　 iso 比值　16→32 ×").Append(r16to32.ToString("F2"))
+              .Append("　32→64 ×").Append(r32to64.ToString("F2"))
+              .Append("（切片数各翻一倍；斜率随 VISTA_AP_STEPS_MAX 的截断点变，"
+                    + "只对 far=32 km 这一档成立）").AppendLine();
+
+            // ---- 同深度换分布的代价 ----
+            // 这是定档里最关键的一条：#7 量到 d=16 Pow k=3 的最差段误差是 d=16 Log 的 1/4，
+            // 若它的耗时也差不多，那"提精度"就不必买切片数 —— 重分布是免费的。
+            double dLog16 = isoMs[0], dPow16 = isoMs[1];
+            if (dLog16 > 1e-4)
+                sb.Append("　　 同深度换分布　d=16 Log ").Append(dLog16.ToString("F3"))
+                  .Append(" → Pow k=3 ").Append(dPow16.ToString("F3"))
+                  .Append(" ms（×").Append((dPow16 / dLog16).ToString("F2"))
+                  .AppendLine("）；显存完全不变，切片数不变，只是把切片挪了位置");
+
+            // ---- 恢复默认配置 ----
+            // 上面的循环把纹理留在了最后一个候选的深度上。不恢复的话，此后任何用
+            // 默认 apSettings 的调用都会拿 depth=32 的 dispatch 打进 64 深的表里。
+            // 这个函数现在排在所有测量之后，但"当前没有后续调用"不是可以不恢复的理由。
+            luts.PrepareAerialPerspective(new VistaAerialPerspectiveSettings());
+            sb.Append("　　 参照：默认档 32³/Log 的 iso ").Append(tApDefault.Or0().ToString("F3"))
+              .Append(" ms、整链 ").Append(tSteadyDefault.Or0().ToString("F3"))
+              .AppendLine(" ms（上方逐 pass 与整链两节测的就是这一档）");
+        }
+
+        /// <summary>
         /// 镜像 <c>VistaSkyReflectionSampleCount</c>（SkyReflection.hlsl:94-100）的取样数。
+
         ///
         /// 这是一份**报告专用**的副本，故意不去做"唯一真源"：它只用来给上面那张表算
         /// 取样量与吞吐，不参与任何判定。所以两边哪天走歧，后果是吞吐那一列的分子错了，

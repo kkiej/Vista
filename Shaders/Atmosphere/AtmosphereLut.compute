@@ -370,8 +370,7 @@ void AerialPerspectiveLut(uint3 id : SV_DispatchThreadID)
                 VistaScatterSample smp = VistaEvaluateScatterSample(p, rayDir, sunDir, s);
 
                 float3 sampleTransmittance = exp(-smp.extinction * dt);
-                luminance += throughput
-                    * (smp.scattered - smp.scattered * sampleTransmittance) / smp.extinction;
+                luminance += throughput * VistaSegmentIntegral(smp.scattered, smp.extinction, dt);
                 throughput *= sampleTransmittance;
             }
         }
@@ -439,16 +438,41 @@ void AerialPerspectiveRoundTrip(uint3 id : SV_DispatchThreadID)
 //        改用柱子总量做分母后，这一项直接读作"贴到画面上的雾量错了百分之几"，
 //        阈值也就能按"平滑渐变上多少对比度会看出带状"来定，而不是拍一个比值。
 //
+//    errMidT   = |(T[i]+T[i+1])/2 - T_truth(D(w_mid))| / T_truth
+//        **透射率**那条曲线在中点的插值误差。与 errMid 不可合并，也不能省：
+//        合成式是 final = geometry·T + inScatter，两项的误差各自乘在不同的东西上。
+//        近端 in-scatter 只占柱子总量的千分之几，按柱子总量归一化之后**必然**合格，
+//        于是 errMid 对近端几乎没有分辨力；而近端恰恰是 T ≈ 1 的地方，它乘的是
+//        全画面最亮的东西（晒到太阳、albedo 0.8 的雪地约 3e4 cd/m²）。
+//        也就是说近端的可见性由 T 决定，而只测 errMid 等于对近端不设判据 ——
+//        "把切片堆到远端、饿死近端"的分布正好能在这种判据下拿到漂亮的聚合值。
+//        分母用 T 自己：T 的相对误差**就是**它给那个像素带来的相对误差，
+//        所以阈值可以直接用 1% 的可见性阈（与 Task #6 的 Weber 判据同一把尺）。
+//
 //  输出借用 _VistaApTransmittanceLutRW；调用方读完重跑正式核覆盖。
-//  RGBA = errCenter、errMid、参考解灰度亮度、LUT 灰度亮度。
-//  后两个通道存的是**原始亮度**而不是切片距离：距离在 C# 侧能精确复刻
+//  (0, 0, i) 的 RGBA = errCenter、errMid、参考解灰度亮度、LUT 灰度亮度。
+//  (3, 0, i) 的 RGBA = errMidT·VISTA_AP_ERR_SCALE、参考解灰度 T、LUT 灰度 T、参考解中点亮度。
+//  两行都存**原始值**而不是切片距离：距离在 C# 侧能精确复刻
 //  （见 VistaAtmosphereSelfTest.ApDistance），而原始值不能 ——
 //  没有它，"误差 24%" 这种报告无法区分"LUT 偏高"还是"参考解偏低"，
 //  而这两者的修法完全相反。
+//
+//  本核连同下面的区间诊断一共占用 x = 0..3 这四列（y = 0），故要求表宽 ≥ 4。
+//  自检里恒为 32，但值得写明：RWTexture3D 的越界写会被静默丢弃，
+//  真踩到时的症状是"某个误差通道恒为 0"，看起来像"误差极小"而不是"没写"。
 // ============================================================================
 TEXTURE3D(_VistaApScatterLutRead);
 
-float3 VistaApReferenceLuminance(float3 posKm, float3 rayDir, float3 sunDir, float tMax)
+// errMidT 在存进 fp16 之前放大。实测这一项在 1e-6 量级，而 fp16 的最小正规数是
+// 6.1e-5 —— 直接存会掉进次正规区，读回来是被量化成阶梯的值，于是"误差极小"与
+// "通道根本没写"在数值上分不清。放大到 1e-3 量级后与其它误差通道同域。
+// C# 侧的对应常量是 VistaAtmosphereLuts.k_ApErrorScale，两处必须一致。
+#define VISTA_AP_ERR_SCALE 4096.0
+
+// 返回整个结果而不只是 luminance：errMidT 要用同一次参考解里的 transmittance。
+// 分两次调用会把参考解的成本翻倍（每次 256 步 × 两次 LUT 取样），
+// 而且两次调用之间没有任何东西保证它们走的是同一段路。
+VistaScatteringResult VistaApReference(float3 posKm, float3 rayDir, float3 sunDir, float tMax)
 {
     VistaRaymarchSettings s = VistaDefaultRaymarchSettings();
     s.sampleCount         = VISTA_AP_REFERENCE_STEPS;
@@ -458,7 +482,7 @@ float3 VistaApReferenceLuminance(float3 posKm, float3 rayDir, float3 sunDir, flo
     s.useMultiScattering  = true;
     s.includeGroundBounce = false;
     s.tMax                = tMax;
-    return VistaIntegrateScatteredLuminance(posKm, rayDir, sunDir, s).luminance;
+    return VistaIntegrateScatteredLuminance(posKm, rayDir, sunDir, s);
 }
 
 [numthreads(64, 1, 1)]
@@ -479,8 +503,9 @@ void AerialPerspectiveSliceError(uint3 id : SV_DispatchThreadID)
     float wCenter = (float)id.x * _VistaApSize.w;
     float dCenter = VistaApSliceCoordToDistance(wCenter);
 
-    float3 lutCenter = LOAD_TEXTURE3D(_VistaApScatterLutRead, uint3(column, id.x)).rgb;
-    float3 refCenter = VistaApReferenceLuminance(posKm, rayDir, sunDir, dCenter);
+    float4 lutCenter4 = LOAD_TEXTURE3D(_VistaApScatterLutRead, uint3(column, id.x));
+    float3 lutCenter  = lutCenter4.rgb;
+    float3 refCenter  = VistaApReference(posKm, rayDir, sunDir, dCenter).luminance;
 
     float errCenter = 0.0;
     float refC = dot(refCenter, 1.0 / 3.0);
@@ -489,24 +514,35 @@ void AerialPerspectiveSliceError(uint3 id : SV_DispatchThreadID)
         errCenter = abs(lutC - refC) / refC;
 
     float errMid = 0.0;
+    float errMidT = 0.0, refTMid = 0.0, lutTMid = 0.0, refSMid = 0.0;
     if (id.x + 1u < depth)
     {
         float wMid = ((float)id.x + 0.5) * _VistaApSize.w;
         float dMid = VistaApSliceCoordToDistance(wMid);
 
-        float3 lutNext = LOAD_TEXTURE3D(_VistaApScatterLutRead, uint3(column, id.x + 1u)).rgb;
-        float3 interp  = 0.5 * (lutCenter + lutNext);
-        float3 refMid  = VistaApReferenceLuminance(posKm, rayDir, sunDir, dMid);
+        float4 lutNext4 = LOAD_TEXTURE3D(_VistaApScatterLutRead, uint3(column, id.x + 1u));
+        float3 interp   = 0.5 * (lutCenter + lutNext4.rgb);
+        VistaScatteringResult refMid = VistaApReference(posKm, rayDir, sunDir, dMid);
 
         // 分母 = 这根柱子最远片上的累积量，也就是它最终会贴到画面上的雾量。
         // 用本地参考值当分母会让最近的一两片恒定爆表（见头部注释）。
         float3 columnFar = LOAD_TEXTURE3D(_VistaApScatterLutRead, uint3(column, depth - 1u)).rgb;
         float  farC = max(dot(columnFar, 1.0 / 3.0), 1e-4);
 
-        errMid = abs(dot(interp, 1.0 / 3.0) - dot(refMid, 1.0 / 3.0)) / farC;
+        refSMid = dot(refMid.luminance, 1.0 / 3.0);
+        errMid  = abs(dot(interp, 1.0 / 3.0) - refSMid) / farC;
+
+        // 透射率那条曲线。LUT 侧取 alpha 里的灰度打包，而不是另开一次 SRV 读
+        // 彩色表 —— alpha == mean(T.rgb) 由 ValidateApTable 单独验过，
+        // 且移动端路径本来就只有这一个 alpha，测的正好是它。
+        lutTMid = 0.5 * (lutCenter4.a + lutNext4.a);
+        refTMid = dot(refMid.transmittance, 1.0 / 3.0);
+        errMidT = abs(lutTMid - refTMid) / max(refTMid, 1e-4);
     }
 
     _VistaApTransmittanceLutRW[uint3(0, 0, id.x)] = float4(errCenter, errMid, refC, lutC);
+    _VistaApTransmittanceLutRW[uint3(3, 0, id.x)] =
+        float4(errMidT * VISTA_AP_ERR_SCALE, refTMid, lutTMid, refSMid);
 
     // ---- 区间诊断（只一个线程写，与上面的每片数据分开放在别的行）----
     // 上面那些百分比全部假定"两个积分器走的是同一段路、被积函数在这段路上连续"。
@@ -540,8 +576,8 @@ void AerialPerspectiveSliceError(uint3 id : SV_DispatchThreadID)
 
         float shadowNear = VistaEarthShadow(posKm + 0.003 * rayDir, sunDir);
         float shadowFar  = VistaEarthShadow(posKm + 1.000 * rayDir, sunDir);
-        float ref1 = dot(VistaApReferenceLuminance(posKm, rayDir, sunDir, 0.02), 1.0 / 3.0);
-        float ref2 = dot(VistaApReferenceLuminance(posKm, rayDir, sunDir, 0.04), 1.0 / 3.0);
+        float ref1 = dot(VistaApReference(posKm, rayDir, sunDir, 0.02).luminance, 1.0 / 3.0);
+        float ref2 = dot(VistaApReference(posKm, rayDir, sunDir, 0.04).luminance, 1.0 / 3.0);
         _VistaApTransmittanceLutRW[uint3(2, 0, 0)] = float4(shadowNear, shadowFar, ref1, ref2);
     }
 }

@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 using UnityEditor;
 using UnityEngine;
 using UnityEngine.Rendering;
@@ -450,7 +450,8 @@ namespace Vista.Editor
         //   1) 深度分布的正反映射写反      -> 雾整体近了或远了一格
         //   2) 行进循环与共享积分器不等价  -> 与天空在地平线处接不上缝
         //   3) 切片布得太稀                -> 距离方向上出现台阶
-        // 前两项有明确阈值，第三项是取舍量（Power vs Log 该选哪个），报数不判死。
+        // 前两项有明确阈值；第三项过去只报数不判死，现在由 ValidateApSliceBudget
+        // 的分段判据定档（见那里的注释：为什么聚合最大值可以被刷，而分段不能）。
         static bool ValidateAerialPerspective(
             VistaAtmosphereLuts luts, VistaAtmosphereParameters p, StringBuilder sb)
         {
@@ -473,14 +474,19 @@ namespace Vista.Editor
                         + "×" + settings.depth + "　far " + settings.maxDistanceKm.ToString("F0") + " km");
 
             bool ok = ValidateApTable(luts, view, settings, sb);
-            ok &= ValidateApDistribution(luts, view, settings,
+            ok &= ValidateApDistribution(luts, view, p, settings,
                       VistaAerialPerspectiveSettings.Distribution.Logarithmic, sb);
-            ok &= ValidateApDistribution(luts, view, settings,
+            ok &= ValidateApDistribution(luts, view, p, settings,
                       VistaAerialPerspectiveSettings.Distribution.Power, sb);
+            ok &= ValidateApSliceBudget(luts, p, settings, sb);
 
             // 自检把 (0, 0, z) 一列当过草稿纸（round-trip 与 slice error 都借它输出），
             // 最后重烘一次，预览窗口拿到的才是真表。
+            // Prepare 必须重来：上面的扫描按 depth 重新分配过，若不还原，
+            // 下面这次烘焙会拿 depth=32 的 _VistaApSize 去写一张 64 片的表，
+            // 后 32 片留着上一档的残留 —— 预览里表现为"远处雾突然跳一下"。
             settings.distribution = VistaAerialPerspectiveSettings.Distribution.Logarithmic;
+            luts.PrepareAerialPerspective(settings);
             var cmd = new CommandBuffer();
             luts.RenderAerialPerspectiveLut(cmd, view, settings);
             Graphics.ExecuteCommandBuffer(cmd);
@@ -613,6 +619,7 @@ namespace Vista.Editor
         /// </summary>
         static bool ValidateApDistribution(
             VistaAtmosphereLuts luts, in VistaAtmosphereViewData view,
+            in VistaAtmosphereParameters p,
             VistaAerialPerspectiveSettings settings,
             VistaAerialPerspectiveSettings.Distribution mode, StringBuilder sb)
         {
@@ -678,34 +685,16 @@ namespace Vista.Editor
 
             // ---- 对高步数参考解的误差 ----
             // errCenter 测**行进循环本身**（步数够不够、是否与共享积分器等价）；
-            // errMid 测**切片分布**（三线性插值在两片之间还原得多准）。见核里的注释。
-            // 距离由 C# 自己算（ApDistance 复刻了 packedParams），核里的两个通道
+            // errMid / errMidT 测**切片分布**（三线性插值在两片之间还原得多准）。见核里的注释。
+            // 距离由 C# 自己算（ApDistance 复刻了 packedParams），核里的通道
             // 让给原始亮度 —— 只有它能区分"LUT 偏高"和"参考解偏低"。
-            float maxErrCenter = 0f, atCenterKm = 0f, cLut = 0f, cRef = 0f;
-            float maxErrMid = 0f, atMidKm = 0f;
-            for (int z = 0; z < d; ++z)
-            {
-                Color e = errCol[0, 0, z];
-                if (e.r > maxErrCenter)
-                {
-                    maxErrCenter = e.r;
-                    atCenterKm = ApDistance(settings, z);
-                    cRef = e.b; cLut = e.a;
-                }
-                // 最后一片没有"下一片"，核里 errMid 恒为 0，排除掉免得拉低统计
-                if (z < d - 1 && e.g > maxErrMid)
-                {
-                    maxErrMid = e.g;
-                    atMidKm = ApDistance(settings, z, 0.5f);
-                }
-            }
+            var curve = ReduceApCurve(errCol, settings, p);
+
             // 5%：段内解析积分 + 每段 ≤16 步对散射这种低频量应该远好于此。
             // 超了说明 VISTA_AP_STEPS_MAX 在该分布的远端段被打满（Log 尤其容易）。
-            bool okErrCenter = maxErrCenter < 0.05f;
-            // 2%：errMid 的分母是整根柱子的雾量总量（见核里的注释），所以这个数
-            // 直接读作"画面上的雾亮错了百分之几"。平滑渐变上 1% 左右的对比度就能
-            // 看出带状，2% 留一倍余量。这一项同时是 Task #6 选 Power 还是 Log 的依据。
-            bool okErrMid = maxErrMid < 0.02f;
+            bool okErrCenter = curve.maxErrCenter < k_ApErrCenterMax;
+            string midText  = ApBandText(curve, false, k_ApErrMidMax,  out bool okErrMid);
+            string midTText = ApBandText(curve, true,  k_ApErrMidTMax, out bool okErrMidT);
 
             sb.AppendLine("　── 分布 " + tag);
             sb.AppendLine(Mark(okRt)            + " 　round-trip 最大 |Δw| " + maxRt.ToString("E2") + "（阈值 1e-3）");
@@ -719,12 +708,19 @@ namespace Vista.Editor
                                                 + texWFar.ToString("F5") + "（应为 " + (0.5f / d).ToString("F5")
                                                 + " / " + ((d - 0.5f) / d).ToString("F5") + "）");
             sb.AppendLine(Mark(okErrCenter)     + " 　切片中心 vs 256 步参考解　最大 "
-                                                + (maxErrCenter * 100f).ToString("F2") + "% @ "
-                                                + atCenterKm.ToString("F3") + " km（阈值 5%，测行进循环）"
-                                                + "　LUT " + cLut.ToString("E3") + " vs 参考 " + cRef.ToString("E3"));
-            sb.AppendLine(Mark(okErrMid)        + " 　切片中点（三线性插值）最大 "
-                                                + (maxErrMid * 100f).ToString("F2") + "% @ "
-                                                + atMidKm.ToString("F3") + " km（阈值 2%，相对柱子总量，测切片分布）");
+                                                + Pct(curve.maxErrCenter) + " @ "
+                                                + curve.atErrCenterKm.ToString("F3") + " km（阈值 "
+                                                + Pct(k_ApErrCenterMax) + "，测行进循环）"
+                                                + "　LUT " + curve.centerLut.ToString("E3")
+                                                + " vs 参考 " + curve.centerRef.ToString("E3"));
+            sb.AppendLine(Mark(okErrMid)        + " 　errMid 逐段 max（" + k_ApBandLegend + "，阈值 "
+                                                + Pct(k_ApErrMidMax) + "，相对柱子总量）　" + midText);
+            sb.AppendLine(Mark(okErrMidT)       + " 　errMidT 逐段 max（阈值 " + Pct(k_ApErrMidTMax)
+                                                + "，相对 T 自身）　" + midTText);
+            sb.AppendLine("　 台阶强度 max|ΔerrMid| " + Pct(curve.maxMidStep) + " @ "
+                        + curve.atMidStepKm.ToString("F3") + " km　"
+                        + "每柱行进步数 " + curve.marchSteps + "（不判定，见 ReduceApCurve）");
+            sb.AppendLine("　 errMid 曲线（中点 km→%）　" + ApCurveText(errCol, settings));
 
             // 区间诊断（核里第 1、2 行）。不判定，只报数 —— 它回答的是"上面那些
             // 百分比是不是在比较同一段路"，而这个前提一旦破了，百分比本身就没意义。
@@ -737,7 +733,8 @@ namespace Vista.Editor
                         + " ref(0.04)=" + g2.a.ToString("E3")
                         + " 比值 " + (g2.b > 1e-6f ? (g2.a / g2.b).ToString("F3") : "n/a") + "（应≈2）");
 
-            return okRt && okW && distIncreasing && okNear && okFar && okTexW && okErrCenter && okErrMid;
+            return okRt && okW && distIncreasing && okNear && okFar && okTexW
+                && okErrCenter && okErrMid && okErrMidT;
         }
 
         /// <summary>C# 侧复刻 <c>VistaApSliceCoordToDistance</c>，用来定位"最接近某个距离"的切片。
@@ -762,6 +759,472 @@ namespace Vista.Editor
                 if (e < bestErr) { bestErr = e; best = z; }
             }
             return best;
+        }
+
+        // ------------------------------------------------- AP 切片分布：分段判据
+        //
+        // 为什么不能用"整根柱子的 max errMid"当判据 —— 这是这一节唯一重要的事：
+        // 那个聚合值可以被"把切片堆在积分已经饱和的远端、饿死近端"刷出漂亮的数字。
+        //   · 远端：透射率衰减完了，累积量走上平台，线性插值误差自然趋近 0；
+        //   · 近端：绝对雾量只有柱子总量的千分之几，除以柱子总量之后照样很小。
+        // 两端都读作"小"，于是一个近处糊成一坨的分布能拿到全场最低的聚合值。
+        // 分段之后每一段各自过阈值，这条路就堵死了：近端那段的分母虽然还是柱子总量，
+        // 但同段内只有两三片可比，插不准就是插不准，藏不到别的段里去。
+        //
+        // 分段的边界按**画面里有什么**切，不按整数：
+        //   脚下 <50 m       角色、脚下地面、近处石头（第三人称相机的常驻内容）
+        //   近景 0.05–0.5 km 能跑到的那块地、树
+        //   中景 0.5–4 km    建筑轮廓、树线（ER 里"看到远处那座教堂"的距离）
+        //   远景 4–32 km     远山层叠与天际线
+        static readonly float[] k_ApBandEdgesKm = { 0f, 0.05f, 0.5f, 4f, 32f };
+        static readonly string[] k_ApBandMarks  = { "①", "②", "③", "④" };
+        const string k_ApBandLegend = "①脚下<50m ②近景.05-.5km ③中景.5-4km ④远景4-32km";
+
+        /// <summary>5%：段内解析积分 + 每段 ≤16 步对散射这种低频量应该远好于此。
+        /// 这一项是**前置门**而不是并列判据：它一旦超标，说明行进本身就不准，
+        /// 后面的 errMid 混着行进误差，不同分布之间不再可比。</summary>
+        const float k_ApErrCenterMax = 0.05f;
+
+        /// <summary>2%：分母是整根柱子的雾量总量（见核里的注释），而晒到太阳的漫反射面
+        /// 约 0.3·120000/π ≈ 1.1e4 cd/m²，与饱和后的雾量同量级 —— 所以这个数可以直接
+        /// 读作"画面亮错了百分之几"。平滑渐变上 1% 对比度就能看出带状，2% 留一倍余量。</summary>
+        const float k_ApErrMidMax = 0.02f;
+
+        /// <summary>1%：透射率的相对误差**就是**它给几何体项带来的相对误差
+        /// （final = geometry·T + inScatter），所以直接用 Task #6 那把 Weber 尺子。</summary>
+        const float k_ApErrMidTMax = 0.01f;
+
+        /// <summary>可见性下限，用在"某段没有中点样本"时（见 <see cref="ApBandVisible"/>）。
+        /// 与上面两个阈值同源：都是 1% 的 Weber 对比度阈。</summary>
+        const float k_ApVisibleFloor = 0.01f;
+
+        /// <summary>定档时的余量系数：能看见的段要压到阈值的一半以内才算候选。
+        ///
+        /// 理由不是"越严越好"，而是**这套阈值本身就是可见阈**，压线通过意味着
+        /// "刚好看不见"，任何一点没测到的变化都会把它推到看得见那边。而这次扫描
+        /// 只测了两个视角、两种大气状态、一根柱子（屏幕中心），覆盖面远不够支撑压线。
+        /// 已经有直接证据：d=16 Log 20m 在主视角 T④0.49%，换到海拔 1 km／太阳 10°
+        /// 就变 0.46%、errMid④ 从 0.77% 涨到 0.91% —— 同一档配置在两个视角上的
+        /// 摆动量就有 0.14 个百分点，和阈值本身同量级。</summary>
+        const float k_ApSelectMargin = 0.5f;
+
+        struct ApCurve
+        {
+            public float maxErrCenter, atErrCenterKm, centerRef, centerLut;
+            public float[] bandMid, bandMidT, bandMidAtKm;
+            public int[] bandCount;
+            public float maxMidStep, atMidStepKm;
+            public int marchSteps;
+            // 逐片的绝对量，给可见性下限用（见 ApBandVisible）
+            public float[] midKm, refS, refT;
+            public int sampleCount;
+            public float visibleWhite;
+        }
+
+        /// <summary>把 SliceError 的两行原始输出压成分段统计 + 台阶强度 + 成本代理。</summary>
+        static ApCurve ReduceApCurve(Volume errCol, VistaAerialPerspectiveSettings s,
+                                     in VistaAtmosphereParameters p)
+        {
+            int d = s.depth, bands = k_ApBandMarks.Length;
+            var c = new ApCurve
+            {
+                bandMid     = new float[bands],
+                bandMidT    = new float[bands],
+                bandMidAtKm = new float[bands],
+                bandCount   = new int[bands],
+                marchSteps  = ApMarchStepsPerColumn(s),
+                midKm       = new float[Mathf.Max(d - 1, 1)],
+                refS        = new float[Mathf.Max(d - 1, 1)],
+                refT        = new float[Mathf.Max(d - 1, 1)],
+                // 判"看不看得见"的分母：日照下 albedo 0.3 的漫反射面。
+                // 取它而不是取柱子总量，是因为柱子总量本身会随切片布局变
+                // —— 那样又变成一个能被布局刷的判据了。
+                visibleWhite = p.groundAlbedo * p.sunIlluminanceLux / Mathf.PI,
+            };
+            for (int b = 0; b < bands; ++b) { c.bandMid[b] = float.NaN; c.bandMidT[b] = float.NaN; }
+
+            float prevMid = float.NaN;
+            for (int z = 0; z < d; ++z)
+            {
+                Color e = errCol[0, 0, z];
+                if (e.r > c.maxErrCenter)
+                {
+                    c.maxErrCenter = e.r;
+                    c.atErrCenterKm = ApDistance(s, z);
+                    c.centerRef = e.b; c.centerLut = e.a;
+                }
+
+                // 最后一片没有"下一片"，核里两个中点通道恒为 0；算进去会把统计洗低。
+                if (z >= d - 1) continue;
+
+                float dMid = ApDistance(s, z, 0.5f);
+                int b = ApBandIndex(dMid);
+                float mid  = e.g;
+                Color e3   = errCol[3, 0, z];
+                float midT = e3.r / VistaAtmosphereLuts.k_ApErrorScale;
+
+                c.midKm[z] = dMid;
+                c.refS[z]  = e3.a;   // 参考解在该中点的累积入散射（绝对 cd/m²，单调增）
+                c.refT[z]  = e3.g;   // 参考解在该中点的灰度透射率（单调减）
+                c.sampleCount = z + 1;
+
+                c.bandCount[b]++;
+                if (float.IsNaN(c.bandMid[b]) || mid > c.bandMid[b])
+                {
+                    c.bandMid[b] = mid;
+                    c.bandMidAtKm[b] = dMid;
+                }
+                if (float.IsNaN(c.bandMidT[b]) || midT > c.bandMidT[b]) c.bandMidT[b] = midT;
+
+                // 相邻区间的下垂量之差。errMid 本身是"插值比真值低多少"，
+                // 而**均匀**的下垂只是整幅画面雾偏淡一点点，人眼没有参照物、看不出来；
+                // 真正能看出来的是下垂量在片界处突然变化，也就是重建曲线的斜率不连续
+                // （Mach band 的成因）。所以台阶的实际强度是这个差值。
+                // 报它、但判据仍用 max errMid：后者是前者的上界（最多差 2 倍），
+                // 拿上界当门槛只会误杀、不会漏过，方向是安全的。
+                if (!float.IsNaN(prevMid) && Mathf.Abs(mid - prevMid) > c.maxMidStep)
+                {
+                    c.maxMidStep = Mathf.Abs(mid - prevMid);
+                    c.atMidStepKm = dMid;
+                }
+                prevMid = mid;
+            }
+            return c;
+        }
+
+        static int ApBandIndex(float km)
+        {
+            for (int b = k_ApBandMarks.Length - 1; b >= 0; --b)
+                if (km >= k_ApBandEdgesKm[b]) return b;
+            return 0;
+        }
+
+        /// <summary>这一段里的雾**看不看得见**。
+        ///
+        /// 只有"某段一个中点样本都没有"时才需要它：那种情况下没有误差可测，
+        /// 一律判死会误杀（Log near=100m 在四个深度上全被段①否掉，而段①是脚下
+        /// 50 m 以内 —— 那里的累积入散射只有 5.8 cd/m²，对着 1.1E+004 的日照
+        /// 参考白是 0.05%，人眼根本不可能看见"这 50 m 的雾插值错了"）。
+        /// 一律跳过又等于给"近端被饿死"免检，那才是真正要防的失败模式。
+        ///
+        /// 所以判据换成绝对量：这段能藏起来的雾量上限，够不够到 1% 的可见阈值。
+        /// 两个通道都要看 —— 入散射（加到画面上的亮度）和遮挡 1−T（吃掉的对比度），
+        /// 因为近处恰恰是 T 主导、入散射可以忽略的区间。
+        ///
+        /// 上限怎么取：累积入散射沿距离单调增、T 单调减（这两条由 ValidateApTable
+        /// 独立验过），所以**该段远端**的值就是段内任意位置的上界。取第一个中点落在
+        /// 段远边界之外的样本，它比真正的远边界更远，是个偏保守的上界。
+        ///
+        /// 这条规则刷不动：refS / refT 来自 256 步参考解，是大气本身的性质，
+        /// 和切片怎么布无关。想让一段"被豁免"，只能是它真的没东西可看。
+        /// </summary>
+        static bool ApBandVisible(in ApCurve c, int b, out float lumRatio, out float occl)
+        {
+            float far = (b + 1 < k_ApBandEdgesKm.Length) ? k_ApBandEdgesKm[b + 1] : float.MaxValue;
+
+            int i = -1;
+            for (int z = 0; z < c.sampleCount; ++z)
+                if (c.midKm[z] >= far) { i = z; break; }
+            if (i < 0) i = c.sampleCount - 1;   // 整张表都没到这段远端：拿最远的样本兜底
+
+            lumRatio = c.refS[i] / Mathf.Max(c.visibleWhite, 1e-6f);
+            occl     = 1f - c.refT[i];
+            return lumRatio >= k_ApVisibleFloor || occl >= k_ApVisibleFloor;
+        }
+
+        /// <summary>四段判据的布尔版（不建字符串），给扫描里的余量档与第二视角用。</summary>
+        static bool ApBandsOk(in ApCurve c, bool transmittance, float threshold)
+        {
+            float[] vals = transmittance ? c.bandMidT : c.bandMid;
+            for (int b = 0; b < k_ApBandMarks.Length; ++b)
+            {
+                if (c.bandCount[b] <= 0)
+                {
+                    if (ApBandVisible(c, b, out _, out _)) return false;
+                    continue;
+                }
+                if (!(vals[b] < threshold)) return false;
+            }
+            return true;
+        }
+
+        /// <summary>能看见的段里最差的那个百分比。只用于报表排序，不参与判定。</summary>
+        static float ApWorstBand(in ApCurve c, bool transmittance)
+        {
+            float[] vals = transmittance ? c.bandMidT : c.bandMid;
+            float worst = 0f;
+            for (int b = 0; b < k_ApBandMarks.Length; ++b)
+                if (c.bandCount[b] > 0) worst = Mathf.Max(worst, vals[b]);
+            return worst;
+        }
+
+        /// <summary>分段结论。某段没有中点样本时，交给 <see cref="ApBandVisible"/> 定生死：
+        /// 段内的雾在 1% 可见阈值之下才豁免，否则仍然判死（近端被饿死的签名）。</summary>
+        static string ApBandText(ApCurve c, bool transmittance, float threshold, out bool ok)
+        {
+            ok = true;
+            var line = new StringBuilder();
+            float[] vals = transmittance ? c.bandMidT : c.bandMid;
+            for (int b = 0; b < k_ApBandMarks.Length; ++b)
+            {
+                if (b > 0) line.Append(' ');
+                line.Append(k_ApBandMarks[b]);
+
+                if (c.bandCount[b] <= 0)
+                {
+                    bool visible = ApBandVisible(c, b, out float lumRatio, out float occl);
+                    ok &= !visible;
+                    line.Append("0片:")
+                        .Append(visible ? "有雾" : "免检")
+                        .Append('(').Append(Pct(lumRatio)).Append('/').Append(Pct(occl)).Append(')');
+                    if (visible) line.Append('✘');
+                    continue;
+                }
+
+                bool bandOk = vals[b] < threshold;
+                ok &= bandOk;
+                line.Append(Pct(vals[b]));
+                if (!transmittance) line.Append('@').Append(c.bandMidAtKm[b].ToString("F2"));
+                line.Append('(').Append(c.bandCount[b]).Append("片)");
+                if (!bandOk) line.Append('✘');
+            }
+            return line.ToString();
+        }
+
+        /// <summary>逐片打印 errMid，不做任何聚合 —— 定档的原始依据。
+        /// 只有看到整条曲线才能区分"整体偏一点"和"某一段塌下去"。</summary>
+        static string ApCurveText(Volume errCol, VistaAerialPerspectiveSettings s)
+        {
+            var line = new StringBuilder();
+            for (int z = 0; z < s.depth - 1; ++z)
+            {
+                if (z > 0) line.Append(' ');
+                line.Append(ApDistance(s, z, 0.5f).ToString("F3")).Append('→')
+                    .Append((errCol[0, 0, z].g * 100f).ToString("F3"));
+            }
+            return line.ToString();
+        }
+
+        /// <summary>成本代理：复刻核里 <c>clamp(ceil(segLen / VISTA_AP_STEP_MAX_KM), MIN, MAX)</c>
+        /// 累计出"一根柱子跑多少步"。这是 AP 那一趟 dispatch 的算力主项
+        /// （宽高固定 32×32，唯一变的就是深度方向的段划分）。
+        ///
+        /// 复刻忽略了核里对 tLimit（大气顶/地面交点）的钳制。对本自检用的贴地水平视线，
+        /// tTop 有几百 km，钳制不生效；若以后拿它去评朝天的柱子，这个数会偏高。</summary>
+        static int ApMarchStepsPerColumn(VistaAerialPerspectiveSettings s)
+        {
+            const float stepMaxKm = 0.25f;
+            const int stepsMin = 2, stepsMax = 16;
+            int total = 0;
+            float prev = 0f;
+            for (int z = 0; z < s.depth; ++z)
+            {
+                float dz = ApDistance(s, z);
+                total += Mathf.Clamp(Mathf.CeilToInt((dz - prev) / stepMaxKm), stepsMin, stepsMax);
+                prev = dz;
+            }
+            return total;
+        }
+
+        static string Pct(float v)
+        {
+            if (float.IsNaN(v)) return "n/a";
+            float p = v * 100f;
+            return p >= 0.01f ? p.ToString("F2") + "%"
+                 : p > 0f     ? p.ToString("E1") + "%"
+                              : "0%";
+        }
+
+        /// <summary>
+        /// 深度 × 分布的扫描，给 AP 定档。
+        ///
+        /// 网格：depth ∈ {16, 24, 32, 48, 64} × {Log(near 20 m), Log(near 100 m), Power k=2, Power k=3}。
+        /// Log(near 100 m) 必须在里面：Step 3 的体积雾会接管近处那一层，届时 nearKm 会抬上去，
+        /// 定档不能只在"近端极密"这一个前提下成立。
+        ///
+        /// **单个配置不通过不算自检失败** —— 扫描的产出就是"哪些不行"，
+        /// 把预期中的失败当红灯会逼着人去放宽阈值。只有两件事算失败：
+        /// 一个都不通过（说明判据或行进精度有问题，不该靠调阈值糊过去），
+        /// 以及胜出配置在第二个视角上翻车（说明是对着一帧调的）。
+        /// </summary>
+        static bool ValidateApSliceBudget(VistaAtmosphereLuts luts, VistaAtmosphereParameters p,
+                                         VistaAerialPerspectiveSettings baseSettings, StringBuilder sb)
+        {
+            var view = MakeView(p, Vector3.zero, 60f);
+            // 第二视角从"事后复核"提到"参与筛选"。理由：余量规则（k_ApSelectMargin）
+            // 存在的唯一依据就是视角敏感性，只在一个视角上核它是自相矛盾的 ——
+            // 上一版就出现过 d=16 Log 20m 在主视角 T④0.49% 刚好压线过、
+            // 换视角 errMid④ 从 0.77% 抬到 0.91% 的情况。既然手上有两个视角，
+            // 就两个都要满足；把第二个只当事后确认，等于让筛选看不见自己的依据。
+            var view2 = MakeView(p, new Vector3(0f, 1000f, 0f), 10f);
+            var modes = new[]
+            {
+                ("Log 20m ", VistaAerialPerspectiveSettings.Distribution.Logarithmic, 2f, 0.02f),
+                ("Log 100m", VistaAerialPerspectiveSettings.Distribution.Logarithmic, 2f, 0.10f),
+                ("Pow k=2 ", VistaAerialPerspectiveSettings.Distribution.Power,       2f, 0.02f),
+                ("Pow k=3 ", VistaAerialPerspectiveSettings.Distribution.Power,       3f, 0.02f),
+            };
+            int[] depths = { 16, 24, 32, 48, 64 };
+
+            sb.AppendLine("　── 切片预算扫描　" + k_ApBandLegend);
+            sb.AppendLine("　 通过 = 四段的 errMid 全 < " + Pct(k_ApErrMidMax)
+                        + " 且 errMidT 全 < " + Pct(k_ApErrMidTMax)
+                        + "；空段按可见性下限 " + Pct(k_ApVisibleFloor)
+                        + " 豁免（入散射/遮挡，见 ApBandVisible）；errCenter < "
+                        + Pct(k_ApErrCenterMax) + " 为前置门");
+            sb.AppendLine("　 定档另加余量：两个视角（贴地/太阳 60° 与海拔 1 km/太阳 10°）"
+                        + "都要 ≤ 阈值×" + k_ApSelectMargin.ToString("F2")
+                        + "（见 k_ApSelectMargin），标 ◎ 的才进候选");
+
+            VistaAerialPerspectiveSettings bestS = null;
+            string bestTag = null;
+            int bestCost = int.MaxValue, bestDepth = int.MaxValue;
+
+            // 出厂档（VistaAerialPerspectiveSettings 的字段初始值）也要参与这次扫描，
+            // 并且它才是本项判定的对象 —— 见循环后面那段说明。
+            var shipped = new VistaAerialPerspectiveSettings();
+            bool shippedSeen = false, shippedPass = false, shippedCand = false;
+            int shippedCost = 0;
+
+            foreach (int depth in depths)
+            foreach (var m in modes)
+            {
+                var s = baseSettings.Clone();
+                s.resolution = new Vector3Int(baseSettings.width, baseSettings.height, depth);
+                s.distribution = m.Item2;
+                s.powerExponent = m.Item3;
+                s.nearDistanceKm = m.Item4;
+
+                var c = MeasureApConfig(luts, view, s, p);
+                bool okCenter = c.maxErrCenter < k_ApErrCenterMax;
+                string midText  = ApBandText(c, false, k_ApErrMidMax,  out bool okMid);
+                string midTText = ApBandText(c, true,  k_ApErrMidTMax, out bool okMidT);
+
+                var c2 = MeasureApConfig(luts, view2, s, p);
+                bool okCenter2 = c2.maxErrCenter < k_ApErrCenterMax;
+                bool okMid2  = ApBandsOk(c2, false, k_ApErrMidMax);
+                bool okMidT2 = ApBandsOk(c2, true,  k_ApErrMidTMax);
+
+                bool pass = okCenter && okMid && okMidT && okCenter2 && okMid2 && okMidT2;
+
+                // 余量档：同一套判据、阈值减半、两个视角都要过。
+                // 只影响"选谁"，不影响"谁算合格"。
+                bool cand = pass
+                    && ApBandsOk(c,  false, k_ApErrMidMax  * k_ApSelectMargin)
+                    && ApBandsOk(c,  true,  k_ApErrMidTMax * k_ApSelectMargin)
+                    && ApBandsOk(c2, false, k_ApErrMidMax  * k_ApSelectMargin)
+                    && ApBandsOk(c2, true,  k_ApErrMidTMax * k_ApSelectMargin);
+
+                // 这一格是不是出厂档。Log 分布下 powerExponent 不参与映射，Power 分布下
+                // nearDistanceKm 不参与（effectiveNearKm 返回 0），所以只比生效的那个。
+                bool isShipped = depth == shipped.depth && m.Item2 == shipped.distribution
+                    && (m.Item2 == VistaAerialPerspectiveSettings.Distribution.Logarithmic
+                        ? Mathf.Approximately(m.Item4, shipped.nearDistanceKm)
+                        : Mathf.Approximately(m.Item3, shipped.powerExponent));
+
+                sb.AppendLine(Mark(pass) + (cand ? "◎" : "　") + (isShipped ? "★" : "")
+                            + "d=" + depth.ToString().PadLeft(2)
+                            + " " + m.Item1
+                            + "　步/柱 " + c.marchSteps.ToString().PadLeft(3)
+                            + "　errC " + Pct(c.maxErrCenter) + "@" + c.atErrCenterKm.ToString("F4")
+                            + (okCenter ? "" : "✘门")
+                            + "　" + midText
+                            + "　Δ " + Pct(c.maxMidStep)
+                            + "　T:" + midTText
+                            + "　｜视角2 最差 " + Pct(ApWorstBand(c2, false))
+                                      + "/T" + Pct(ApWorstBand(c2, true))
+                                      + (okCenter2 && okMid2 && okMidT2 ? "" : "✘"));
+
+                if (isShipped)
+                {
+                    shippedSeen = true; shippedPass = pass; shippedCand = cand;
+                    shippedCost = c.marchSteps;
+                }
+
+                if (cand && (c.marchSteps < bestCost
+                          || (c.marchSteps == bestCost && depth < bestDepth)))
+                {
+                    bestCost = c.marchSteps; bestDepth = depth;
+                    bestS = s; bestTag = "d=" + depth + " " + m.Item1.Trim();
+                }
+            }
+
+            if (bestS == null)
+            {
+                sb.AppendLine("✘ 没有配置通过分段判据。先查行进精度与判据本身，不要直接放宽阈值。");
+                return false;
+            }
+
+            // ---- 最省的候选：它回答的是"合格线能压到多低"，不是"出厂发什么" ----
+            //
+            // 这一行曾经就叫"定档"，那是个错误的口径。这套判据（1% 的 Weber 可见阈）
+            // 只能判**合格**，不能判**该选谁** —— 20 组配置全部合格时，"取最省的"
+            // 就成了一条藏在代码里的偏好，而它并没有画面或成本上的依据支撑：
+            // 成本侧实测（Profile Atmosphere LUTs 的 AP 定档一节）给出 d=16→32 在
+            // 稳态整链上只差 0.01~0.02 ms 量级、显存差 256 KB，而误差差约 4 倍。
+            // 也就是说这里"省"下来的东西小到测不太准，换掉的却是四倍余量。
+            // 具体毫秒数不在这儿抄一份：抄了就会在核变化后静默过期。
+            float bestKb = baseSettings.width * baseSettings.height * bestS.depth * 8f * 2f / 1024f;
+            sb.AppendLine("　 最省候选 → " + bestTag + "　步/柱 " + bestCost
+                        + "　显存 " + bestKb.ToString("F0") + " KB"
+                        + "　（只说明合格线能压到多低；出厂档见下一行）");
+
+            // ---- 出厂档：把默认值本身当被测对象 ----
+            //
+            // 判定挂在出厂档而不是挂在"扫描里有没有配置能过"上。理由：后者永远会过
+            // （总有一档够精细），于是这项自检就永远绿，改坏默认值也照样绿 ——
+            // 那是一条伪通过。真正需要回归保护的是"用户什么都不改时拿到的那一档"。
+            if (!shippedSeen)
+            {
+                sb.AppendLine("✘ 出厂档 d=" + shipped.depth + "/" + shipped.distribution
+                            + " 不在扫描网格里，本项无法判定。改了默认值就要同步 depths/modes。");
+                return false;
+            }
+
+            float shippedKb = shipped.width * shipped.height * shipped.depth * 8f * 2f / 1024f;
+            sb.AppendLine(Mark(shippedPass && shippedCand) + " 　出厂档 ★ d=" + shipped.depth
+                        + " " + shipped.distribution
+                        + (shipped.distribution == VistaAerialPerspectiveSettings.Distribution.Logarithmic
+                            ? " near " + (shipped.nearDistanceKm * 1000f).ToString("F0") + "m"
+                            : " k=" + shipped.powerExponent.ToString("F1"))
+                        + "　步/柱 " + shippedCost
+                        + "　显存 " + shippedKb.ToString("F0") + " KB"
+                        + "　合格 " + (shippedPass ? "✔" : "✘")
+                        + "　含余量 " + (shippedCand ? "✔" : "✘")
+                        + "　（余量档不过就说明默认值已经压到可见阈附近，要么升档要么改判据，"
+                        + "不能靠「两个视角都刚好没超」过关）");
+
+            // 出厂档在第二视角上的完整逐段数据。筛选阶段已经用过这个视角，
+            // 这里把它摊开印出来 —— 定档要能被人复核，不能只留一个"最差值"。
+            var cWin2 = MeasureApConfig(luts, view2, shipped, p);
+            bool okCenterW = cWin2.maxErrCenter < k_ApErrCenterMax;
+            string midW  = ApBandText(cWin2, false, k_ApErrMidMax,  out bool okMidW);
+            string midTW = ApBandText(cWin2, true,  k_ApErrMidTMax, out bool okMidTW);
+            bool pass2 = okCenterW && okMidW && okMidTW;
+
+            sb.AppendLine(Mark(pass2) + " 　复核 出厂档 @ 海拔 1 km／太阳 10°（落日）"
+                        + "　errC " + Pct(cWin2.maxErrCenter) + "@" + cWin2.atErrCenterKm.ToString("F4")
+                                  + (okCenterW ? "" : "✘门")
+                        + "　" + midW + "　Δ " + Pct(cWin2.maxMidStep) + "　T:" + midTW);
+
+            return pass2 && shippedPass && shippedCand;
+        }
+
+        /// <summary>烘一个配置并测一次。顺序是硬的：SliceError 要把散射表当 SRV 读回来对照，
+        /// 所以必须在正式核之后。</summary>
+        static ApCurve MeasureApConfig(VistaAtmosphereLuts luts, in VistaAtmosphereViewData view,
+                                       VistaAerialPerspectiveSettings s,
+                                       in VistaAtmosphereParameters p)
+        {
+            luts.PrepareAerialPerspective(s);
+
+            var cmd = new CommandBuffer();
+            luts.RenderAerialPerspectiveLut(cmd, view, s);
+            luts.RenderApSliceError(cmd, view, s);
+            Graphics.ExecuteCommandBuffer(cmd);
+            cmd.Release();
+
+            return ReduceApCurve(Readback3D(luts.apTransmittanceLut), s, p);
         }
 
         static bool Sane(Color c) =>

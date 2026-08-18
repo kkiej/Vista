@@ -232,6 +232,35 @@ VistaScatterSample VistaEvaluateScatterSample(
     return o;
 }
 
+// ----------------------------------------------------------------------------
+//  步段内的解析积分  ∫₀^dt S·exp(-σ·t) dt = S·(1 - exp(-σ·dt)) / σ
+//
+//  照着公式直写，在 σ·dt 很小时会**灾难性相消**：fp32 在 1.0 下方的间距是
+//  5.96e-8，σ·dt 掉到 1e-7 量级时，exp(-σ·dt) 与 1.0 之间只剩一两个可表示的
+//  台阶，相减出来的几乎全是舍入噪声（GPU 的 exp 本身还是近似实现，只会更糟）。
+//
+//  这不是边角情况。地表 σ ≈ 1e-2 /km，步长短于 ~1 cm 就会踩到，而"步长很短"
+//  恰恰是两个真实场景：AP 的首片天生只有几米长；Step 1 把 s.tMax 设成近处
+//  几何的深度，一面 1 m 外的墙就是这个量级。#7 的自检里 256 步参考解跑 1 m
+//  路径时 σ·dt ≈ 4e-8，实测把 errCenter 抬到 126% —— 当时差点被误判成
+//  "切片布得太近导致行进不准"，其实是**尺子自己坏了**。
+//
+//  σ·dt < 1e-4 时改用 (1 - e^{-x})/x = 1 - x/2 + x²/6 - … 的截断展开，
+//  截断误差 < x³/24 ≈ 4e-14，比相消误差小七个数量级；且展开式整个不做除法，
+//  σ 兜底到 1e-9 的大气顶附近也不再放大误差。
+//  逐通道选择：RGB 三个方向的 σ 差 6 倍，同一步长可能一个通道相消一个不相消。
+// ----------------------------------------------------------------------------
+float3 VistaSegmentIntegral(float3 source, float3 extinction, float dt)
+{
+    float3 x = extinction * dt;
+
+    float3 exact  = (source - source * exp(-x)) / extinction;
+    float3 series = source * dt * (1.0 - x * 0.5 + x * x * (1.0 / 6.0));
+
+    float3 useSeries = step(x, 1e-4);   // x <= 1e-4 时取 1
+    return lerp(exact, series, useSeries);
+}
+
 // posKm / sunDir 都在"星球中心为原点"的大气空间（km）。rayDir、sunDir 须归一化。
 VistaScatteringResult VistaIntegrateScatteredLuminance(
     float3 posKm, float3 rayDir, float3 sunDir, VistaRaymarchSettings s)
@@ -305,9 +334,13 @@ VistaScatteringResult VistaIntegrateScatteredLuminance(
         }
         else
         {
-            float tNew = tMax * (i + VISTA_SAMPLE_SEGMENT_T) / sampleCount;
-            dt = tNew - t;
-            t  = tNew;
+            // 段边界是 [i·dt, (i+1)·dt]，取样点在段内 30% 处 —— 和上面变步长分支
+            // 同一个语义。曾经写成"dt = 相邻取样点之差"，那样第一段只有 0.3·dt、
+            // 末段整个丢掉，总覆盖变成 tMax·(N−0.7)/N：N=256 时少积 0.27%，
+            // 正好是 #7 里 errCenter 在所有 20 组配置上都读到 0.25~0.29% 的原因
+            // （尺子本身有个恒定偏置，把切片布局的差别整个盖住了）。
+            dt = tMax / sampleCount;
+            t  = (i + VISTA_SAMPLE_SEGMENT_T) * dt;
         }
 
         float3 p = posKm + t * rayDir;
@@ -320,12 +353,11 @@ VistaScatteringResult VistaIntegrateScatteredLuminance(
 
         // 步段内的解析积分：∫ S·exp(-σt) dt = S·(1 - exp(-σ·dt)) / σ。
         // 直接用 S·dt（矩形法）在光学厚的步段会明显高估，是低步数下带状的主因。
-        result.luminance += throughput
-            * (smp.scattered - smp.scattered * sampleTransmittance) / smp.extinction;
+        // 短步段的相消问题在 VistaSegmentIntegral 里处理，别在这儿照公式直写。
+        result.luminance    += throughput * VistaSegmentIntegral(smp.scattered, smp.extinction, dt);
 
         // MS LUT 的输入项：入射亮度恒为 1、无相位、无遮挡时的散射传递量
-        result.multiScatAs1 += throughput
-            * (smp.msAs1 - smp.msAs1 * sampleTransmittance) / smp.extinction;
+        result.multiScatAs1 += throughput * VistaSegmentIntegral(smp.msAs1, smp.extinction, dt);
 
         throughput *= sampleTransmittance;
     }
