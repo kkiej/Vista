@@ -76,7 +76,21 @@ namespace Vista.Editor
     ///
     /// ── 不覆盖的判据 ──
     ///
-    /// 变体 A/B 逐像素一致：变体 B（#14）还没有，等它做完再补。
+    /// 变体 A/B 逐像素一致：已经做了，但在**另一条自检**里 ——
+    /// <c>VistaApVariantAgreementSelfTest</c>（菜单
+    /// 「Validate AP Variant A-B Agreement」）。为什么不并进这里：那条判据需要
+    /// 六次渲染（关 / B / A / A 的对照 / B 的距离出口 / A 的距离出口）与一套
+    /// Lit 布景，而这条自检的全部前提是「Unlit 的未合成基线是精确常数」——
+    /// 两者的布景要求互斥。
+    ///
+    /// 那条自检担保的是：不透明、无镜面高光、无环境反射、非透明材质的路径上，
+    /// A 与 B 逐像素相差不超过 2 个 fp16 ulp。它**不**担保开了镜面/反射之后
+    /// 仍然一致（材质上是关掉的），也**不**担保透明材质（两条路都故意不合成），
+    /// 更不覆盖延迟（变体 B 在延迟里概念上不存在）。
+    /// 另外它把「A 从深度反投影 positionWS」这一项的贡献报成
+    /// **低于读出地板的上界**，不是报成零 —— 32 位浮点深度的预测量级
+    /// （6.6e-4 m @ 34 km）本来就在那把尺子的分辨力以下。
+    ///
     /// 性能：要 Play 模式的 ProfilerRecorder 路径，见
     /// 「Cross-Check LUT Timing (Play Mode)」那条；不在这里混着做。
     /// </summary>
@@ -114,8 +128,12 @@ namespace Vista.Editor
         /// <summary>同通道绝对可见性豁免：小于参考白的 0.1% 就算看不见。</summary>
         const float k_AbsTol = 1e-3f;
 
-        /// <summary>fp16 相对精度 2^-11。两个 fp16 量相减要算两次。</summary>
-        const float k_Fp16Rel = 4.88e-4f;
+        /// <summary>
+        /// fp16 相对精度 2^-11。两个 fp16 量相减要算两次。
+        /// 值本身放在 <see cref="VistaSelfTestNumerics"/> 里：它是一条跨自检共享的
+        /// 数值事实，各写一份的症状是「某条判据的门限比另一条松」，最难发现。
+        /// </summary>
+        const float k_Fp16Rel = VistaSelfTestNumerics.k_Fp16Rel;
 
         /// <summary>一次渲染读出的四列 RGB。</summary>
         struct Row

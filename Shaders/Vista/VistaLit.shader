@@ -153,6 +153,21 @@ Shader "Vista/Lit"
             // 于是四项能分别探测而不多编变体（理由见 VistaLitForwardPass.hlsl）。
             #pragma shader_feature_local_fragment _ VISTA_LIT_DIFF_DEBUG
 
+            // #15 判据②a 用：让 VistaApplyApTail 输出「插值出来的 positionWS 折出的
+            // 距离 (km)」而不是合成结果，理由见 VistaLighting.hlsl 里那一档的注释。
+            //
+            // 为什么是关键字而不是像 VistaApInShaderEnabled() 那样的 uniform 分支：
+            // 那个 uniform 存在的理由是**合成方式要能运行时切**（Off/全屏/着色内
+            // 是一个产品级选项）。而这一档是一次性的测量出口，
+            // 用 uniform 就要让每一个出货片元永久多付一次读 + 一次分支。
+            // 两者的取舍方向不同，所以不该套用同一种写法。
+            //
+            // 与 VISTA_LIT_DIFF_DEBUG 声明成**两个独立**的 feature 而不是一个互斥集：
+            // 互斥集里「两个都开」那个组合不会被编译，真开了会落到未定义行为上。
+            // 拆开之后四种组合都有确定含义（都开时 DIFF_DEBUG 在 ApTail 之前
+            // 就短路了，胜出方是确定的），代价只是 Editor 下按需多编一个变体。
+            #pragma shader_feature_local_fragment _ VISTA_AP_DEBUG_DISTANCE
+
             // -------------------------------------
             // Material Keywords
             #pragma shader_feature_local _NORMALMAP

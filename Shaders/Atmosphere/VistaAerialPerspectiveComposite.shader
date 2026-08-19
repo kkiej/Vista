@@ -79,18 +79,29 @@ Shader "Hidden/Vista/AerialPerspectiveComposite"
                 return o;
             }
 
-            // 两趟共用的取值：clip 掉天空，反投影出世界坐标，取回两个乘子。
-            // 写成一个函数是为了让两趟看到**完全相同**的中间量 ——
-            // 若各自重算一遍反投影，浮点差异会让 T 与 S 落在相邻切片上，
-            // 交界处出现 1 个纹素宽的暗边，而那种缝极难反查。
-            void SampleTerms(float2 uv, out float3 addTerm, out float3 mulTerm)
+            // 反投影出世界坐标，并 clip 掉天空。
+            //
+            // 抽成一个函数而不是让每个 pass 各写一遍，有两个不同的理由：
+            //   · 两趟混合必须看到**完全相同**的中间量。若各自重算一遍反投影，
+            //     浮点差异会让 T 与 S 落在相邻切片上，交界处出现 1 个纹素宽的暗边，
+            //     而那种缝极难反查。
+            //   · 下面那个调试档（Pass 2）要量的正是**这个操作数本身**。
+            //     若调试档自己再写一遍反投影，它量到的就不是真实路径用的
+            //     那个 positionWS —— 那样「A 与 B 的距离一致」这条判据
+            //     担保的是一份只在调试档里存在的代码。
+            float3 SampleWorldPos(float2 uv)
             {
                 float rawDepth = SampleSceneDepth(uv);
                 if (VISTA_AP_IS_SKY_DEPTH(rawDepth))
                     clip(-1.0);
 
-                float3 positionWS = ComputeWorldSpacePosition(uv, rawDepth, UNITY_MATRIX_I_VP);
-                VistaGetAerialPerspectiveTerms(uv, positionWS, addTerm, mulTerm);
+                return ComputeWorldSpacePosition(uv, rawDepth, UNITY_MATRIX_I_VP);
+            }
+
+            // 两趟共用的取值。
+            void SampleTerms(float2 uv, out float3 addTerm, out float3 mulTerm)
+            {
+                VistaGetAerialPerspectiveTerms(uv, SampleWorldPos(uv), addTerm, mulTerm);
             }
         ENDHLSL
 
@@ -130,6 +141,39 @@ Shader "Hidden/Vista/AerialPerspectiveComposite"
                 float3 addTerm, mulTerm;
                 SampleTerms(input.uv, addTerm, mulTerm);
                 return float4(addTerm, 0.0);
+            }
+            ENDHLSL
+        }
+
+        // -------------------------------------------------------------- Pass 2
+        //  自检专用（#15 判据②a）：输出**变体 A 折出来的距离 (km)**，不做合成。
+        //
+        //  为什么把它做成本 shader 的一个 pass，而不是自检里另写一个全屏 shader：
+        //  ②a 要判的是「A 与 B 折出来的距离是否一致」，而 A 的那个距离取决于
+        //  深度图在**哪一个时刻**被拷贝、UNITY_MATRIX_I_VP 在**哪一个 pass** 里是什么、
+        //  以及反投影用的是哪一份代码。另写一个 shader 就得把这三件事重新对齐一遍，
+        //  而"对齐了"只能靠假设。做成 Pass 2 之后它由同一个 pass 实例、
+        //  在同一个 RenderPassEvent、用同一份 SampleWorldPos 画出来 ——
+        //  判据担保的就是真实路径。
+        //
+        //  运行时代价为零：一个从不被 Draw 的 pass 不产生任何 GPU 工作，
+        //  它唯一的成本是一份编译产物（自检开关见 VistaAerialPerspectiveCompositePass）。
+        //
+        //  Blend Off + 写 alpha=1：它是一次纯覆盖写，不参与任何混合方程。
+        Pass
+        {
+            Name "Vista AP Composite (Debug Distance)"
+            Blend Off
+
+            HLSLPROGRAM
+            #pragma vertex Vert
+            #pragma fragment FragDebugDistance
+
+            float4 FragDebugDistance(Varyings input) : SV_Target
+            {
+                // 与 SampleTerms 调的是同一个 SampleWorldPos、同一个 VistaApDistanceKm，
+                // 所以这一档与 Pass 0/1 实际用的距离**是同一个数**，不是它的等价复现。
+                return float4(VistaApDistanceKm(SampleWorldPos(input.uv)).xxx, 1.0);
             }
             ENDHLSL
         }

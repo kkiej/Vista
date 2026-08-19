@@ -30,7 +30,7 @@ namespace Vista.Editor
     ///   c) **根本没渲到被测像素** —— 假通过。
     ///
     /// c) 用两道措施排除：
-    ///   · 清屏色设成 shader 里那个哨兵值（100）。没被 Vista/Lit 画到的像素
+    ///   · 清屏色设成 shader 里那个哨兵值（30000）。没被 Vista/Lit 画到的像素
     ///     不是 0 而是一个巨大值，绝不可能被读成「一致」。
     ///   · 逐项故障注入 <c>_VistaDiffInject</c>：分四次给
     ///     mainLight / additionalLights / gi / vertexLighting 各注入 2% 偏差，
@@ -60,8 +60,8 @@ namespace Vista.Editor
         /// <summary>Weber 1%：全项目通用的可见性门槛。</summary>
         const float k_RelTol = 0.01f;
 
-        /// <summary>fp16 相对精度 2^-11。</summary>
-        const float k_Fp16Rel = 4.88e-4f;
+        /// <summary>fp16 相对精度 2^-11。共享量，见 <see cref="VistaSelfTestNumerics"/>。</summary>
+        const float k_Fp16Rel = VistaSelfTestNumerics.k_Fp16Rel;
 
         /// <summary>
         /// 与 shader 里 VISTA_DIFF_NOT_COMPARED 对应的判定门。
@@ -141,19 +141,13 @@ namespace Vista.Editor
         /// <summary>
         /// 渲染→读回路径的加性扰动幅度，实测值 = 1/1024。
         ///
-        /// 怎么量到的：5 档写死 (0.25, 0.5, 0.75) 这三个 half 精确值，读回来逐像素
-        /// 低 1~2 个 half ulp，且随像素位置变化，全图最大偏离恰好是 9.766e-4。
-        /// 也就是说着色器写出的值与 CPU 读到的值之间存在一个**加性**扰动场。
-        ///
-        /// 为什么这条常量值得单独存在：期望值为 0 的量（relError、3 档的分子）
-        /// 读回来永远被这条地板顶起来，而它的量级又与 fp16 相对精度
-        /// （<see cref="k_Fp16Rel"/> = 4.88e-4）几乎相同 —— 判据 1 因此连续多次
-        /// 报出 6.595E-004，我却把尺子的地板当成了被测对象的精度极限。
-        /// 教训：**尺子的地板与被测量的期望值同量级时，尺子会自己伪造一个结论。**
-        /// 修法不是放宽容差（那会把 1e-3 量级的真实偏差一起放过），
-        /// 而是在写出之前把被测量抬到地板之上（见 <see cref="k_RelScale"/>）。
+        /// **这条常量与它的完整来龙去脉搬到了 <see cref="VistaSelfTestNumerics"/>** ——
+        /// #15 判据②也要用它，而「同一个量两份实现」在本项目里是禁止的：
+        /// 两份之中只更新了一份的症状是「某一条判据的门限比另一条松」，
+        /// 那是最难被发现的一类偏差。这里只留一个别名，
+        /// 下面所有引用（包括那条「地板变大就失败」的交叉校验）都不用改。
         /// </summary>
-        const float k_ReadbackFloor = 9.766e-4f;
+        const float k_ReadbackFloor = VistaSelfTestNumerics.k_ReadbackFloor;
 
         /// <summary>
         /// 与 shader 里 5 档写出的常量对应。三个通道取三个**互不相同**的值：
@@ -1130,15 +1124,8 @@ namespace Vista.Editor
 
         /// <summary>
         /// half 在 v 附近的一个 ulp。用来回答「差了几个最小可表示单位」。
+        /// 实现在 <see cref="VistaSelfTestNumerics"/>（#15 判据②也用它）。
         /// </summary>
-        static float HalfUlp(float v)
-        {
-            v = Mathf.Abs(v);
-            const float minNormal = 6.1035156e-5f;    // 2^-14
-            const float denormStep = 5.9604645e-8f;   // 2^-24
-            if (v < minNormal) return denormStep;
-            int e = Mathf.FloorToInt(Mathf.Log(v, 2f));
-            return Mathf.Pow(2f, e - 10);             // half 有 10 位尾数
-        }
+        static float HalfUlp(float v) => VistaSelfTestNumerics.HalfUlp(v);
     }
 }

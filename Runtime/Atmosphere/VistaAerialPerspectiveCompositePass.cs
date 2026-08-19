@@ -48,16 +48,40 @@ namespace Vista
         public const int k_PassMultiply = 0;
         public const int k_PassAdd      = 1;
 
-        /// <summary>自检用：上面两个序号对应的 pass 名，与 shader 里的 Name 必须逐字相同。</summary>
+        /// <summary>
+        /// 自检用（#15 判据②a）：输出变体 A 折出来的距离 (km) 而不是合成结果。
+        /// 为什么它必须是本 shader 的一个 pass，见 .shader 里 Pass 2 的注释。
+        /// </summary>
+        public const int k_PassDebugDistance = 2;
+
+        /// <summary>自检用：上面几个序号对应的 pass 名，与 shader 里的 Name 必须逐字相同。</summary>
         public static readonly string[] k_PassNames =
         {
             "Vista AP Composite (Multiply Transmittance)",
             "Vista AP Composite (Add In-Scattering)",
+            "Vista AP Composite (Debug Distance)",
         };
+
+        /// <summary>
+        /// 自检用（#15 判据②a）：置 true 时本 pass 只画 <see cref="k_PassDebugDistance"/>，
+        /// 不做合成。
+        /// </summary>
+        /// <remarks>
+        /// 为什么是 static：本 pass 实例由 <c>VistaAtmosphereFeature</c> 创建并持有，
+        /// 而且刻意没有 Setup（逐帧无可配项）。给它加一条实例级的调试开关，
+        /// 就要为一个只在 Editor 自检里活一瞬间的东西，在 feature 上开一条
+        /// 逐帧都要走的传参路径 —— 那条路径会永久留在出货代码里。
+        /// 静态开关的代价只是「同一进程内所有相机共享它」，
+        /// 而自检本来就是把一台相机单独渲一次、渲完立刻在 finally 里复位。
+        ///
+        /// 它不影响出货：默认 false，且没有任何运行时代码写它。
+        /// </remarks>
+        public static bool s_DebugDistanceOutput;
 
         class PassData
         {
             public Material material;
+            public bool debugDistance;
         }
 
         readonly Material m_Material;
@@ -96,6 +120,11 @@ namespace Vista
 
             data.material   = m_Material;
 
+            // 在录制期读一次静态开关、存进 PassData，而不是在执行期直接读它：
+            // 执行期读的话，图录制与图执行之间的任何一次赋值都会让
+            // 「这一帧画的是哪个 pass」与「录制时声明的依赖」对不上。
+            data.debugDistance = s_DebugDistanceOutput;
+
             // AccessFlags.Write 而不是 ReadWrite：RenderGraph 把「Write 且未附加 Discard」
             // 当作 partial write，load action 仍然是 Load（见 core 包
             // NativePassCompiler.cs 里 partialWrite 那一段）。混合需要的正是这个。
@@ -116,6 +145,16 @@ namespace Vista
             // _VistaSkyViewLut 靠的也是同一条机制。
             builder.SetRenderFunc((PassData d, RasterGraphContext ctx) =>
             {
+                if (d.debugDistance)
+                {
+                    // 自检档：只画距离，且**替换**掉两趟合成。
+                    // 不能在合成之后再画：那样距离会覆盖颜色，颜色档与距离档
+                    // 就得靠两次渲染分别取，反而多一次渲染。
+                    ctx.cmd.DrawProcedural(Matrix4x4.identity, d.material,
+                        k_PassDebugDistance, MeshTopology.Triangles, 3);
+                    return;
+                }
+
                 // 两趟的顺序是公式的一部分，不能交换：
                 // 先乘得到 dst·T，再加得到 dst·T + S。
                 // 反过来先加后乘是 (dst + S)·T —— 散射项被多衰减了一次，

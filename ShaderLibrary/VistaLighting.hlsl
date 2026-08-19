@@ -186,12 +186,35 @@ half4 VistaResolveLighting(LightingData lightingData, half alpha)
 // 透明物的雾归 Step 3 的体积雾统一处理（那时两条路会一起改）。
 half4 VistaApplyApTail(half4 color, InputData inputData)
 {
+#if defined(VISTA_AP_DEBUG_DISTANCE)
+    // 自检档（#15 判据②a）：输出合成的**操作数** —— 插值出来的 positionWS
+    // 折出的径向距离 (km) —— 而不是合成结果。
+    //
+    // 为什么要分解成操作数：A 与 B 的差异有两个来源，
+    //   ① A 从深度图反投影出 positionWS，B 直接插值；
+    //   ② 给定同一个距离，两者调的是同一个 VistaApplyAerialPerspective，
+    //      但 A 是往一张已经量化成 fp16 的颜色上混合、B 是在寄存器里算完只量化一次。
+    // 只比最终颜色，这两项混成一个数，出问题定不了位。这一档只暴露 ①。
+    //
+    // 与变体 A 的 Pass 2 调的是**同一个** VistaApDistanceKm（都在
+    // AerialPerspectiveComposite.hlsl 里，全项目唯一一份），
+    // 所以两边量到的差异只可能来自 positionWS 本身。
+    //
+    // 不受 VistaApInShaderEnabled() 与透明分支影响：这一档要的是这个操作数
+    // 在任何配置下都能被读出来，而不是「B 这一帧会不会合成」。
+    //
+    // 返回类型是 half4（签名与非调试路径共用），但 D3D11 的 DXBC 里 half 就是 float，
+    // 所以 km 量级的距离不在这里丢精度 —— 丢不丢取决于目标 RT 的格式，
+    // 自检端拿一组**已知距离**去量它的分辨力，不假设。
+    return half4(VistaApDistanceKm(inputData.positionWS).xxx, 1.0);
+#else
 #if !defined(_SURFACE_TYPE_TRANSPARENT)
     // uniform 分支而不是 shader keyword：合成方式要能运行时切，切换不产生变体。
     if (VistaApInShaderEnabled())
         VistaApplyAerialPerspective(color.rgb, inputData.normalizedScreenSpaceUV, inputData.positionWS);
 #endif
     return color;
+#endif
 }
 
 #endif // VISTA_LIGHTING_INCLUDED
