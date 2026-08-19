@@ -2,8 +2,10 @@ using System.Text;
 using UnityEditor;
 using UnityEngine;
 using UnityEngine.Rendering;
-// System.Diagnostics 里也有一个 Debug，直接 using 会与 UnityEngine.Debug 撞成 CS0104。
-using Stopwatch = System.Diagnostics.Stopwatch;
+// 计时核（fence 探测 / 多轮取最小 / 背靠背摊销）住在 VistaGpuTimer 里，AP 合成的
+// 性能项也用它 —— 别名只是让下面几十处 Sample/SyncMode 不必写全名。
+using SyncMode = Vista.Editor.VistaGpuTimer.SyncMode;
+using Sample = Vista.Editor.VistaGpuTimer.Sample;
 
 namespace Vista.Editor
 {
@@ -51,31 +53,8 @@ namespace Vista.Editor
         //  参数
         // ==================================================================
 
-        /// <summary>
-        /// 摊销次数。选 200 的依据：稳态五 pass 单次亚毫秒，200 次几十到几百毫秒 GPU ——
-        /// 足以把提交+同步的固定开销（实测亚毫秒）摊到小数点后三位以下，
-        /// 又短得可以在一个菜单项里跑几十次测量而不让 Editor 卡住。
-        /// </summary>
-        const int k_Iterations = 200;
-
-        /// <summary>
-        /// 预热次数。首次 dispatch 要付 shader 变体的实际上载、描述符堆分配、
-        /// 以及 GPU 时钟从低功耗档爬升 —— 不预热的话第一项测量会明显偏高，
-        /// 而"偏高的那一项"取决于菜单项里的调用顺序，是最容易被误读成真实开销的假象。
-        /// </summary>
-        const int k_WarmupIterations = 20;
-
-        /// <summary>
-        /// 每项测量重复的轮数，取**最小值**上报。
-        ///
-        /// 取最小而不是平均：这类测量的噪声是**单向**的 —— Editor 自己的重绘、驱动的
-        /// 命令批处理、其它进程抢 GPU，全都只会让某一轮变慢，没有任何机制能让一轮
-        /// 比真实开销更快。所以最小值是对"无争用下的真实开销"的最好估计，
-        /// 而平均值会把一次偶发的 Editor 重绘平摊进最终数字里。
-        /// 第一版只取一轮，六次重跑给出 0.647~1.138 ms（±40%）—— 那个离散度本身
-        /// 就是"必须取最小值"的实测理由。同时上报 min/max，离散度太大时数字不该引用。
-        /// </summary>
-        const int k_Trials = 5;
+        // 摊销次数 / 预热次数 / 取最小的轮数，以及"为什么取最小而不是平均"那条
+        // 实测理由，都在 VistaGpuTimer 里 —— 它们现在被 AP 合成的性能项共用。
 
         /// <summary>
         /// 稳态五 pass 的预算。0.3 ms 不是拍的：目标是 60 fps（16.67 ms）下
@@ -83,12 +62,6 @@ namespace Vista.Editor
         /// 静态两表只在参数变化帧出现，不计入。
         /// </summary>
         const float k_SteadyBudgetMs = 0.300f;
-
-        /// <summary>
-        /// fence 探测预算。见 <see cref="ProbeFence"/> —— 这个常量存在的理由是
-        /// 一次实测事故，不是防御性编程。
-        /// </summary>
-        const double k_FenceProbeSec = 0.25;
 
         /// <summary>太阳仰角。与另外三份自检的"正午档"一致，三份报告的数字才能横向对照。</summary>
         const float k_SunElevationDeg = 60f;
@@ -99,26 +72,6 @@ namespace Vista.Editor
         /// </summary>
         const float k_HarnessTolerance = 0.15f;
 
-        // ==================================================================
-        //  同步原语
-        // ==================================================================
-
-        enum SyncMode
-        {
-            /// <summary>CommandBuffer 末尾插 fence，CPU 自旋等 passed。测量窗口里不含回读传输。</summary>
-            Fence,
-            /// <summary>拿一个一元素 buffer 做 GetData —— 它会 flush 整条命令流并等 GPU 跑完。</summary>
-            Readback,
-        }
-
-        /// <summary>
-        /// 硬同步用的哑元 buffer。<c>GetData</c> 会阻塞到**先前排入的全部**GPU 工作完成
-        /// （这正是另外三份自检能在 <c>ExecuteCommandBuffer</c> 之后直接读到正确数据的原因），
-        /// 所以它不需要与被测工作有任何数据关系。
-        /// </summary>
-        static GraphicsBuffer s_Sync;
-        static readonly float[] s_SyncData = new float[1];
-
         [MenuItem("Window/Vista/Profile Atmosphere LUTs", priority = 125)]
         public static void Run()
         {
@@ -127,43 +80,6 @@ namespace Vista.Editor
 
             Debug.Log(("[Vista] LUT 耗时" + (ok ? "达标" : "**未达标/不可判定**") + "\n" + sb)
                       .Replace("\r", "").Replace("\n", "  |  "));
-        }
-
-        /// <summary>
-        /// 试一下 fence 到底能不能用，**不信 <c>SystemInfo.supportsGraphicsFence</c>**。
-        ///
-        /// 这个函数是一次实测事故换来的。第一版直接按那个能力位选 fence 路径，结果：
-        /// 后端是 D3D11，<c>supportsGraphicsFence</c> 返回 **true**，而 CPU 轮询
-        /// <c>fence.passed</c> 永远等不到 —— 因为提交要靠 Editor 推动渲染线程，
-        /// 而我的自旋把主线程占满了，于是"等提交"和"推动提交"互相锁死。
-        /// 二十次测量各自撞满 5 s 超时，Editor 卡了四分多钟，所有数字变成 0 或负数。
-        ///
-        /// 结论不是"fence 不能用"，而是**能力查询 ≠ 该原语在当前线程模型下可用**。
-        /// 所以这里先用一条空 buffer 花 250 ms 探一次：过了就用 fence，
-        /// 没过就整场退到 readback 并在报告里说明。代价是最坏 250 ms，
-        /// 而不是二十次 5 s。
-        /// </summary>
-        static bool ProbeFence()
-        {
-            if (!SystemInfo.supportsGraphicsFence)
-                return false;
-
-            var cmd = new CommandBuffer { name = "Vista Fence Probe" };
-            var fence = cmd.CreateGraphicsFence(GraphicsFenceType.CPUSynchronisation,
-                                                SynchronisationStageFlags.ComputeProcessing);
-            var sw = Stopwatch.StartNew();
-            Graphics.ExecuteCommandBuffer(cmd);
-            GL.Flush();
-
-            bool passed = false;
-            while (sw.Elapsed.TotalSeconds < k_FenceProbeSec)
-            {
-                if (fence.passed) { passed = true; break; }
-            }
-            cmd.Release();
-            // 无论探测结果如何都硬同步一次，别把探测的残留留给第一项正式测量。
-            s_Sync.GetData(s_SyncData);
-            return passed;
         }
 
         static bool Profile(StringBuilder sb)
@@ -183,10 +99,7 @@ namespace Vista.Editor
             var p = VistaAtmosphereParameters.CreateEarth();
             var apSettings = new VistaAerialPerspectiveSettings();
             var luts = new VistaAtmosphereLuts(res.atmosphereLutCS, res.skyReflectionCS);
-            s_Sync = new GraphicsBuffer(GraphicsBuffer.Target.Structured, 1, sizeof(float))
-            {
-                name = "VistaProfilerSync",
-            };
+            VistaGpuTimer.Begin();
 
             try
             {
@@ -225,11 +138,12 @@ namespace Vista.Editor
                 // 所以兜底值对耗时没有影响。
                 var ap = apSettings;
 
-                bool fenceUsable = ProbeFence();
+                bool fenceUsable = VistaGpuTimer.ProbeFence();
                 var syncMode = fenceUsable ? SyncMode.Fence : SyncMode.Readback;
 
                 sb.Append("── LUT 链路耗时（模型 B：Edit 模式立即提交，N=")
-                  .Append(k_Iterations).Append(" 摊销 × ").Append(k_Trials).Append(" 轮取最小）")
+                  .Append(VistaGpuTimer.k_DefaultIterations).Append(" 摊销 × ")
+                  .Append(VistaGpuTimer.k_DefaultTrials).Append(" 轮取最小）")
                   .AppendLine();
                 sb.Append("　 GPU ").Append(SystemInfo.graphicsDeviceName)
                   .Append("　后端 ").Append(SystemInfo.graphicsDeviceType).AppendLine();
@@ -425,8 +339,7 @@ namespace Vista.Editor
             }
             finally
             {
-                s_Sync?.Dispose();
-                s_Sync = null;
+                VistaGpuTimer.End();
                 luts.Dispose();
             }
         }
@@ -435,54 +348,8 @@ namespace Vista.Editor
         //  测量
         // ==================================================================
 
-        /// <summary>
-        /// 一项测量的 M 轮结果。上报 min（见 <see cref="k_Trials"/> 的理由）与 max，
-        /// 后者只用来判"这个数字值不值得引用"。
-        /// </summary>
-        readonly struct Sample
-        {
-            public readonly double min, max;
-            Sample(double min, double max) { this.min = min; this.max = max; }
-
-            public static Sample Invalid => new Sample(double.NaN, double.NaN);
-            public bool valid => !double.IsNaN(min);
-            /// <summary>相对离散度。min 落到噪声以下时给 1（视为完全不可信），不给 0。</summary>
-            public double spread => min > 1e-3 ? (max - min) / min : 1.0;
-            public double Or0() => valid ? min : 0.0;
-
-            public string Fmt() => valid
-                ? min.ToString("F3") + " ms（max " + max.ToString("F3") + "，±"
-                  + spread.ToString("P0") + "）"
-                : "  ——  ";
-
-            /// <summary>裸测量：不扣基线，用于测基线本身。</summary>
-            public static Sample Of(SyncMode mode, System.Action<CommandBuffer> record)
-                => Collect(mode, record, 0.0);
-
-            /// <summary>扣掉基线并除以 N 的每次开销。</summary>
-            public static Sample Amortized(SyncMode mode, System.Action<CommandBuffer> record,
-                                           double baselineMs)
-                => Collect(mode, record, baselineMs);
-
-            static Sample Collect(SyncMode mode, System.Action<CommandBuffer> record,
-                                  double baselineMs)
-            {
-                bool amortize = baselineMs > 0.0;
-                RawMs(record, k_WarmupIterations, mode);   // 预热一次就够，M 轮之间不必重复
-                double lo = double.MaxValue, hi = double.MinValue;
-                for (int t = 0; t < k_Trials; ++t)
-                {
-                    double raw = RawMs(record, k_Iterations, mode);
-                    // 可能为负（固定开销本身有抖动，而最便宜的 pass 比抖动还小）。
-                    // 不 clamp 到 0：负值是"这一项已经落在测量噪声以下"的信号，
-                    // 抹平成 0 反而看不出来。
-                    double v = amortize ? (raw - baselineMs) / k_Iterations : raw;
-                    if (v < lo) lo = v;
-                    if (v > hi) hi = v;
-                }
-                return new Sample(lo, hi);
-            }
-        }
+        // Sample / RawMs / SyncMode 都在 VistaGpuTimer 里（文件头有 using 别名）。
+        // 只留这一个本地便利包装：它把"扣基线"这件事的调用点收成一处。
 
         static Sample Per(SyncMode mode, Sample baseline, System.Action<CommandBuffer> record)
             => Sample.Amortized(mode, record, baseline.min);
@@ -803,53 +670,6 @@ namespace Vista.Editor
             if (mip == 0) return 1;
             if (mode == VistaSkyReflectionMode.AmbientSh) return 16;
             return Mathf.Min(256, 16 << mip);
-        }
-
-        ///
-        /// 一条 buffer 录 N 遍而不是 N 次提交+同步：后者量到的几乎全是提交与同步的
-        /// 往返延迟（每次百微秒到毫秒量级），被测的 dispatch 反而淹没在里面。
-        ///
-        /// buffer 的**录制**在计时窗口之外 —— 那是 CPU 成本，与被测的 GPU 工作无关。
-        /// </summary>
-        static double RawMs(System.Action<CommandBuffer> record, int reps, SyncMode mode)
-        {
-            var cmd = new CommandBuffer { name = "Vista LUT Profile" };
-            for (int i = 0; i < reps; ++i)
-                record(cmd);
-
-            GraphicsFence fence = default;
-            if (mode == SyncMode.Fence)
-            {
-                // CPUSynchronisation 而不是 AsyncQueueSynchronisation：只有前者能用
-                // fence.passed 在 CPU 上轮询。ComputeProcessing 是这条链路唯一用到的阶段。
-                fence = cmd.CreateGraphicsFence(GraphicsFenceType.CPUSynchronisation,
-                                                SynchronisationStageFlags.ComputeProcessing);
-            }
-
-            var sw = Stopwatch.StartNew();
-            Graphics.ExecuteCommandBuffer(cmd);
-            // ExecuteCommandBuffer 只是排进渲染线程的队列；GL.Flush 把它推下去。
-            GL.Flush();
-
-            // 这里**没有超时**，因为能不能用已经由 ProbeFence 在 250 ms 内定过了 ——
-            // 走到这条路径就说明 fence 在这台机器上确实会 passed。
-            // 第一版把"能不能用"和"每次等多久"混成同一个 5 s 超时，代价是
-            // 二十次各撞满超时、Editor 卡四分钟、全部数字失效。探测与等待要分开。
-            if (mode == SyncMode.Fence)
-                while (!fence.passed) { }
-            else
-                s_Sync.GetData(s_SyncData);
-
-            sw.Stop();
-            double ms = sw.Elapsed.TotalMilliseconds;
-            cmd.Release();
-
-            // fence 路径补一次硬同步，在计时窗口之外：finally 里要 Dispose 这些
-            // RTHandle 与 buffer，而释放正在被 GPU 读的资源在 D3D12/Vulkan 上是未定义行为。
-            if (mode == SyncMode.Fence)
-                s_Sync.GetData(s_SyncData);
-
-            return ms;
         }
     }
 }
