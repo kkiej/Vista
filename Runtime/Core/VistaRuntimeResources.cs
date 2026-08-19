@@ -56,6 +56,15 @@ namespace Vista
         /// <summary>物理天空盒 shader。用于生成挂到 RenderSettings.skybox 的材质。</summary>
         public Shader skyShader => m_SkyShader;
 
+        [SerializeField, ResourcePath("Shaders/Atmosphere/VistaAerialPerspectiveComposite.shader")]
+        private Shader m_AerialPerspectiveCompositeShader;
+
+        /// <summary>
+        /// Aerial Perspective 的全屏合成（变体 A）。为 null 时 AP 只能走 InShader 模式，
+        /// 大气模块的其余部分照常工作。
+        /// </summary>
+        public Shader aerialPerspectiveCompositeShader => m_AerialPerspectiveCompositeShader;
+
         /// <summary>取当前管线下的 Vista 资源容器，不在 URP 下时返回 null。</summary>
         public static VistaRuntimeResources Get()
             => GraphicsSettings.GetRenderPipelineSettings<VistaRuntimeResources>();

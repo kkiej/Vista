@@ -410,6 +410,29 @@
 - **`Window/Vista/Validate TimeOfDay Diagnostics`**：面板那几条报警的可达性验收。
   报警是保护性代码，而它最常见的失效方式不是"报错"而是"**永远不报**" ——
   一条永不触发的 HelpBox 与一行注释等价。四组的详情见「坑」里"每条报警都要双向验"。
+- **AP 合成：共享合成层 + 全屏合成 pass（变体 A）**。AP LUT 在此之前没有消费者，
+  Step 1 的验收标准③（远山洗白）一直悬着。
+  - `ShaderLibrary/AerialPerspectiveComposite.hlsl` 是**全项目唯一**一份合成实现：
+    距离 `VistaApDistanceKm`、两个乘子 `VistaGetAerialPerspectiveTerms`、
+    应用 `VistaApplyAerialPerspective`（= `color·T + S·exposure`）各只有一份。
+    变体 A 与变体 B 调用的是同一个函数 —— 这样"A 与 B 必须逐像素一致"才是个有意义的判据，
+    而不是两份实现互相担保。
+  - `VistaAerialPerspectiveCompositePass` 排在 `AfterRenderingSkybox`：
+    天空盒之后（它在不透明之后画且**不写深度**，更早合成既白做一遍、又没法用深度剔天空）、
+    半透明之前（AP 用的是不透明深度）。这两个约束之间只剩这一个位置。
+  - 深度**一定拿得到，没有兜底分支**：`ConfigureInput(Depth)` 把
+    `earliestDepthReadEvent` 拉到 AfterRenderingSkybox，
+    `CalculateDepthCopySchedule` 于是选 `DepthCopySchedule.AfterSkybox`，
+    `CalculateSplitEventRange` 把"事件 ≥ earliestDepthReadEvent"的自定义 pass 排到拷贝之后。
+    这条链与用户在 renderer 上选的 `CopyDepthMode` 无关，所以不写"深度无效就跳过"——
+    那种分支只会把真正的失效藏起来。
+  - `Window/Vista/Validate AP Composite Wiring`：**接线**自检，刻意不验任何数值
+    （在 C# 里重算合成式就是造第二份真相，反射自检那里已经付过这个学费）。
+    三条判据全绿：shader 无编译错误、Pass 序号 ↔ Pass 名逐字相符（乘/加互换不报任何错，
+    只让远景雾偏暗）、`_VistaApSize = (32,32,32,0)` 且 `_VistaApConsumer.x = 0.0`（预期 0.0）。
+  - 已知不覆盖：XR 单趟立体（`UNITY_MATRIX_I_VP` 不逐眼索引，全屏三角形也没 instancing）；
+    `#pragma only_renderers` 不含 GLES，所以变体 A 的移动端目前只覆盖 Vulkan/Metal。
+    两条都是明确记为**不支持**，不是假装支持。
 
 ### 取舍
 
@@ -789,7 +812,55 @@
   这个洞是我重读自己刚写的面板代码时发现的，不是测出来的：第一版只判了缺 feature 与
   关驱动两支。
 
+- **全屏合成不采样颜色目标，把两个乘子交给混合器，代价是两趟。**
+  直觉写法是"采 cameraColor → 算 → 写回"，但同一张 RT 不能同时采样和写入：
+  要么申请临时 RT 再拷回（双倍带宽），要么把 `cameraColor` 换成新贴图
+  （那会强制 `requiresIntermediateTexture = true`，多一次最终 blit）。
+  两条都不走，因为 `dst·T + S` 的两个乘子混合器都能做：
+  `Blend Zero SrcColor` 得 `dst·T`，再 `Blend One One` 得 `dst·T + S`。
+  换来的不只是省一次拷贝：不读颜色目标意味着**直接渲后台缓冲也能用**、
+  **MSAA 下逐样本混合天然正确**、移动端两趟画在同一个 RenderPass 里不打断 tile。
+  两趟的**顺序是公式的一部分**：反过来先加后乘是 `(dst + S)·T`，散射项被多衰减一次，
+  症状是远景雾偏暗且越远越暗（T 越小错得越多）。
+- **`AccessFlags.Write` 而不是 `ReadWrite`，尽管这个 pass 在做混合。**
+  RenderGraph 把"Write 且未附加 Discard"当作 partial write，load action 仍然是
+  `Load`（core 包 `NativePassCompiler.cs` 的 `partialWrite` 那一段），
+  混合要的正是这个。URP 自己的 `DrawSkyboxPass` / `DrawObjectsPass` 也是这么声明的
+  （全仓只有 `StopNanPostProcessPass` 用 `ReadWrite`）。
+  改成 `ReadWrite` 不会让画面变对，只会多一条读依赖 —— 所以代码里写了注释挡住这个"修复"。
+- **`_VistaApConsumer` 由 Sky-View pass 下发，不跟着 AP pass 走。**
+  变体 B 的开关必须**每帧无条件写**，包括 AP 整个关掉的那一帧 —— 那时它得是 0。
+  跟着 AP pass 走的话，AP 关掉的帧里那个 pass 根本不排入（记录期就 return），
+  uniform 留着上一帧的 1，材质就会去采一张已经释放的 3D 表。
+  「关掉某功能后画面才坏」是最难反查的一类失效，所以它挂在唯一一个"一定存在"的
+  逐帧 pass 上。同理它不塞进 `_VistaApFlags` 的空位：那一组只在 AP 启用时才被写。
+  也没有给 `VistaAtmosphereViewData.Bind` 加参数 —— 那会波及约十个不关心它的 dispatch 调用点。
+- **排入与否在 `AddRenderPasses` 里判完，不在 `RecordRenderGraph` 里 return。**
+  这个 pass 声明了 `ConfigureInput(Depth)`，**光是排入**就会让 URP 安排一次全屏深度拷贝。
+  为一个什么都不做的 pass 拷一张深度是实打实的浪费。
+  三个条件（`compositeMode == Fullscreen`、`m_Luts.isAerialPerspectiveValid`、材质有效）
+  与大气 pass 里的 `apEnabled` 必须同真同假；这条耦合写成了
+  `PrepareAerialPerspective` 上的**契约注释**，而不是在运行时再复制一份 guard ——
+  复制出来的 guard 会变成"永不触发的保护性代码"，这个项目已经把那条教训记在上面了。
+
 ### 坑
+
+- **双源混合在 Unity 里不存在 —— 试过了，记下来免得再试一遍。**
+  硬件本来有一条一趟写法：双源混合（`SV_Target0 = S`、`SV_Target1 = T`，
+  `dst = S·One + dst·Src1Color`）。但 `UnityEngine.Rendering.BlendMode` 里
+  **根本没有** `Src1Color` / `Src1Alpha`（反射实测只有 `Zero/One` 与 `Src|Dst` 的
+  `Color|Alpha` 那十一个），ShaderLab 的 `Blend` 解析器也直接拒收：
+  `Parse error: syntax error, unexpected TVAL_ID, expecting TVAL_VARREF or TVAL_BMODE`。
+  发现路径值得记：这个 Pass 是**先写进 shader 的**，是刚写好的接线自检在第一次运行时
+  报出编译错误才查清的 —— 而它同时暴露了一个更坏的现象：整个 shader 编译失败时，
+  `Material.passCount` 仍然返回 3，pass 名却是替身 shader 的
+  `<Unnamed Pass 0>` / `DepthNormalsOnly` / `DepthOnly`。
+  也就是说**只判 passCount 不判 pass 名的自检会在这种情况下通过**。
+  其余混合方程也表达不出 `dst·T + S`：`Blend One SrcAlpha` 只能给出灰度 T，
+  `Blend One OneMinusSrcColor` 的 dst 系数是 `1−S` 而不是 T。
+  所以两趟不是"先图省事"，而是 Unity 里唯一可表达的形式。
+  **这条同时推翻了我上一轮自己的计划**：原本打算保留双源那一趟做带宽 A/B，
+  #15 的性能项里那个对比必须删掉。
 
 - **绝对光度量的管线里，"少乘一次曝光"的症状是"阴影不见了"，而不是"画面太亮"。**
   `VISTA_EXPOSURE` 全工程只在 `VistaSky.shader` 里乘了一处；两条**引擎出口**

@@ -384,6 +384,12 @@ namespace Vista
         /// 塞进去会让那个方法的返回值（"必须排静态 pass"）多一层含义。
         /// </summary>
         /// <returns>AP 表是否可用。false 时调用方应跳过 AP pass 并让下游走无雾路径。</returns>
+        /// <remarks>
+        /// 契约：这个返回值必须恒等于 <see cref="isAerialPerspectiveValid"/>。
+        /// <c>VistaAtmosphereFeature</c> 用后者在**排入之前**决定要不要排入全屏合成 pass
+        /// （那时本方法还没被调用），两者一旦分叉，合成 pass 就会去采一张这一帧没被写、
+        /// 甚至已经释放的 3D 表。要加新的失败路径，得同时反映到那个属性上。
+        /// </remarks>
         public bool PrepareAerialPerspective(VistaAerialPerspectiveSettings settings)
         {
             if (settings == null) throw new ArgumentNullException(nameof(settings));

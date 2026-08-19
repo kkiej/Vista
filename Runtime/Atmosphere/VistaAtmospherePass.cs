@@ -36,6 +36,8 @@ namespace Vista
             public VistaAtmosphereViewData view;
             public VistaAerialPerspectiveSettings apSettings;
             public VistaSkyReflectionMode reflectionMode;
+            /// <summary>见 SkyView pass 里填这个字段处的注释。</summary>
+            public Vector4 apConsumer;
             public TextureHandle transmittance;
             public TextureHandle multiScattering;
             public TextureHandle skyView;
@@ -214,6 +216,20 @@ namespace Vista
                 data.multiScattering = multiScattering;
                 data.skyView = skyView;
 
+                // 变体 B（Vista 材质自己合成 AP）的开关，**每帧无条件下发**。
+                //
+                // 为什么挂在这个 pass 上：它是唯一一个「一定存在」的逐帧 pass。
+                // AP 关掉的帧里 AP pass 根本不排入（记录期就 return 了），
+                // 而材质里那个 uniform 会留着上一帧的 1，去采一张已经释放的 3D 表。
+                // 「关掉某功能后画面才坏」是最难反查的一类失效，所以这一行必须
+                // 走每帧必跑的路径，不能跟着 AP 一起消失。
+                //
+                // apEnabled 由这里传进设置对象：设置对象只知道用户「想要」哪种模式，
+                // 不知道核缺失 / 分级降档这类运行时结果。
+                data.apConsumer = m_ApSettings != null
+                    ? m_ApSettings.PackedConsumer(apEnabled)
+                    : Vector4.zero;
+
                 builder.UseTexture(transmittance, AccessFlags.Read);
                 builder.UseTexture(multiScattering, AccessFlags.Read);
                 builder.UseTexture(skyView, AccessFlags.Write);
@@ -233,8 +249,11 @@ namespace Vista
                 builder.AllowPassCulling(false);
 
                 builder.SetRenderFunc((LutPassData d, ComputeGraphContext ctx) =>
+                {
                     d.luts.RenderSkyViewLut(
-                        new VistaGraphLutDispatcher(ctx.cmd, Handles(d)), d.view));
+                        new VistaGraphLutDispatcher(ctx.cmd, Handles(d)), d.view);
+                    ctx.cmd.SetGlobalVector(VistaShaderIDs._VistaApConsumer, d.apConsumer);
+                });
             }
 
             // 排在 SkyView 之后：这个核**采样** SkyView（SRV），而 SkyView pass 里它是 UAV。

@@ -48,6 +48,7 @@ namespace Vista
 
         VistaAtmosphereLuts m_Luts;
         VistaAtmospherePass m_Pass;
+        VistaAerialPerspectiveCompositePass m_ApCompositePass;
 
         /// <summary>
         /// 当前生效的大气模块。场景侧的组件（<see cref="VistaTimeOfDay"/>）靠它拿到
@@ -126,6 +127,14 @@ namespace Vista
             m_Luts.SetSkyViewResolution(m_SkyViewResolution.x, m_SkyViewResolution.y);
 
             m_Pass ??= new VistaAtmospherePass();
+
+            // 合成 pass 每次 Create 都重建：它持有一个由 shader 生成的材质，
+            // 而 Create 正是在 shader 重编译后被重新调用的时机。
+            // 材质缺失（资源没配）时 isValid 为 false，AP 的 Fullscreen 模式失效，
+            // 大气其余部分照常 —— 与反射核缺失走的是同一套降级逻辑。
+            m_ApCompositePass?.Dispose();
+            m_ApCompositePass = new VistaAerialPerspectiveCompositePass(
+                resources.aerialPerspectiveCompositeShader);
         }
 
         public override void AddRenderPasses(ScriptableRenderer renderer, ref RenderingData renderingData)
@@ -144,6 +153,20 @@ namespace Vista
             m_Pass.Setup(m_Luts, m_Parameters, m_AerialPerspective, m_SkyReflection,
                          m_GroundLevelWorldY, m_EV100);
             renderer.EnqueuePass(m_Pass);
+
+            // 全屏合成（变体 A）。三个条件都必须在**排入之前**判掉，而不是排进去再在
+            // RecordRenderGraph 里 return：这个 pass 声明了 ConfigureInput(Depth)，
+            // 光是排入就会让 URP 安排一次深度拷贝。AP 关掉的帧里为一个什么都不做的
+            // pass 拷一张全屏深度，是实打实的浪费。
+            //
+            // isAerialPerspectiveValid 与大气 pass 里那个 apEnabled 必须同真同假 ——
+            // 契约写在 VistaAtmosphereLuts.PrepareAerialPerspective 的注释里。
+            if (m_AerialPerspective.compositeMode == VistaAerialPerspectiveSettings.CompositeMode.Fullscreen
+                && m_Luts.isAerialPerspectiveValid
+                && m_ApCompositePass != null && m_ApCompositePass.isValid)
+            {
+                renderer.EnqueuePass(m_ApCompositePass);
+            }
         }
 
         protected override void Dispose(bool disposing)
@@ -162,6 +185,8 @@ namespace Vista
             // 把一个已销毁的 Texture 留在 RenderSettings 里，Editor 下表现为
             // 反射变黑 + 偶发的 "Texture has been destroyed" 报错。
             m_Pass?.Teardown();
+            m_ApCompositePass?.Dispose();
+            m_ApCompositePass = null;
             m_Luts?.Dispose();
             m_Luts = null;
         }

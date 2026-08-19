@@ -20,6 +20,26 @@ namespace Vista
             Logarithmic = 1,
         }
 
+        /// <summary>
+        /// AP 怎么贴到画面上。运行时可切 —— 走 uniform 分支而不是 shader keyword，
+        /// 所以切换不产生变体、也不触发着色器重编译。
+        ///
+        /// 两条路的取舍见 <c>Shaders/Atmosphere/VistaAerialPerspectiveComposite.shader</c>
+        /// 与 <c>ShaderLibrary/AerialPerspectiveComposite.hlsl</c> 的文件头。
+        /// </summary>
+        public enum CompositeMode
+        {
+            /// <summary>LUT 照常构建，但不贴到画面上。用来做 A/B 与「关掉后画面应当变干净」的反例。</summary>
+            Off = 0,
+            /// <summary>全屏合成 pass。覆盖所有不透明材质，含 URP 自带 Lit 与第三方资源。</summary>
+            Fullscreen = 1,
+            /// <summary>
+            /// 由 Vista 自己的材质在着色末尾合成。覆盖面只有 Vista 的 shader，
+            /// 但拿得到 direct/indirect 分量 —— 逐像素大气透射率（#12）只能挂在这条路上。
+            /// </summary>
+            InShader = 2,
+        }
+
         [Header("分辨率")]
         [Tooltip("froxel 体积尺寸 (宽, 高, 深度切片数)。\n"
                + "32×32×32 是 Hillaire 论文与 UE5 SkyAtmosphere 的默认值。\n"
@@ -56,6 +76,15 @@ namespace Vista
                + "两者的差值由自检数值量化，不是拍脑袋。")]
         public bool coloredTransmittance = true;
 
+        [Header("合成")]
+        [Tooltip("AP 怎么贴到画面上。\n"
+               + "Fullscreen：全屏 pass，覆盖所有不透明材质（含 URP Lit 与第三方资源）。\n"
+               + "InShader：只有 Vista 自己的材质合成，但能拿到 direct/indirect 分量，"
+               + "逐像素大气透射率只能挂这条路。\n"
+               + "Off：表照常构建但不上画面 —— 留着做 A/B 与反例测量。\n"
+               + "运行时可切，走 uniform 分支，不产生 shader 变体。")]
+        public CompositeMode compositeMode = CompositeMode.Fullscreen;
+
         /// <summary>切片数下界为 2：分布映射里有 1/(depth-1)。</summary>
         public int depth => Mathf.Max(2, resolution.z);
         public int width => Mathf.Max(1, resolution.x);
@@ -86,6 +115,19 @@ namespace Vista
             coloredTransmittance ? 1f : 0f,
             effectiveNearKm > 0f ? 1f / effectiveNearKm : 1e8f,
             0f, 0f);
+
+        /// <summary>
+        /// x: Vista 材质是否应当自己合成 AP。
+        ///
+        /// 注意参数 <paramref name="lutsValid"/>：这个向量**每帧都要下发**，包括 AP 整个
+        /// 关掉的那一帧 —— 那时它必须是 0，否则材质会拿着上一帧的 1 去采一张
+        /// 已经释放的 3D 表。所以「表这一帧有没有被写」必须由调用方传进来，
+        /// 不能由本对象自己的字段推断（本对象不知道核缺失/分级降档这类运行时情况）。
+        /// 详见 <c>AtmosphereDef.hlsl</c> 里 <c>_VistaApConsumer</c> 的注释。
+        /// </summary>
+        public Vector4 PackedConsumer(bool lutsValid) => new Vector4(
+            lutsValid && compositeMode == CompositeMode.InShader ? 1f : 0f,
+            0f, 0f, 0f);
 
         /// <summary>只有影响 3D 纹理分配的字段才算：其余每帧推 cbuffer 即可生效。</summary>
         public bool Equals(VistaAerialPerspectiveSettings other)

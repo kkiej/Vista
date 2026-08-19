@@ -74,6 +74,18 @@ CBUFFER_START(VistaAtmospherePerViewCB)
     // y: 1/最近切片距离 (1/km)，用于近端淡出；Power 模式填一个大数
     // zw: 未用
     float4 _VistaApFlags;
+
+    // AP 的消费方开关。
+    // x: 1 = Vista 自己的材质在着色末尾合成 AP（变体 B）；
+    //    0 = 材质不合成 —— 要么 AP 整个关掉，要么由全屏合成 pass 负责（变体 A）。
+    // yzw: 未用
+    //
+    // 为什么它在这里、而不是塞进 _VistaApFlags 的空位：
+    // 上面那一组连同两张 3D 表**只在 AP 启用时**才被写（见 BindAerialPerspective）。
+    // 而这个开关必须在 AP 关掉的那一帧也被写成 0，否则材质会拿着上一帧的 1
+    // 去采一张已经释放的表。「关掉某功能后画面才坏」是最难反查的一类失效，
+    // 所以它由 Sky-View pass 下发 —— 那是唯一一个「一定存在」的逐帧 pass。
+    float4 _VistaApConsumer;
 CBUFFER_END
 
 // 物理单位 -> 渲染目标单位的曝光倍率。

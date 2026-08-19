@@ -31,6 +31,7 @@ namespace Vista
         public static readonly int _VistaApRayTL               = Shader.PropertyToID("_VistaApRayTL");
         public static readonly int _VistaApRayTR               = Shader.PropertyToID("_VistaApRayTR");
         public static readonly int _VistaApFlags               = Shader.PropertyToID("_VistaApFlags");
+        public static readonly int _VistaApConsumer            = Shader.PropertyToID("_VistaApConsumer");
 
         // ---- Atmosphere: LUT 绑定点 ----
         public static readonly int _VistaTransmittanceLut       = Shader.PropertyToID("_VistaTransmittanceLut");
