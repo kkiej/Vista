@@ -141,6 +141,42 @@ namespace Vista.Editor
         const int k_ColorBytesPerPx = 8;   // RGBA16F
         const int k_DepthBytesPerPx = 4;   // URP 拷出来的深度是单通道 32 位
 
+        // ==================================================================
+        //  给模型 A 用的线模型系数
+        // ==================================================================
+
+        /// <summary>
+        /// 本机实测的两个折叠系数（四档均值，单次测量的极差见 CHANGELOG 的表：
+        /// b 9.6%、a/全屏 4.5%）。
+        ///
+        /// 放在这里而不是抄进 <c>VistaLutGpuRecorderCrossCheck</c>：模型 A 要拿这条线
+        /// 做包线对账，而同一个量有两份字面值的话，改了这边忘了那边，
+        /// 表现是"两份报告的结论互相矛盾"而没人知道该信哪份。
+        ///
+        /// 换 GPU 必须重跑本菜单项重填这两个数 —— 它们是这台机器的系数，
+        /// 只有 <c>ms = a + b·覆盖面积</c> 这个**形式**与机器无关。
+        /// </summary>
+        public const double k_ClippedMsPerMpx = 0.0266;   // a/全屏：每个像素都付的
+        public const double k_CoveredMsPerMpx = 0.0245;   // b：只有非天空像素付的
+
+        /// <summary>
+        /// 给定**总像素面积**下本 pass 的包线：全天空构图的下界、满覆盖构图的上界。
+        ///
+        /// 只能给包线不能给一个数，因为耗时取决于构图的天空占比 ——
+        /// 而模型 A 跑在真实场景上，那个占比不由测量方控制。
+        /// 这正是包线的用法：模型 A 的值必须落在下界之上；超出上界的部分不可能由
+        /// 构图解释（覆盖率只能把值往下拉），所以那一段可以归因给 barrier / pass 边界。
+        ///
+        /// 收**面积**而不是宽高，是因为模型对面积是线性的：一帧里多次渲染
+        /// （Game View + Scene View）的包线就是各自面积之和的包线，
+        /// 调用方把面积加起来传进来就行，不需要在自己那边再写一遍这两个乘法。
+        /// </summary>
+        public static void Bracket(double megapixels, out double floorMs, out double ceilMs)
+        {
+            floorMs = k_ClippedMsPerMpx * megapixels;
+            ceilMs = (k_ClippedMsPerMpx + k_CoveredMsPerMpx) * megapixels;
+        }
+
         [MenuItem("Window/Vista/Profile AP Composite (Perf)", priority = 128)]
         public static void Run()
         {

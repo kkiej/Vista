@@ -8,7 +8,8 @@ namespace Vista.Editor
 {
     /// <summary>
     /// 模型 A：Play 模式下用 <see cref="ProfilerRecorder"/> 抓 RenderGraph 的逐 pass marker，
-    /// 交叉验证 <c>VistaAtmosphereLutProfiler</c>（模型 B）给出的数字。
+    /// 交叉验证 <c>VistaAtmosphereLutProfiler</c> 与 <c>VistaApCompositePerf</c>（模型 B）
+    /// 给出的数字。覆盖两张静态表 + 稳态五个 LUT pass + AP 合成（全屏光栅）。
     ///
     /// 两个模型测的**不是同一件事**，所以这不是"再量一遍看对不对"：
     ///   模型 B（Edit 模式立即提交、N 次背靠背摊销）测的是**吞吐** —— 相邻 dispatch
@@ -65,10 +66,24 @@ namespace Vista.Editor
             "Vista Sky Reflection",
             "Vista Sky Reflection Copy",
             "Vista Aerial Perspective LUT",
+            "Vista Aerial Perspective Composite",
         };
 
-        /// 稳态五 pass（不含两张静态表）在 k_PassNames 里的下标。
+        /// 稳态五 pass（不含两张静态表、不含合成）在 k_PassNames 里的下标。
         static readonly int[] k_SteadyIdx = { 2, 3, 4, 5, 6 };
+
+        /// AP 合成（全屏光栅）的下标。它**必须**自己一档，不能混进上面那五个，
+        /// 理由是两条，都是硬的：
+        ///
+        /// ① **不能除以出现次数。** 那一步的前提写在下面的报告里 ——「LUT 尺寸与相机
+        ///    分辨率无关，所以两次渲染做的是同样的工作量」。全屏光栅 pass 恰好违反它：
+        ///    Scene View 与 Game View 分辨率不同，成本也就不同，把两者之和除以 2
+        ///    得到的是一个**不对应任何一次真实渲染**的数。所以这一行只报原始和 + 出现次数。
+        ///
+        /// ② **不能进「稳态五 pass 之和」。** 那个和是拿去和模型 B 的 0.170~0.198 ms
+        ///    对账的，而那个区间是五个 LUT compute 的口径。把一个随分辨率变化的项
+        ///    加进去，和会随 Game View 大小漂移，而对账区间不会 —— 对账从此失效。
+        static readonly int[] k_CompositeIdx = { 7 };
 
         /// 两张静态表的下标。这两个 pass 在稳态里**应该一个样本都没有** ——
         /// 它们只在大气参数变化时重算，太阳不动的 300 帧里根本不该进图。
@@ -84,7 +99,29 @@ namespace Vista.Editor
         static bool s_Running;
         static bool s_Started;
 
-        [MenuItem("Window/Vista/Cross-Check LUT Timing (Play Mode)")]
+        /// <summary>
+        /// 无帧进展的看门狗。这一段是一次实测事故换来的：<c>runInBackground</c> 关着的时候，
+        /// Editor 一失焦 play 循环就停走，<c>Time.frameCount</c> 冻住，
+        /// 于是 Tick 永远等不到采样帧数 —— 表现是**菜单执行完什么都不打印，一直挂着**，
+        /// 而控制台还被 Clear on Play 清空了，连"武装成功"那条都看不见。
+        /// 静默挂死是最坏的失败模式：它和"还在跑"、"pass 名走歧"长得一模一样。
+        /// 所以这里宁可超时中止并把成因说出来。
+        /// </summary>
+        const double k_NoProgressAbortSec = 15.0;
+        static int s_LastFrame;
+        static System.Diagnostics.Stopwatch s_NoProgress;
+
+        /// <summary>
+        /// 进 play 时把 <c>Application.runInBackground</c> 打开、退出时还原。
+        ///
+        /// 动的是**运行期属性**，不是 <c>PlayerSettings.runInBackground</c> ——
+        /// 后者会写进 ProjectSettings.asset，那就成了"量性能的工具改了工程配置"，
+        /// 是这类 harness 最容易犯的错（本类的类注释里已经为场景立过这条规矩）。
+        /// 运行期属性只作用于当前这次 play 会话，退出即还原，磁盘上不留痕。
+        /// </summary>
+        static bool s_RunInBackgroundSaved;
+
+        [MenuItem("Window/Vista/Cross-Check Atmosphere Timing (Play Mode)")]
         static void Arm()
         {
             if (EditorApplication.isPlayingOrWillChangePlaymode)
@@ -123,6 +160,10 @@ namespace Vista.Editor
                 s_StartFrame = Time.frameCount;
                 s_Running = true;
                 s_Started = false;
+                s_LastFrame = int.MinValue;
+                s_NoProgress = System.Diagnostics.Stopwatch.StartNew();
+                s_RunInBackgroundSaved = Application.runInBackground;
+                Application.runInBackground = true;
                 EditorApplication.update -= Tick;
                 EditorApplication.update += Tick;
             }
@@ -139,7 +180,27 @@ namespace Vista.Editor
         {
             if (!s_Running) return;
 
-            int elapsed = Time.frameCount - s_StartFrame;
+            // 看门狗：只看帧号有没有动，不看时间过了多久 —— 后者会把"机器慢"
+            // 误判成"卡死"。帧号一动就重置，所以正常运行永远不会触发。
+            int frame = Time.frameCount;
+            if (frame != s_LastFrame)
+            {
+                s_LastFrame = frame;
+                s_NoProgress.Restart();
+            }
+            else if (s_NoProgress.Elapsed.TotalSeconds > k_NoProgressAbortSec)
+            {
+                Debug.LogWarning($"[Vista] play 循环停走了：帧号 {frame} 已经 "
+                    + $"{k_NoProgressAbortSec:F0} s 没动，交叉验证中止（未出报告）。"
+                    + "成因通常是 Editor 失焦 + Run In Background 关着 —— "
+                    + "本工具已在 play 期间打开运行期的 Application.runInBackground，"
+                    + "所以还撞到这条的话要查是不是被暂停了（Pause 按钮 / 断点）。");
+                Cleanup();
+                EditorApplication.ExitPlaymode();
+                return;
+            }
+
+            int elapsed = frame - s_StartFrame;
 
             if (!s_Started)
             {
@@ -256,12 +317,15 @@ namespace Vista.Editor
         static void Report(int elapsedFrames)
         {
             var sb = new StringBuilder();
-            sb.AppendLine("── LUT 逐 pass 耗时（模型 A：Play 模式 ProfilerRecorder，帧内延迟）");
+            sb.AppendLine("── 大气逐 pass 耗时（模型 A：Play 模式 ProfilerRecorder，帧内延迟）");
             sb.Append("　 GPU ").Append(SystemInfo.graphicsDeviceName)
               .Append("　后端 ").Append(SystemInfo.graphicsDeviceType)
               .Append("　场景 ").AppendLine(UnityEngine.SceneManagement.SceneManager.GetActiveScene().name);
             sb.Append("　 采样 ").Append(k_SampleFrames).Append(" 帧（丢弃预热 ")
               .Append(k_WarmupFrames).Append("，实际经过 ").Append(elapsedFrames).AppendLine(" 帧）");
+            sb.Append("　 本次 play 期间强制 Application.runInBackground=true（原值 ")
+              .Append(s_RunInBackgroundSaved ? "true" : "false")
+              .AppendLine("，退出即还原，不写 ProjectSettings）—— 失焦时 play 循环不停走，否则采样会卡死");
 
             int gpuUsable = 0, missing = 0, occUnstable = 0, staticLeak = 0;
             double steadyRawMin = 0.0, steadyPerRenderMin = 0.0, steadyPerRenderMed = 0.0;
@@ -269,13 +333,18 @@ namespace Vista.Editor
             double occAll = 0.0;          // 稳态五 pass 共同的出现次数（不一致就置 0）
             bool occAgreed = true;
 
+            // 合成 pass 单独留一份：它的对账口径与 LUT 那五个不同（见 k_CompositeIdx）。
+            Stat composite = default;
+            int compositeMissing = 0, compositeCpuOnly = 0, compositeOccUnstable = 0;
+
             for (int i = 0; i < k_PassNames.Length; ++i)
             {
                 Stat g = Read(s_Gpu[i]);
                 Stat c = Read(s_Cpu[i]);
                 bool isStatic = System.Array.IndexOf(k_StaticIdx, i) >= 0;
+                bool isComposite = System.Array.IndexOf(k_CompositeIdx, i) >= 0;
 
-                sb.Append("　　 ").Append(k_PassNames[i].PadRight(30));
+                sb.Append("　　 ").Append(k_PassNames[i].PadRight(34));
 
                 if (isStatic)
                 {
@@ -291,6 +360,46 @@ namespace Vista.Editor
                         sb.Append("**静态表每帧在跑**：GPU min ").Append(g.minMs.ToString("F3"))
                           .Append(" ms　帧 ").Append(g.count).Append("/").Append(k_SampleFrames)
                           .Append("　→ 脏标记失效，白烧约 0.044 ms/帧（画面无异常，只有计时器能看见）");
+                    }
+                    sb.AppendLine();
+                    continue;
+                }
+
+                if (isComposite)
+                {
+                    composite = g;
+                    if (g.count > 0)
+                    {
+                        sb.Append("GPU min ").Append(g.minMs.ToString("F3"))
+                          .Append("　中位 ").Append(g.medMs.ToString("F3"))
+                          .Append("　max ").Append(g.maxMs.ToString("F3"))
+                          .Append(" ms　帧 ").Append(g.count).Append("/").Append(k_SampleFrames)
+                          .Append("　每帧出现 ").Append(g.occMin.ToString("F0"));
+                        if (g.occMax != g.occMin)
+                        {
+                            sb.Append("~").Append(g.occMax.ToString("F0")).Append(" ⚠不稳定");
+                            compositeOccUnstable++;
+                        }
+                        // 这里**故意不印「单次」**：除法不合法，理由见 k_CompositeIdx ①。
+                        sb.Append("　（全屏光栅：不按出现次数相除）");
+                    }
+                    else if (c.count > 0)
+                    {
+                        compositeCpuOnly++;
+                        sb.Append("GPU 无值（valid=").Append(g.valid).Append("）　但 CPU marker 在：min ")
+                          .Append(c.minMs.ToString("F3")).Append(" ms　帧 ").Append(c.count)
+                          .Append("　→ pass 跑了，是 GPU recorder 取不到");
+                    }
+                    else
+                    {
+                        compositeMissing++;
+                        // 两种成因都要写出来，因为这个 harness **分不开**它们：
+                        // 不把两种都摆上，读的人会默认是自己知道的那一种。
+                        sb.Append("**一个样本都没有**（GPU valid=").Append(g.valid)
+                          .Append("，CPU valid=").Append(c.valid).Append("）　→ 二义：")
+                          .Append("pass 名走歧 ／ 合成 pass 没进这个 renderer（或已由变体 B 接管）。")
+                          .Append("区分办法：Window/Analysis/Profiler 的 Rendering 里搜这个名字，"
+                                + "有 marker 就是本表的字符串走歧了");
                     }
                     sb.AppendLine();
                     continue;
@@ -380,6 +489,148 @@ namespace Vista.Editor
                     : "**A < B，方向反了** —— 这指向 marker 归属而不是性能事实（被合并 / 被剪 / 相机数不同）");
             }
 
+            // ---- AP 合成与模型 B 的**包线**对账 ----
+            // 为什么是包线而不是一个数：模型 B 给的是 ms = a + b·覆盖面积，
+            // 而覆盖面积（非天空像素占比）取决于**构图**——模型 A 跑在真实场景上，
+            // 那个占比不由测量方控制，也无法从 marker 里反推。
+            // 所以能对的只有两端：全天空 = a，满覆盖 = a + b·全屏面积。
+            //
+            // 每帧出现多次时**不做除法**（理由见 k_CompositeIdx ①），改成
+            // **把每次渲染的面积逐个点名加起来**再套包线 —— 模型对面积是线性的，
+            // 所以「两次渲染之和」的包线就是两个包线之和，不需要任何等工作量假设。
+            bool compositeDirOk = true, compositeJudged = false;
+            sb.AppendLine("　 AP 合成与模型 B 对账（模型 B 给的是线：ms = a + b·覆盖面积，故只能对包线）");
+            {
+                var urp = UnityEngine.Rendering.GraphicsSettings.currentRenderPipeline
+                        as UnityEngine.Rendering.Universal.UniversalRenderPipelineAsset;
+                int msaa = urp != null ? urp.msaaSampleCount : 1;
+                bool hdr = urp == null || urp.supportsHDR;
+
+                // renderScale 只对 game 相机生效，且与 1 相差 < 0.05 时被吸成 1
+                // （URP UniversalRenderPipeline.cs:1456-1460 的 kRenderScaleThreshold /
+                //  isScenePreviewOrReflectionCamera 两条）。Scene View 一律 1.0 ——
+                // 这不是我推测的，是照着那段代码写的，否则缩放会被错算两次。
+                float raw = urp != null ? urp.renderScale : 1f;
+                float scale = Mathf.Abs(1f - raw) < 0.05f ? 1f : raw;
+
+                var bd = new StringBuilder();
+                double mpxSum = 0.0;
+                int nTargets = 0;
+
+                int gw = Mathf.Max(1, Mathf.RoundToInt(Screen.width * scale));
+                int gh = Mathf.Max(1, Mathf.RoundToInt(Screen.height * scale));
+                mpxSum += gw * (double)gh / 1e6;
+                nTargets++;
+                bd.Append("Game ").Append(gw).Append("×").Append(gh);
+
+                var views = SceneView.sceneViews;
+                for (int v = 0; views != null && v < views.Count; ++v)
+                {
+                    var sv = views[v] as SceneView;
+                    if (sv == null || sv.camera == null) continue;
+                    int sw = sv.camera.pixelWidth, sh = sv.camera.pixelHeight;
+                    if (sw <= 0 || sh <= 0) continue;
+                    mpxSum += sw * (double)sh / 1e6;
+                    nTargets++;
+                    bd.Append(" + Scene ").Append(sw).Append("×").Append(sh);
+                }
+
+                double floorMs, ceilMs;
+                VistaApCompositePerf.Bracket(mpxSum, out floorMs, out ceilMs);
+
+                sb.Append("　　 渲染目标 ").Append(bd)
+                  .Append("　合计 ").Append(mpxSum.ToString("F3")).Append(" Mpx")
+                  .Append("　renderScale ").Append(scale.ToString("F2"))
+                  .Append("（仅 Game）　MSAA ").Append(msaa).Append("×　HDR ")
+                  .AppendLine(hdr ? "开" : "关");
+                sb.Append("　　 包线 [").Append(floorMs.ToString("F3")).Append(", ")
+                  .Append(ceilMs.ToString("F3"))
+                  .Append("] ms＝[全天空构图, 满覆盖构图]，系数 a/全屏=")
+                  .Append(VistaApCompositePerf.k_ClippedMsPerMpx.ToString("F4"))
+                  .Append("　b=").Append(VistaApCompositePerf.k_CoveredMsPerMpx.ToString("F4"))
+                  .AppendLine(" ms/Mpx（本机实测，换 GPU 要重测）");
+
+                // 两端各自的前提**分别**失效，所以分别判、分别说，不合成一个「前提不成立」
+                // 一票否决 —— 那样会把唯一还成立的那一端也挡掉。
+                if (!hdr)
+                    sb.AppendLine("　　 ⚠ HDR 关：颜色附件比模型 B 的 RGBA16F 窄，实际更便宜，"
+                                + "**下界判定不成立**（上界仍成立）。");
+                if (msaa > 1)
+                    sb.AppendLine("　　 ⚠ MSAA " + msaa + "×：逐样本混合比模型 B 的 1× 更贵，"
+                                + "**上界失效**（下界仍成立，只会更宽松）。");
+
+                if (composite.count == 0)
+                {
+                    sb.AppendLine("　　 无 GPU 样本，不做判定（成因见上面那一行的二义）。");
+                }
+                else if (compositeOccUnstable > 0)
+                {
+                    sb.AppendLine("　　 **不可判定**：出现次数帧间在变，连「这一帧渲染了几次」都不固定。");
+                }
+                else if ((int)composite.occMin != nTargets)
+                {
+                    // 点名对不上就认输，**不猜**。少了 = 有视图没在渲染（被 tab 遮住），
+                    // 多了 = 还有别的相机（第二个 game 相机 / 预览窗口）。
+                    // 两种都会让面积和错，而错的面积和会给出一个看起来很像结论的数。
+                    sb.Append("　　 **不可判定**：marker 每帧出现 ").Append(composite.occMin.ToString("F0"))
+                      .Append(" 次，而点名点到 ").Append(nTargets)
+                      .AppendLine(" 个渲染目标，对不上。少了＝某个视图被遮住没渲染；"
+                                + "多了＝还有没点到的相机（第二个 game 相机 / 材质预览）。"
+                                + "关掉多余视图或让 Scene 视图停止渲染后重跑。");
+                }
+                else if (!hdr)
+                {
+                    sb.AppendLine("　　 下界前提不成立（HDR 关），仅报数：min "
+                                + composite.minMs.ToString("F3") + " ms。");
+                }
+                else
+                {
+                    compositeJudged = true;
+                    bool aboveFloor = composite.minMs >= floorMs;
+                    sb.Append("　　 A(").Append(nTargets).Append(" 次渲染之和) min ")
+                      .Append(composite.minMs.ToString("F3")).Append(" ms　→ ");
+                    if (aboveFloor)
+                    {
+                        sb.AppendLine("≥ 全天空下界 " + floorMs.ToString("F3")
+                                    + " ms，方向符合预期（帧内延迟 ≥ 允许重叠的吞吐下界）");
+                    }
+                    else
+                    {
+                        compositeDirOk = false;
+                        sb.AppendLine("**低于全天空下界 " + floorMs.ToString("F3")
+                                    + " ms** —— 帧内延迟不可能低于吞吐下界，所以这指向工具而非性能："
+                                    + "marker 被合并/被剪，或实际渲染分辨率不是上面点名的那些"
+                                    + "（动态分辨率、渲染缩放被 Volume 覆盖）");
+                    }
+
+                    // 下界都没过就**不再谈落点**。故障注入（把 floor ×10）时这里原本照样打
+                    // 「落在包线内（占上界 66%）」，和上一行的「低于全天空下界」直接自相矛盾 ——
+                    // 真出故障时这段话会替故障背书。所以位置描述必须挂在下界判定之后。
+                    if (!aboveFloor)
+                    {
+                        sb.AppendLine("　　 下界未过，落点位置不再解读：包线本身已经不可信"
+                                    + "（要么面积点名错了，要么 marker 不是这个 pass 的）。");
+                    }
+                    else if (composite.minMs > ceilMs && msaa <= 1)
+                    {
+                        // 这一侧**可以**归因，而且只有这一侧可以：覆盖率只能把值往下拉，
+                        // 所以超过满覆盖上界的部分不可能是构图造成的。
+                        sb.Append("　　 超出满覆盖上界 ").Append((composite.minMs - ceilMs).ToString("F3"))
+                          .AppendLine(" ms —— 覆盖率只能让值更低，所以这个超出量是"
+                                    + " barrier / pass 边界 / 无重叠 三样代价之和的**下界**。");
+                    }
+                    else
+                    {
+                        sb.Append("　　 落在包线内（占上界 ")
+                          .Append(ceilMs > 1e-9 ? (composite.minMs / ceilMs).ToString("P0") : "——")
+                          .AppendLine("）。此时**不能**把它拆成「天空占比」与「barrier 加价」两项："
+                                    + "两者都未知，且对同一个数的贡献符号相反（天空多→更低，"
+                                    + "barrier→更高），会互相掩盖。要单独拿到 barrier 加价，"
+                                    + "得让构图覆盖率可控 —— 那是模型 B 的活，不是场景 harness 的。");
+                    }
+                }
+            }
+
             sb.AppendLine("── 引用这些数字时必须一起给");
             sb.AppendLine("　 1) RenderGraph 的逐 pass marker 被 #if DEVELOPMENT_BUILD || UNITY_EDITOR 包着"
                         + "（core RenderGraph.cs:2868-2884）。**Release 构建里没有这些 marker**，"
@@ -389,20 +640,32 @@ namespace Vista.Editor
             sb.AppendLine("　 3) 「每帧出现」> 1 时，行首的值是同一帧里多次渲染（通常 Scene View + "
                         + "Game View）的**总和**；「单次」是按出现次数除出来的，前提见上。"
                         + "要拿到无需假设的数字，让 Scene 视图停止渲染（与 Game 停靠同区并置前）再量。");
+            sb.AppendLine("　 4) AP 合成那一行**没有「单次」**，也不进上面那个和：它是全屏光栅，"
+                        + "成本随分辨率变，两个视图做的不是同样的工作量，除法与求和都不合法。");
 
             string flat = sb.ToString().Replace("\r", "").Replace("\n", "  |  ");
+            // compositeJudged 也进这个门：上一版没进，于是「不可判定」照样打
+            // 「交叉验证完成」—— 一条未覆盖的路径被读成通过，正是本项目记过的那个反模式。
+            // 不可判定必须是缺口，不能是通过。
             bool ok = missing == 0 && occUnstable == 0 && staticLeak == 0
-                   && gpuUsable == k_SteadyIdx.Length && steadyComplete;
+                   && gpuUsable == k_SteadyIdx.Length && steadyComplete
+                   && compositeMissing == 0 && compositeCpuOnly == 0
+                   && compositeOccUnstable == 0 && compositeJudged && compositeDirOk;
             if (ok) Debug.Log("[Vista] 模型 A 交叉验证完成  |  " + flat);
             else Debug.LogWarning($"[Vista] 模型 A 交叉验证有缺口（稳态缺样本 {missing}，GPU 可用 "
                                 + $"{gpuUsable}/{k_SteadyIdx.Length}，出现次数不稳 {occUnstable}，"
-                                + $"静态表泄漏 {staticLeak}）  |  " + flat);
+                                + $"静态表泄漏 {staticLeak}；合成缺样本 {compositeMissing}，"
+                                + $"合成仅 CPU {compositeCpuOnly}，合成出现次数不稳 {compositeOccUnstable}，"
+                                + $"合成包线{(compositeJudged ? (compositeDirOk ? "通过" : "**方向反了**") : "**未判定**")}）"
+                                + "  |  " + flat);
         }
 
         static void Cleanup()
         {
             s_Running = false;
             s_Started = false;
+            Application.runInBackground = s_RunInBackgroundSaved;
+            s_NoProgress = null;
             EditorApplication.update -= Tick;
             Dispose(ref s_Gpu);
             Dispose(ref s_Cpu);
