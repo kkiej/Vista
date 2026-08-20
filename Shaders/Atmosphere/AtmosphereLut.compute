@@ -367,7 +367,13 @@ void AerialPerspectiveLut(uint3 id : SV_DispatchThreadID)
                 float  t = tPrev + (i + VISTA_SAMPLE_SEGMENT_T) * dt;
                 float3 p = posKm + t * rayDir;
 
-                VistaScatterSample smp = VistaEvaluateScatterSample(p, rayDir, sunDir, s);
+                // #18 会把这里换成 VistaSampleFog(VistaFogHeightMeters(t, rayDir.y))。
+                // 现在传 None，是为了让 #17 的签名改动对本 kernel **逐位无影响**：
+                // 全零结构体让雾的三项都乘 0、常量折叠后指令数不变，
+                // 于是 #7 的深度分布曲线与 #15 的 A/B 一致性读数都不该动 ——
+                // 这是 #17 唯一可用的回归判据，不能靠"看起来没变"。
+                VistaScatterSample smp =
+                    VistaEvaluateScatterSample(p, rayDir, sunDir, VistaFogSampleNone(), s);
 
                 float3 sampleTransmittance = exp(-smp.extinction * dt);
                 luminance += throughput * VistaSegmentIntegral(smp.scattered, smp.extinction, dt);

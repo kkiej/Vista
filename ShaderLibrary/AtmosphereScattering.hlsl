@@ -15,6 +15,7 @@
 
 #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/GlobalSamplers.hlsl"
 #include "Packages/com.kkiej.vista/ShaderLibrary/AtmosphereDef.hlsl"
+#include "Packages/com.kkiej.vista/ShaderLibrary/FogMedium.hlsl"
 
 TEXTURE2D(_VistaTransmittanceLut);
 TEXTURE2D(_VistaMultiScatteringLut);
@@ -143,6 +144,23 @@ struct VistaRaymarchSettings
     bool   applyPhase;          // false = 各向同性相位（建 MS LUT 用）
     bool   includeGroundBounce; // 计入地面反弹的一次漫反射
     bool   useMultiScattering;  // 采样 MS LUT（建 MS LUT 时必须 false，否则自引用）
+
+    // 雾的环境项入射亮度（绝对光度量 cd/m²）。必须由调用方用 VistaShAmbientMean 算，
+    // 那是 SphericalHarmonics.hlsl 里唯一一份"各向同性相位下的平均入射亮度"。
+    //
+    // 为什么放在**逐视线**的 settings 里而不是逐样本算：
+    // 天光环境探针是整个相机位置的一个 SH，沿视线不变，逐样本重算是纯浪费；
+    // 更重要的是，把它抬到 settings 里让 AtmosphereScattering.hlsl **不依赖**
+    // _VistaSkyAmbientSh 这个 StructuredBuffer —— 否则每个 include 本文件的
+    // 片元着色器（Vista/Lit、天空、水面）都会白占一个 t 槽位，
+    // 而移动端 GLES3 上片元着色器里的 SSBO 是个已知的雷区。
+    // 需要它的只有两个 compute kernel（#18 的 AP、#20 的近层雾体），
+    // 由它们各自在 setup 处调一次那个共享函数。
+    //
+    // 已知的近似：这一项**不含遮挡** —— 洞穴里的雾拿到的天光和空地一样多。
+    // 正确的做法要么让雾体去查 Step 4 的 PRTGI，要么给雾体自己做一层
+    // 天空可见度，两者都不在 Step 3 的范围里。
+    float3 fogAmbientRadiance;
 };
 
 VistaRaymarchSettings VistaDefaultRaymarchSettings()
@@ -156,6 +174,7 @@ VistaRaymarchSettings VistaDefaultRaymarchSettings()
     s.applyPhase          = true;
     s.includeGroundBounce = true;
     s.useMultiScattering  = true;
+    s.fogAmbientRadiance  = 0.0;
     return s;
 }
 
@@ -181,16 +200,30 @@ struct VistaScatteringResult
 //  VistaIntegrateScatteredLuminance。但两者必须共用同一份能量计算 ——
 //  否则就回到了本文件开头警告的那个 bug：远山雾色与天空色在交界处对不上。
 //  所以只复制循环，绝不复制物理。
+//
+//  ---- 雾为什么也从这里进 ----
+//  雾是并列的第四个介质组分（见 FogMedium.hlsl 的"与大气介质的关系"），
+//  它的相位、到太阳的透射率、消光都必须和 Rayleigh/Mie/臭氧在**同一个表达式**里合成，
+//  否则档 A（近层 froxel）与档 D（AP LUT）在交界距离上会对不上 ——
+//  那正是本文件开头警告的那类 bug，只是换了一条缝。
+//  不需要雾的消费者（静态 LUT、MS LUT、SkyView LUT）传 VistaFogSampleNone()：
+//  那是个全零字面量结构体，内联后常量折叠会把雾的三项连同
+//  VistaFogTransmittanceToSun 一起消掉，所以它们的指令数与接雾之前一致，
+//  #15 量到的 A/B 一致性也不受影响。
 // ----------------------------------------------------------------------------
 struct VistaScatterSample
 {
-    float3 scattered;   // 该点的散射源项（已含相位、到太阳的透射率、星球阴影、多次散射）
-    float3 msAs1;       // 入射亮度恒为 1 时的散射系数和（建 MS LUT 用）
+    float3 scattered;   // 该点的散射源项（已含相位、到太阳的透射率、星球阴影、多次散射、雾）
+    float3 msAs1;       // 入射亮度恒为 1 时的散射系数和（建 MS LUT 用，**不含雾**）
     float3 extinction;  // 已兜底 >= 1e-9，可直接作除数
 };
 
+//  fog: 该点的雾介质。由调用方用 VistaSampleFog(VistaFogHeightMeters(t, rayDir.y)) 取 ——
+//  **不在这里取**，因为雾的高度必须从 t 推、不能从 p 反算（fp32 在 6360 km 上的
+//  ulp 是 0.49 m，理由见 FogMedium.hlsl）。让调用方传进来同时也让 #24 的局部雾体
+//  可以在传入前往这个结构体里叠密度，不需要再改一次签名。
 VistaScatterSample VistaEvaluateScatterSample(
-    float3 p, float3 rayDir, float3 sunDir, VistaRaymarchSettings s)
+    float3 p, float3 rayDir, float3 sunDir, VistaFogSample fog, VistaRaymarchSettings s)
 {
     float  r  = length(p);
     float3 up = p / r;
@@ -201,18 +234,24 @@ VistaScatterSample VistaEvaluateScatterSample(
     float3 transmittanceToSun = VistaSampleTransmittanceToSun(r, muSun);
     float  earthShadow = VistaEarthShadow(p, sunDir);
 
+    // 雾自己对阳光的衰减只作用在雾的那一项上（空气不会被雾的液滴挡住两次），
+    // 所以它折进 fog 的散射系数里，而不是乘到公共的 transmittanceToSun 上。
+    float3 fogScattering = fog.scattering * VistaFogTransmittanceToSun(fog, sunDir.y);
+
     float3 phaseTimesScattering;
     if (s.applyPhase)
     {
         float cosTheta = dot(rayDir, sunDir);
         phaseTimesScattering =
               medium.scatteringRayleigh * VistaRayleighPhase(cosTheta)
-            + medium.scatteringMie      * VistaHenyeyGreensteinPhase(_VistaMieExtinct.w, cosTheta);
+            + medium.scatteringMie      * VistaHenyeyGreensteinPhase(_VistaMieExtinct.w, cosTheta)
+            + fogScattering             * VistaHenyeyGreensteinPhase(fog.phaseG, cosTheta);
     }
     else
     {
         phaseTimesScattering =
-            (medium.scatteringRayleigh + medium.scatteringMie) * VISTA_ISOTROPIC_PHASE;
+            (medium.scatteringRayleigh + medium.scatteringMie + fogScattering)
+            * VISTA_ISOTROPIC_PHASE;
     }
 
     float3 multiScattered = 0.0;
@@ -226,9 +265,18 @@ VistaScatterSample VistaEvaluateScatterSample(
     o.scattered = s.sunIlluminance
                 * (earthShadow * transmittanceToSun * phaseTimesScattering)
                 + s.sunIlluminance * multiScattered;
+
+    // 雾的环境项：各向同性相位下 ∫p·L dω 就是平均入射亮度本身，
+    // 所以这里是 σ_s · L̄ 而**不是** σ_s · L̄ · (1/4π) —— 那个 1/4π 已经在
+    // VistaShAmbientMean 的推导里约掉了（(1/4π)·∫L dω = L̄）。写成后者的症状是
+    // 阴影里的雾暗 12.6 倍，看起来像"环境项强度调小了"，很难反查。
+    // 用 fog.scattering 而不是 fogScattering：自遮蔽只挡直射太阳，不挡天光。
+    o.scattered += fog.scattering * (s.fogAmbientRadiance * _VistaFogHeight.z);
+
+    // 不含雾：MS LUT 是静态的、球对称参数化的大气量，见 FogMedium.hlsl。
     o.msAs1 = medium.scatteringRayleigh + medium.scatteringMie;
     // 大气顶附近密度指数衰减到接近 0，除法要兜底
-    o.extinction = max(medium.extinction, 1e-9);
+    o.extinction = max(medium.extinction + fog.extinction, 1e-9);
     return o;
 }
 
@@ -345,7 +393,11 @@ VistaScatteringResult VistaIntegrateScatteredLuminance(
 
         float3 p = posKm + t * rayDir;
 
-        VistaScatterSample smp = VistaEvaluateScatterSample(p, rayDir, sunDir, s);
+        // 传 None：本积分器服务的是 Transmittance / MS / SkyView LUT 与地面反弹，
+        // 那些都是静态或球对称/方位对称的大气量，雾不能进（见 FogMedium.hlsl）。
+        // 天空像素的雾靠雾体远端的 transmittance/inScatter 覆盖，不靠这里。
+        VistaScatterSample smp =
+            VistaEvaluateScatterSample(p, rayDir, sunDir, VistaFogSampleNone(), s);
 
         float3 sampleOpticalDepth   = smp.extinction * dt;
         float3 sampleTransmittance  = exp(-sampleOpticalDepth);
