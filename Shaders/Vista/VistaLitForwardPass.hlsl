@@ -108,6 +108,27 @@ float4 _VistaDiffInject;
 //   3 = |mine − ref| × VISTA_DIFF_NUM_SCALE + VISTA_DIFF_NUM_BIAS
 //   4 = 相对误差的**分母** max(|ref|, 分母下限)
 //   5 = 常量 (0.25, 0.5, 0.75)（已知常量对照）
+//   6 = #12 逐像素太阳透射率比值（判定用；这条链上唯一期望值非 0 的档位）
+//   7 = 着色器看到的 _VistaSunTransmittanceRef.xyz（归因）
+//   8 = (该 uniform 的 w, _VistaDiffCtrl.x, 曝光 × 1e4)（归因）
+//   9 = 着色器看到的 _VistaSunDirection.xyz * 0.5 + 0.5（归因）
+//  10 = URP 的 _MainLightPosition.xyz * 0.5 + 0.5（归因）
+//  11 = URP 的 _MainLightColor.rgb（归因）
+//
+// 为什么 10/11 要和 9 并排存在：9 是 **Vista 发布的**太阳方向，10/11 是
+// **URP 自己解析出来的**主光。两者由不同的代码决定
+//（VistaAtmospherePass.GetSunDirection 对 URP 的 GetMainLightIndex），
+// 于是「Vista 的太阳不对」有两种完全不同的成因 ——
+// URP 压根没选中我要的那盏灯（10/11 与 9 一致地错），
+// 还是 URP 选对了而 Vista 解析错了（10 对、9 错）。
+// 只读 9 无法分辨这两者，而它们的修法在不同的文件里。
+// 11 还顺带回答一个判据级的问题：主光色若是黑的，任何「乘在主光上」的
+// 特性都乘在零上，相关判据全部退化成 0 == 0 的空判。
+//
+// 7~11 是**归因**档，不参与任何判据。它们存在的理由是 C# 侧的
+// Shader.GetGlobalVector 与着色器读到的值**不是同一个东西**：前者是「现在 CPU
+// 全局表里存着什么」，后者是「本次渲染时着色器看到了什么」。逐帧重发全局的 pass、
+// 多相机、上一帧残留，这三种失效都会让两者分叉 —— 而那正是最需要归因的时刻。
 //
 // ── 为什么 0 档要放大：读回路径有一条**加性**地板 ──
 //
@@ -250,7 +271,25 @@ void VistaLitPassFragment(
     // 6 档：#12 的逐像素太阳透射率比值本身。
     // 它是这条链上唯一一个**期望值不是 0、也不是两侧之差**的档位 —— 直接输出被测量，
     // 于是它的读数可以拿去与 CPU 闭式对账，不必经过「两次渲染相减」。
-    if (_VistaDiffCtrl.x > 5.5)      payload = VistaSunTransmittanceRatio(inputData.positionWS);
+    // 7/8/9/10/11 档：**归因**用，不参与任何判据。
+    //
+    // 为什么必须从着色器里把这几个量读出来、而不是在 C# 里 Shader.GetGlobalVector：
+    // 那两处读的不是同一个东西。C# 读的是「当前 CPU 侧全局表里存着什么」，
+    // 而判据要归因的是「本次渲染时**着色器**看到了什么」。两者在
+    // 「pass 每帧重发 / 多相机 / 上一帧残留」这几种失效下会给出不同答案 ——
+    // 而那正是最需要归因的时候。#12 的第一次运行就撞上了这一条：
+    // C# 读到 w = 0，画面的行为却像 w = 1，靠 C# 那一侧永远看不出是谁不对。
+    //
+    // 9/10 档的方向做了 *0.5+0.5 偏置：自检把负数与 NaN 一起当「未覆盖」处理
+    //（双侧闭合的哨兵判定），不偏置的话 x/z 为负的太阳会被判成没画到。
+    if (_VistaDiffCtrl.x > 10.5)     payload = _MainLightColor.rgb;
+    else if (_VistaDiffCtrl.x > 9.5) payload = _MainLightPosition.xyz * 0.5 + 0.5;
+    else if (_VistaDiffCtrl.x > 8.5) payload = _VistaSunDirection.xyz * 0.5 + 0.5;
+    else if (_VistaDiffCtrl.x > 7.5) payload = half3(_VistaSunTransmittanceRef.w,
+                                                     _VistaDiffCtrl.x,
+                                                     VISTA_EXPOSURE * 1e4);
+    else if (_VistaDiffCtrl.x > 6.5) payload = _VistaSunTransmittanceRef.xyz;
+    else if (_VistaDiffCtrl.x > 5.5) payload = VistaSunTransmittanceRatio(inputData.positionWS);
     else if (_VistaDiffCtrl.x > 4.5) payload = half3(0.25, 0.5, 0.75);
     else if (_VistaDiffCtrl.x > 3.5) payload = diffDenominator;
     else if (_VistaDiffCtrl.x > 2.5) payload = diffNumerator * VISTA_DIFF_NUM_SCALE + VISTA_DIFF_NUM_BIAS;
