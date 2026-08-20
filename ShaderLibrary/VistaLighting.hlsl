@@ -42,6 +42,7 @@
 
 #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Lighting.hlsl"
 #include "Packages/com.kkiej.vista/ShaderLibrary/AerialPerspectiveComposite.hlsl"
+#include "Packages/com.kkiej.vista/ShaderLibrary/SunTransmittance.hlsl"
 
 // ----------------------------------------------------------------------------
 //  累加
@@ -92,15 +93,30 @@ bool VistaComputeLighting(InputData inputData, inout SurfaceData surfaceData,
     uint meshRenderingLayers = GetMeshRenderingLayer();
     Light mainLight = GetMainLight(inputData, shadowMask, aoFactor);
 
-    // ========================= #12 的挂载点 =========================
-    // 逐像素大气透射率要写在这里：mainLight.color *= T(着色点海拔, 太阳方向)。
-    // 位置是唯一的 —— 必须在 MixRealtimeAndBakedGI 之前还是之后，是 #12 要定的
-    // 一个真问题（那个函数用 mainLight 做 subtractive 混合，而 lightmap 是
-    // 不带 T 烘的），所以现在不放占位代码，只留这条注释。
-    // ===============================================================
-
     // NOTE: We don't apply AO to the GI here because it's done in the lighting calculation below...
     MixRealtimeAndBakedGI(mainLight, inputData.normalWS, inputData.bakedGI);
+
+    // ==================== #12 逐像素太阳透射率 ====================
+    // 位置是**在 MixRealtimeAndBakedGI 之后**，这不是随手排的，理由如下。
+    //
+    // 那个函数唯一做的事是 subtractive 混合（URP GlobalIllumination.hlsl:592，
+    // 只有一句 SubtractDirectMainLightFromLightmap；light 声明成 inout 但从头到尾
+    // 没被写过，所以顺序对别的东西没有任何影响）。它的做法是先估一遍
+    // 「烘焙器往 lightmap 里放了多少直接光」，再从 lightmap 里把被实时阴影挡住的
+    // 那一份减掉。
+    //
+    // 关键在于 lightmap 是一张**已经烘死的贴图**：里面装的是烘焙时那个光色的能量，
+    // 而烘焙器并不知道逐像素透射率这回事。要减的东西只能是**贴图里真有的那一份**。
+    // 若把修正后的 mainLight.color 交给它，它会去减一个贴图里并不存在的量，
+    // 误差随场景的海拔跨度放大：高处 T_px > T_ref ⇒ 过减，阴影区被
+    // _SubtractiveShadowColor 夹住变死黑；低洼处 T_px < T_ref ⇒ 欠减，阴影不够暗。
+    // 两种症状都只在「烘了 lightmap + Subtractive 混合 + 有落差」时出现，
+    // 单看直射光完全正常 —— 典型的难查失效。
+    //
+    // 反过来说：放在之后，估算用的是与烘焙同源的那个光色，减法的口径是自洽的；
+    // 而实时直射光拿到修正后的值。两边各自正确。
+    mainLight.color *= VistaSunTransmittanceRatio(inputData.positionWS);
+    // ==============================================================
 
     lightingData = CreateLightingData(inputData, surfaceData);
 

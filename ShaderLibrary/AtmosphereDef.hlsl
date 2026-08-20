@@ -86,6 +86,45 @@ CBUFFER_START(VistaAtmospherePerViewCB)
     // 去采一张已经释放的表。「关掉某功能后画面才坏」是最难反查的一类失效，
     // 所以它由 Sky-View pass 下发 —— 那是唯一一个「一定存在」的逐帧 pass。
     float4 _VistaApConsumer;
+
+    // 平行光颜色里**已经含有**的那一份太阳透射率（参考高度处）。
+    // xyz: T_ref，逐通道；w: 1 = 逐像素修正生效，0 = 不生效（比值恒为 1）。
+    //
+    // 为什么需要它 —— 逐像素透射率不能直接乘 T：
+    // VistaTimeOfDay 已经把参考高度处的 T_ref 乘进了 Light.color
+    // （见 VistaSunTransmittance.ComputeLightParams）。着色时再乘一次 T 就是乘了两遍，
+    // 症状是「整个场景偏暗、越接近日落越暗」—— 一个看起来"很有大气感"的错误，
+    // 极容易被当成风格接受下来。正确形式是**比值** T(着色点) / T_ref。
+    //
+    // 比值形式还有一个不显然的好处 —— **CPU 那份 T 会代数上整项约掉**：
+    //   Light.color·intensity × ratio
+    //     = (E·T_ref^CPU·exposure/π) × (T^LUT(着色点) / T_ref^CPU)
+    //     = E·exposure/π × T^LUT(着色点)
+    // 于是最终画面里只剩**一份** T，而且是 GPU LUT 那一份 —— 与天空、AP、天光 SH
+    // 用的是同一张表。这正是本项目「同一个量不允许两份实现」那条规矩想要的结果：
+    // CPU 那份退化成一个自我消去的载体。
+    // 反过来说，若分母改成在 GPU 上重采 LUT，比值在参考高度会精确等于 1，但最终光
+    // 变成 T^CPU(ref)·T^LUT(px)/T^LUT(ref) —— 两份 T 相乘。宁可要前者。
+    //
+    // 代价（必须承认的）：不走 Vista/Lit 的材质 —— URP 自带 Lit、粒子、第三方 shader
+    // —— 仍然吃 T^CPU。两条口径的差距实测在项目自己的尺子内：
+    // 纹素中心最大绝对误差 5.047E-004；带双线性的实用工况里走相对判据的通道
+    // 最大 0.706%（门 1%），另有 2 个通道走绝对豁免（自身 |ΔT| < 1E-003）。
+    // 见「Validate Sun Transmittance」的 A/B 两项。
+    //
+    // 注意：#8 那条「Light.color × intensity == E·T·exposure/π」的接缝验收
+    // 对这一层**结构性无法失败** —— 它的布景用的是 Hidden/Vista/SeamProbe，
+    // 根本不走 Vista/Lit。所以那条验收的数字不变**不能**用来证明这一层是对的，
+    // 它只能证明这一层没有碰到 CPU 侧写灯的那条路。
+    //
+    // T_ref 必须来自**写灯时用的那一次** Evaluate（CPU 侧上传，不在 GPU 上重算）：
+    // 上面那个约分要求分母与 Light.color 里的因子是**同一个 float**。
+    // w 位为什么不能省：Light.color 里有没有 T_ref 取决于 VistaTimeOfDay 是否在
+    // 驱动光色（!m_DriveColor / 没挂 feature / 组件被禁用时它压根不写灯）。
+    // 那些情况下灯是美术手填的裸颜色，除以任何 T_ref 都是错的 —— 必须整条退化成
+    // no-op。所以这里与 _VistaApConsumer 同理：**每帧无条件写**，由 Sky-View pass
+    // 下发，缺省 (1,1,1,0)。漏写的症状同样是「关掉某功能后画面才坏」。
+    float4 _VistaSunTransmittanceRef;
 CBUFFER_END
 
 // 物理单位 -> 渲染目标单位的曝光倍率。

@@ -160,6 +160,8 @@ float4 _VistaDiffInject;
 // 那条 1e-3 的加性地板，「有没有执行」这个判断不受影响。
 // 1/2/4 档不加印记：它们的量级本身就与 0 档差三个数量级，已经是印记了，
 // 加偏置反而会毁掉它们「读数就是那个量本身」的性质。
+// 6 档同理不加印记 —— 它的期望值在 1 附近（比值），本身就远离 0，
+// 而且这一档存在的意义正是「读数就是被测量」，加了偏置就得再解一次码。
 float4 _VistaDiffCtrl;
 CBUFFER_END
 
@@ -245,7 +247,11 @@ void VistaLitPassFragment(
     // 0 档放大 100 倍再写出：读回路径有一条 ±1/1024 的加性地板，
     // 而 relError 的期望值是 0，不放大的话读回来永远是地板值（理由见声明处）。
     half3 payload = relError * VISTA_DIFF_REL_SCALE;
-    if (_VistaDiffCtrl.x > 4.5)      payload = half3(0.25, 0.5, 0.75);
+    // 6 档：#12 的逐像素太阳透射率比值本身。
+    // 它是这条链上唯一一个**期望值不是 0、也不是两侧之差**的档位 —— 直接输出被测量，
+    // 于是它的读数可以拿去与 CPU 闭式对账，不必经过「两次渲染相减」。
+    if (_VistaDiffCtrl.x > 5.5)      payload = VistaSunTransmittanceRatio(inputData.positionWS);
+    else if (_VistaDiffCtrl.x > 4.5) payload = half3(0.25, 0.5, 0.75);
     else if (_VistaDiffCtrl.x > 3.5) payload = diffDenominator;
     else if (_VistaDiffCtrl.x > 2.5) payload = diffNumerator * VISTA_DIFF_NUM_SCALE + VISTA_DIFF_NUM_BIAS;
     else if (_VistaDiffCtrl.x > 1.5) payload = reference.rgb;

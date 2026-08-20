@@ -17,9 +17,15 @@ namespace Vista.Editor
     ///
     /// VISTA_LIT_DIFF_DEBUG 变体在**上 AP 之前**取差：量的是「拆分累加是否等价」，
     /// 与 AP 表、太阳方向、compositeMode 全部无关。所以这条自检不需要
-    /// VistaAtmosphereFeature 在场，也不会被时间/天气配置影响 ——
-    /// 它是一条纯粹的回归判据，URP 升级时第一个该跑的就是它。
+    /// VistaAtmosphereFeature 在场 —— 它是一条纯粹的回归判据，URP 升级时第一个该跑的就是它。
     /// 变体 A/B 的逐像素一致（#15 判据②）是另一件事，在另一个自检里。
+    ///
+    /// 但「与大气无关」不是自动成立的，要靠一条显式措施维持：#12 的逐像素太阳透射率
+    /// 就长在 VistaComputeLighting 里面，**只乘我这一侧**。它一生效，两侧就天然差
+    /// mainLightColor·(ratio−1)，与拷贝抄得对不对无关。所以本自检在
+    /// <see cref="Run"/> 里把它强制置成不生效（<see cref="k_TRefHeldOff"/>），
+    /// 并在判据 1 的报告里点名 —— 见那里的说明：一条被强制关掉的东西若不点名，
+    /// 「累加 ≡ UniversalFragmentPBR」会被读成「#12 不改变光」，恰好是反的。
     ///
     /// ── 「恒 0」的三种解释，和怎么区分 ──
     ///
@@ -166,6 +172,20 @@ namespace Vista.Editor
         const float k_PreClear = 3f;
 
         static float Channel(Color c, int i) => i == 0 ? c.r : (i == 1 ? c.g : c.b);
+
+        /// <summary>
+        /// 本自检期间强制下发的 <c>_VistaSunTransmittanceRef</c>：w = 0 ⇒ #12 的比值恒为 1。
+        ///
+        /// 为什么必须强制、而不是「场景里没挂 ToD 所以自然是 1」：那是运气，不是保障。
+        /// 布景是运行时搭的，但 <see cref="VistaTimeOfDay"/> 是**场景级**组件 ——
+        /// 在一个挂了它的场景里跑本自检，w 就是 1，于是判据 1 会把 #12 报成
+        /// 「拷贝走歧」。反过来更坏：现在它「通过」也可能只是因为当前场景恰好没挂 ToD，
+        /// 而报告里看不出这个前提。用钩子钉住，两种情形都消失。
+        ///
+        /// 三个 xyz 给 1 只是为了让这个值本身自洽（比值 = T/1）；w = 0 时 shader
+        /// 第一行就返回 1，xyz 根本不会被读到。
+        /// </summary>
+        static readonly Vector4 k_TRefHeldOff = new Vector4(1f, 1f, 1f, 0f);
 
         /// <summary>
         /// 5 档能与它混淆的**候选值**：另外两个通道的常量、CPU 预清屏值、以及 0
@@ -323,12 +343,19 @@ namespace Vista.Editor
         {
             var sb = new StringBuilder();
             bool ok;
+
+            // #12 在整条自检期间强制置成不生效，理由见 k_TRefHeldOff。
+            // 范围是**整条**而不只是判据 1：判据 2 的注入也跑在同一套布景上，
+            // 而 #12 只乘在我这一侧 —— 它一生效，四项注入都会带上一个共同的基线偏差。
+            var prevTRef = VistaTimeOfDay.s_DebugTRefOverride;
+            VistaTimeOfDay.s_DebugTRefOverride = k_TRefHeldOff;
             try
             {
                 ok = Validate(sb);
             }
             finally
             {
+                VistaTimeOfDay.s_DebugTRefOverride = prevTRef;
                 Shader.SetGlobalVector(s_InjectId, Vector4.zero);
                 Shader.SetGlobalVector(s_CtrlId, Vector4.zero);
                 EditorUtility.ClearProgressBar();
@@ -405,6 +432,30 @@ namespace Vista.Editor
 
                 // ── 判据 1：逐配置等价
                 sb.AppendLine("── 判据 1：各关键字配置下，我的累加 ≡ UniversalFragmentPBR");
+                // 点名一件被强制关掉的东西。不点名的话，下面一排 OK 会被读成
+                // 「#12 不改变直射光」—— 恰好是反的。这一行报的是
+                // ResolveSunTransmittanceRef() 的**实际返回值**，不是「我设过了」这句声称：
+                // 钩子若没生效（比如将来 pass 改成不走这个取值口），这里的 w 会是 1，
+                // 读报告的人立刻看得见。
+                var tRefNow = VistaTimeOfDay.ResolveSunTransmittanceRef();
+                sb.Append("　 前提：#12 逐像素太阳透射率在本自检期间**强制不生效** —— "
+                        + "实测下发值 w = ").Append(tRefNow.w.ToString("F1"))
+                  .AppendLine("（0 = 比值恒 1）。它长在 VistaComputeLighting 里且只乘我这一侧，"
+                            + "生效时两侧天然差 mainLightColor·(ratio−1)，与拷贝对不对无关。"
+                            + "所以本判据的「等价」是**在 #12 关掉的前提下**的等价；"
+                            + "#12 自己的正确性由另一条自检负责，不在这里。");
+
+                // 硬闸：钩子没生效就不要往下解释数字。
+                // 只报不判是不够的 —— 钩子失效 + 场景里有 ToD 时判据 1 会真的失败，
+                // 而那份失败的报告长得和「拷贝走歧」一模一样。归因错了比失败更贵。
+                if (tRefNow.w > 0.5f)
+                {
+                    ok = false;
+                    sb.AppendLine("　 **失败**：钩子没有生效（w = 1），本自检的前提不成立。"
+                                + "下面所有相对误差都可能只是 #12 的比值，而不是累加的差异 —— "
+                                + "先查 VistaTimeOfDay.s_DebugTRefOverride 有没有被别处覆盖、"
+                                + "以及 Sky-View pass 是否仍走 ResolveSunTransmittanceRef() 取值。");
+                }
                 // 0 档读数的可测下限：读回地板折算回相对误差。判据 1 与 1b 都用它，
                 // 所以在这里声明一次，避免两处各写一遍而悄悄写出两个不同的地板。
                 float relFloor = k_ReadbackFloor / k_RelScale;
@@ -551,9 +602,15 @@ namespace Vista.Editor
 
                     // 分子低于 NumFloor 时只能作上界报出。写成一个具体值等于宣称
                     // 量到了尺子地板以下的东西 —— 上一版正是这样解出了「负的绝对差」。
+                    //
+                    // 两条 ulp 都报：half 那条对应「payload 存进 ARGBHalf RT」那一步的量化，
+                    // fp32 那条对应「减法在写出之前完成」那一步的算术。3 档量的是后者，
+                    // 只报 half 会把半个 fp32 ulp 的差异印成 0.000 —— 一个把最强的通过
+                    // 说成「测不到」的读数。
                     string numText = Mathf.Abs(num) < NumFloor
                         ? "≤ " + NumFloor.ToString("E3") + "（低于尺子地板，只能作上界）"
-                        : num.ToString("E3") + "　= " + (num / ulp).ToString("F3") + " 个 half ulp";
+                        : num.ToString("E3") + "　= " + (num / ulp).ToString("F3") + " 个 half ulp / "
+                          + (num / VistaSelfTestNumerics.Fp32Ulp(r)).ToString("F3") + " 个 fp32 ulp";
 
                     sb.AppendLine("── 判据 1b：最坏像素归因（同配置换输出档位，六档同组渲染）");
                     sb.Append("　 像素 (").Append(worstIndex % k_Size).Append(", ")
@@ -696,8 +753,77 @@ namespace Vista.Editor
                                 + "读回 ").Append(m.ToString("E6"))
                           .AppendLine("：那是一个与地板无关的、有结构的量，换了画面它会跟着变。");
                     }
+                    // ── 粗尺子钉在地板上，细尺子给出一个**低于粗尺子地板**的读数 ──
+                    //
+                    // 这不是矛盾，是分辨力差异 —— 必须排在下面那条「只有一侧落地板」之前。
+                    // 两把尺子的可测下限实测差四个数量级：0 档是 relFloor（9.766E-006，
+                    // 由 ±1/1024 的加性地板 ÷ REL_SCALE 得来），3/4 档折算回相对量只有
+                    // NumFloor/den（≈ 1E-009，因为减法发生在写出**之前**）。
+                    // 于是「细尺子量出 6E-008、粗尺子说测不到」是**必然结果**：
+                    // 6E-008 落在粗尺子地板以下，它结构性看不见。
+                    //
+                    // ── 这条分支是为一次实测出来的失败加的，把那次读数记在这里 ──
+                    //
+                    // 像素 (126,42) 通道 b、配置①：rel0 = 6.642E-006（地板 9.766E-006 ⇒ 落地板）、
+                    // 3 档原始读数 3.098145E-001（⇒ 该档执行过）、分子 5.981E-008
+                    // （地板 9.766E-010 ⇒ **未**落地板）、分母 9.795E-001、商 6.107E-008、
+                    // 我的 == 参考 == 9.794922E-001（读得出的每一位都相同）、1/2 档相减 = 0。
+                    // 上一版把它并进了下面的矛盾分支，于是这一组读数 —— 这台尺子能给出的
+                    // 最强结论 —— 被报成了失败。教训与上面那条「拿两个上界做相对比较」同源：
+                    // **两把分辨力差几个数量级的尺子，粗尺子钉在自己的地板上、细尺子给出一个
+                    // 低于粗尺子地板的读数，只说明分辨力不同，不构成矛盾。**
+                    //
+                    // 一条必须承认的事：那次读数**没有复现**。修完之后连跑两轮，最坏像素都落在
+                    // (127,42)、分子回到 ≤ 9.766E-010，走的是上面那条「两侧同时落地板」。
+                    // 也就是说本分支覆盖的是一个**间歇**条件（最坏像素在 16384 个里只领先
+                    // 1 个，编译器/驱动的求值次序一变就换人），它在稳态下不执行。
+                    // 留着它不是为了「以防万一」—— 上面那组数字就是它的反例来源；
+                    // 但读报告的人要知道：报告里出现本分支的文字才说明它被执行过。
+                    //
+                    // 门取 2×relFloor 而不是 1×：0 档那条地板是**加性**的，真实值恰在
+                    // 一倍地板附近时 rel0 读回 0 或读回 2 倍都可能。取 1× 会在边界上
+                    // 造出一段必然误报的区间。超过 2× 还落地板，粗尺子就真的该看见
+                    // 却没看见 —— 那才是矛盾，交给下一条。
+                    // 条件里带 num > 0：分子在 shader 里是 abs() 出来的，解出负值只有一种
+                    // 解释 —— 尺子坏了（档位/缩放/偏置对不上）。不加这一项的话，一个
+                    // 大负数会满足 relCpu <= 2×relFloor 而被本分支当成**通过**吞掉，
+                    // 恰好是最危险的方向。落回下面的矛盾分支才对：那里会点名 ruler。
+                    // （读回地板造成的那点负值 |num| ≲ NumFloor，已被上一条分支接走。）
+                    else if (rel0 <= relFloor && num > 0f && relCpu <= 2f * relFloor)
+                    {
+                        sb.Append("　 归因：**细尺子量到了粗尺子结构上看不见的量** —— 0 档钉在自己的"
+                                + "地板上（≤ ").Append(relFloor.ToString("E3"))
+                          .Append("），3/4 档复算出 ").Append(relCpu.ToString("E3"))
+                          .Append("，而它的可测下限只有 ").Append((NumFloor / den).ToString("E3"))
+                          .Append("（比 0 档细 ").Append((relFloor / (NumFloor / den)).ToString("F0"))
+                          .AppendLine(" 倍）。细尺子的读数落在粗尺子地板以下，"
+                                    + "粗尺子**不可能**看见它 —— 两个读数一致，不是矛盾。");
+                        sb.Append("　 　 这个差异有多大：绝对差 ").Append(num.ToString("E3"))
+                          .Append(" = ").Append((num / VistaSelfTestNumerics.Fp32Ulp(r)).ToString("F3"))
+                          .Append(" 个 fp32 ulp（参考值 ").Append(r.ToString("E6"))
+                          .AppendLine("）。半个 ulp 量级 = 一次加法的舍入 —— 两侧同一套算术、"
+                                    + "编译器排的加法顺序不同，不是抄错。数 fp32 而不是 half："
+                                    + "3 档的减法在写出前完成，是 fp32 算的（D3D11 上 half 即 float），"
+                                    + "拿 half ulp 数它只会得到 0.000，把结论抹平成「测不到」。");
+                        sb.Append("　 　 这比「两侧同时落地板」**更强**：那一档只能给出上界，"
+                                + "这一档给出了具体的数。旁证：1/2 档读回相减 = ")
+                          .Append(dQuant.ToString("E3"))
+                          .Append("，3 档原始读数 ").Append(numRaw.ToString("E6"))
+                          .AppendLine("（远高于偏置的一半 → 该档确实执行过）。");
+                        sb.AppendLine("　 　 同样要点明那条**惰性判据**：worstAll 也钉在地板上，"
+                                    + "于是「两次渲染是不是同一幅画」那条守卫本轮无法失败"
+                                    + "（rel0 只能等于地板，不可能低于 worstAll 的一半）。"
+                                    + "本轮排除「换了画面」靠的是 1/2 档与 3 档那两个有结构的读数。");
+                    }
                     // 只有一侧落地板 → 三档量的不是同一件事，且这一次不能用相对门限
                     // 说明（其中一侧没有可比的量级），单独成一条。
+                    //
+                    // 注意上面那条新分支已经把**唯一一种无害的「只有一侧落地板」**接走了。
+                    // 剩到这里的只有两种真矛盾，方向相反：
+                    //   · 0 档落地板，而细尺子的读数**高过** 2 倍粗地板 —— 粗尺子该看见却没看见；
+                    //   · 细尺子落地板（≤ 1e-9），而 0 档报出 > 9.8e-6 —— 细尺子比粗尺子细四个
+                    //     数量级，它不可能测不到粗尺子能看见的东西。
+                    // 两种都说明三档读的不是同一组量，归因链断裂。
                     else if (rel0 <= relFloor || Mathf.Abs(num) < NumFloor)
                     {
                         ruler = true;

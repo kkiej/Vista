@@ -63,5 +63,28 @@ namespace Vista.Editor
             int e = Mathf.FloorToInt(Mathf.Log(v, 2f));
             return Mathf.Pow(2f, e - 10);             // half 有 10 位尾数
         }
+
+        /// <summary>
+        /// fp32 在 v 附近的一个 ulp。
+        ///
+        /// 为什么两条 ulp 都要有、而不是只留 half 那条：D3D11 上 HLSL 的 <c>half</c>
+        /// 就是 float，于是「写成 half3 的 payload」实际按 fp32 算、也按 fp32 存
+        /// （RT 是 <c>ARGBHalf</c> 时只有**存**那一步量化到 fp16）。
+        /// 在写出前就完成减法的档位（累加自检的 3 档）里，差值本身是 fp32 算出来的，
+        /// 拿 half ulp 去数它只会得到「0.000 个 ulp」—— 一个把最强的通过说成
+        /// 「测不到」的读数。归因需要的是 fp32 那把尺子。
+        ///
+        /// 从 <c>VistaApVariantAgreementSelfTest</c> 的私有方法提上来的：
+        /// 它在那里数深度的量化步长，与这里数舍入误差是同一条数值事实 ——
+        /// 按本文件的规矩不允许存在两份。
+        /// </summary>
+        public static float Fp32Ulp(float v)
+        {
+            v = Mathf.Abs(v);
+            const float minNormal = 1.1754944e-38f;   // 2^-126
+            if (v < minNormal) return 1.4e-45f;       // 最小非规格化
+            int e = Mathf.FloorToInt(Mathf.Log(v, 2f));
+            return Mathf.Pow(2f, e - 23);             // fp32 有 23 位尾数
+        }
     }
 }

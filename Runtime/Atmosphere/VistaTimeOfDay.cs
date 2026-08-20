@@ -141,6 +141,71 @@ namespace Vista
         /// <summary>找不到可驱动的平行光。</summary>
         public bool sunMissing => m_SunMissing;
 
+        // ==================================================================== 向渲染侧发布 T_ref
+
+        /// <summary>
+        /// 「不生效」时的 <c>_VistaSunTransmittanceRef</c>：比值恒为 1，逐像素修正整条退化成 no-op。
+        /// </summary>
+        static readonly Vector4 k_TRefInactive = new Vector4(1f, 1f, 1f, 0f);
+
+        /// <summary>
+        /// 当前生效的实例。逐像素太阳透射率要知道「<c>Light.color</c> 里已经乘进去的那份
+        /// T_ref 是多少」，而只有这个组件知道 —— 那个值是它算出来写进灯的。
+        ///
+        /// 方向与 <see cref="VistaAtmosphereFeature.current"/> 相反，这是有意的：
+        /// 那边是**配置**（渲染侧唯一真相，场景侧只读），这边是**逐帧结果**
+        /// （场景侧算出来，渲染侧读）。两个箭头反向但各自只有一份真相，
+        /// 不构成 #7 吃过的那种「两份配置漂移」。
+        ///
+        /// 多个实例时最后一个 OnEnable 的赢，与 feature 同一套规则。
+        /// </summary>
+        public static VistaTimeOfDay current { get; private set; }
+
+        Vector4 m_PublishedTRef = k_TRefInactive;
+
+        /// <summary>
+        /// 要下发到 <c>_VistaSunTransmittanceRef</c> 的值。
+        /// xyz = 写进 <c>Light.color</c> 的那份 T_ref，w = 1 表示逐像素修正可以生效。
+        /// </summary>
+        public Vector4 publishedSunTransmittanceRef => m_PublishedTRef;
+
+        /// <summary>
+        /// 自检覆写：非 null 时 <see cref="ResolveSunTransmittanceRef"/> 直接返回它，
+        /// 绕开组件的逐帧发布。
+        /// </summary>
+        /// <remarks>
+        /// 为什么必须是这里的一个钩子、而不是自检自己 <c>Shader.SetGlobalVector</c>：
+        /// <c>_VistaSunTransmittanceRef</c> 由 Sky-View pass **每帧无条件下发**
+        /// （理由见 AtmosphereDef.hlsl 里那个变量的注释）。自检从外面写一次全局，
+        /// 下一帧就被 pass 覆盖回去 —— 而自检恰恰要渲好几帧。所以要控制它，
+        /// 只能控制 pass 读的那个源头。
+        ///
+        /// 判据需要这个钩子的具体理由：#12 的隔离要把同一个布景在 w=0 与 w=1
+        /// 两种状态下各渲一遍求差。w 由「T_ref 有没有非零通道」推出来，
+        /// 而那取决于太阳高度 —— 靠改时刻去凑 w=0 会同时改掉 T 本身，
+        /// 两遍就不止差一件事了。
+        ///
+        /// 与 <see cref="VistaAerialPerspectiveCompositePass.s_DebugDistanceOutput"/>
+        /// 同一套约定：静态、默认 null、没有任何运行时代码写它、自检在 finally 里复位。
+        /// </remarks>
+        public static Vector4? s_DebugTRefOverride;
+
+        /// <summary>
+        /// 渲染侧的取值口。没有实例、或实例没在驱动光色时给「不生效」。
+        ///
+        /// 为什么不直接读 <see cref="lastLightParams"/>：那个字段在 <c>m_DriveColor</c>
+        /// 关掉时会**停在上一次的值**（它是诊断用的），拿它当 T_ref 会在关掉光色驱动之后
+        /// 继续拿一个过期的分母去除 —— 症状是「关掉某开关后画面才坏」。
+        /// 所以发布用一个专门的字段，只在两个地方写：<c>Apply</c> 开头置「不生效」、
+        /// 真正写完灯之后置「生效」。任何提前返回都会留下正确的值。
+        /// </summary>
+        public static Vector4 ResolveSunTransmittanceRef()
+        {
+            if (s_DebugTRefOverride.HasValue)
+                return s_DebugTRefOverride.Value;
+            return current != null ? current.m_PublishedTRef : k_TRefInactive;
+        }
+
         // ==================================================================== 可编程接口
 
         /// <summary>当地时钟时间（小时）。Timeline / 演示脚本驱动这一个值即可。</summary>
@@ -172,7 +237,20 @@ namespace Vista
 
         // ==================================================================== 生命周期
 
-        void OnEnable() => Apply();
+        void OnEnable()
+        {
+            current = this;
+            Apply();
+        }
+
+        void OnDisable()
+        {
+            if (current == this)
+                current = null;
+            // 自己也清一遍：组件被禁用而不是销毁时字段还在，下次 OnEnable 到 Apply 之间
+            // 若有一帧渲染，读到的必须是「不生效」而不是禁用前那个分母。
+            m_PublishedTRef = k_TRefInactive;
+        }
 
         void Update() => Apply();
 
@@ -205,6 +283,11 @@ namespace Vista
         /// </summary>
         public void Apply()
         {
+            // 先置「不生效」：下面每一条提前返回都意味着「这一帧没有把 T 乘进灯」，
+            // 而那种情况下逐像素修正必须退化成 no-op。放在最前面，就不需要在
+            // 每个 return 前各记一次 —— 少一处漏写的机会。
+            m_PublishedTRef = k_TRefInactive;
+
             m_LastSolar = VistaSolarPosition.Evaluate(
                 m_Year, m_Month, m_Day, m_LocalHours,
                 m_Latitude, m_Longitude, m_UtcOffsetHours);
@@ -246,6 +329,18 @@ namespace Vista
                 p, transmittance, VistaAtmosphereViewData.ExposureFromEV100(feature.ev100));
 
             ApplyLightParams(sun, m_LastLight);
+
+            // 发布分母。条件是「T_ref 至少有一个通道不为 0」——
+            // 太阳落到参考高度的地平线以下时 Evaluate 返回全 0（见 k_MinMuSun），
+            // 那一刻 Light.color 也是 0，除法没有任何可恢复的东西，
+            // 与其让 shader 去靠下限兜住 0/0，不如在这里明确宣布「不生效」。
+            // 数值下限（VISTA_T_REF_FLOOR）留着兜逐通道下溢（切线处蓝通道只有 5e-5），
+            // 两层各管一件事：这里是语义闸门，那里是数值闸门。
+            bool hasTransmittance =
+                transmittance.x > 0f || transmittance.y > 0f || transmittance.z > 0f;
+            if (hasTransmittance)
+                m_PublishedTRef = new Vector4(
+                    transmittance.x, transmittance.y, transmittance.z, 1f);
         }
 
         /// <summary>

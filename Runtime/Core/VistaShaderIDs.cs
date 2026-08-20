@@ -33,6 +33,12 @@ namespace Vista
         public static readonly int _VistaApFlags               = Shader.PropertyToID("_VistaApFlags");
         public static readonly int _VistaApConsumer            = Shader.PropertyToID("_VistaApConsumer");
 
+        /// <summary>
+        /// 平行光颜色里已含的那一份太阳透射率（参考高度处）。xyz = T_ref，w = 逐像素修正是否生效。
+        /// 与 <c>_VistaApConsumer</c> 同理，**每帧无条件下发**。
+        /// </summary>
+        public static readonly int _VistaSunTransmittanceRef   = Shader.PropertyToID("_VistaSunTransmittanceRef");
+
         // ---- Atmosphere: LUT 绑定点 ----
         public static readonly int _VistaTransmittanceLut       = Shader.PropertyToID("_VistaTransmittanceLut");
         public static readonly int _VistaTransmittanceLutRW     = Shader.PropertyToID("_VistaTransmittanceLutRW");

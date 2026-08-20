@@ -697,14 +697,7 @@ namespace Vista.Editor
             return clip.z / clip.w;
         }
 
-        static float Fp32Ulp(float v)
-        {
-            v = Mathf.Abs(v);
-            const float minNormal = 1.1754944e-38f;
-            if (v < minNormal) return 1.4e-45f;
-            int e = Mathf.FloorToInt(Mathf.Log(v, 2f));
-            return Mathf.Pow(2f, e - 23);
-        }
+        static float Fp32Ulp(float v) => VistaSelfTestNumerics.Fp32Ulp(v);
 
         // ────────────────────────────────────────────────────────────────
         // 判据②a：Δd

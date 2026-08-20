@@ -38,6 +38,8 @@ namespace Vista
             public VistaSkyReflectionMode reflectionMode;
             /// <summary>见 SkyView pass 里填这个字段处的注释。</summary>
             public Vector4 apConsumer;
+            /// <summary>同上，同一条「每帧无条件下发」的理由。</summary>
+            public Vector4 sunTransmittanceRef;
             public TextureHandle transmittance;
             public TextureHandle multiScattering;
             public TextureHandle skyView;
@@ -230,6 +232,17 @@ namespace Vista
                     ? m_ApSettings.PackedConsumer(apEnabled)
                     : Vector4.zero;
 
+                // 逐像素太阳透射率的分母，同样**每帧无条件下发**（理由同上一段）。
+                //
+                // 值来自场景侧的 VistaTimeOfDay —— 它算出 T_ref 并写进 Light.color，
+                // 这里读的就是**同一次** Evaluate 的结果，不重算。理由是着色端要靠
+                // 「分母与 Light.color 里那个因子是同一个 float」把 CPU 那份 T 整项约掉，
+                // 最终只留下 GPU LUT 那一份（详见 AtmosphereDef.hlsl 里
+                // _VistaSunTransmittanceRef 的注释）。重算一份就约不掉了。
+                //
+                // 组件不在 / 没在驱动光色时给 (1,1,1,0)，比值恒为 1，整条退化成 no-op。
+                data.sunTransmittanceRef = VistaTimeOfDay.ResolveSunTransmittanceRef();
+
                 builder.UseTexture(transmittance, AccessFlags.Read);
                 builder.UseTexture(multiScattering, AccessFlags.Read);
                 builder.UseTexture(skyView, AccessFlags.Write);
@@ -253,6 +266,8 @@ namespace Vista
                     d.luts.RenderSkyViewLut(
                         new VistaGraphLutDispatcher(ctx.cmd, Handles(d)), d.view);
                     ctx.cmd.SetGlobalVector(VistaShaderIDs._VistaApConsumer, d.apConsumer);
+                    ctx.cmd.SetGlobalVector(
+                        VistaShaderIDs._VistaSunTransmittanceRef, d.sunTransmittanceRef);
                 });
             }
 
