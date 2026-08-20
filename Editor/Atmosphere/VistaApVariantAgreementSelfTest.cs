@@ -269,6 +269,7 @@ namespace Vista.Editor
             var prevMode = ap.compositeMode;
             bool prevFog = RenderSettings.fog;
             bool prevDebugPass = VistaAerialPerspectiveCompositePass.s_DebugDistanceOutput;
+            var prevSun = RenderSettings.sun;
 
             RenderTexture rtColor = null, rtDist = null;
             Texture2D readback = null;
@@ -296,7 +297,11 @@ namespace Vista.Editor
                 readback = new Texture2D(k_Size, k_Size, TextureFormat.RGBAFloat, false, true);
 
                 Build(litShader, layer, feature.groundLevelWorldY, rtColor,
-                      out root, out Camera cam, out mat, out Transform[] quads);
+                      out root, out Camera cam, out mat, out Transform[] quads,
+                      out Light sunLight);
+                // 接管主光。不接管的话主光是「当前打开的场景里的太阳」，两条判据的结论
+                // 不变（两个变体读同一个主光），但读数随场景变化而报告里看不出来。
+                RenderSettings.sun = sunLight;
 
                 Vector3 eye = cam.transform.position;
                 var known = new float[k_Columns];
@@ -308,6 +313,13 @@ namespace Vista.Editor
                   .Append("（颜色 ARGBHalf / 距离 ARGBFloat）")
                   .Append("　FOV = ").Append(k_Fov).Append('°')
                   .Append("　相机海拔 = ").Append(k_CameraAltitudeM).Append(" m")
+                  .AppendLine();
+                // 报的是**接管之后实际读回的**那盏灯，不是「我设过了」这句声称：
+                // 若别处（比如 VistaTimeOfDay 的 Update）把它抢回去，这一行会当场露出来。
+                sb.Append("　 临时状态：RenderSettings.fog ").Append(prevFog).Append(" → False")
+                  .Append("　RenderSettings.sun ")
+                  .Append(prevSun == null ? "(无)" : prevSun.name).Append(" → 实测 ")
+                  .Append(RenderSettings.sun == null ? "(无)" : RenderSettings.sun.name)
                   .AppendLine();
                 sb.Append("　 正对面板 ").Append(k_Columns).Append(" 列，径向距离 ")
                   .Append(known[0].ToString("F1")).Append(" m → ")
@@ -508,6 +520,9 @@ namespace Vista.Editor
                 ap.compositeMode = prevMode;
                 RenderSettings.fog = prevFog;
                 VistaAerialPerspectiveCompositePass.s_DebugDistanceOutput = prevDebugPass;
+                // 在销毁布景**之前**还原：sun 指着即将被销毁的那盏灯，
+                // 反过来会留下一小段「sun 指向已销毁对象」的窗口。
+                RenderSettings.sun = prevSun;
 
                 if (mat != null) mat.DisableKeyword("VISTA_AP_DEBUG_DISTANCE");
                 if (root != null) Object.DestroyImmediate(root);
@@ -1021,7 +1036,8 @@ namespace Vista.Editor
         }
 
         static void Build(Shader litShader, int layer, float groundLevelWorldY, RenderTexture rt,
-                          out GameObject root, out Camera cam, out Material mat, out Transform[] quads)
+                          out GameObject root, out Camera cam, out Material mat, out Transform[] quads,
+                          out Light sunLight)
         {
             root = new GameObject("Vista AP Variant Agreement Probe") { hideFlags = HideFlags.HideAndDontSave };
             root.transform.position = new Vector3(0f, groundLevelWorldY + k_CameraAltitudeM, 0f);
@@ -1053,8 +1069,15 @@ namespace Vista.Editor
 
             SetTarget(cam, rt, k_ColorSentinel);
 
-            // ── 自带太阳，挂在探针 layer 上（场景那盏不在 cullingMask 里，会被剔掉）。
-            //    于是 URP 的主光就是这一盏，也完全不必动全局 RenderSettings.sun。
+            // ── 自带太阳，挂在探针 layer 上。
+            //
+            // 注意「挂在探针 layer 上」**保证不了**它是 URP 的主光：平行光不因为 layer
+            // 不在相机 cullingMask 里就从 visibleLights 里消失，而 GetMainLightIndex
+            // 第一条规则是「等于 RenderSettings.sun 的那盏直接返回」。所以调用方要
+            // 临时把 RenderSettings.sun 指过来（见 Validate 里的保存/还原）。
+            // 这条对本自检的两条判据（A/B 逐像素一致、距离连续性）不改变结论 ——
+            // 两个变体读的是同一个主光 —— 但不接管的话读数会随**当前打开的场景**变化，
+            // 而报告里看不出这个前提。（这条是 #12 的自检实测出来的。）
             var lightGo = new GameObject("Sun") { hideFlags = HideFlags.HideAndDontSave };
             lightGo.transform.SetParent(root.transform, false);
             lightGo.layer = layer;
@@ -1064,6 +1087,7 @@ namespace Vista.Editor
             light.intensity = 1f;
             // 与 AP 数值验收用同一组角度：侧逆光远景，Mie 峰值之外但散射够强。
             lightGo.transform.localRotation = Quaternion.Euler(25f, 150f, 0f);
+            sunLight = light;
 
             // ── 材质：一份，所有几何共用。
             //

@@ -402,6 +402,12 @@ namespace Vista.Editor
             Texture2D readback = null;
             GameObject root = null;
             Material mat = null;
+            // 本自检要临时接管 URP 的主光。理由不是整洁，是**可复现性**：
+            // 不接管的话主光是「当前打开的那个场景里的太阳」，于是这条自检的读数
+            // 随场景变化，而报告里看不出这个前提。实测（10/11 归因档）在接管前
+            // 主光方向是 (-0.6538, 0.7539, -0.0444)、色是 (0.8926, 0.8018, 0.6748)
+            // —— 布景那盏是纯白、方向 (-0.2531, 0.5736, -0.7791)，两者毫无关系。
+            var prevSun = RenderSettings.sun;
 
             try
             {
@@ -410,7 +416,8 @@ namespace Vista.Editor
                 readback = new Texture2D(k_Size, k_Size, TextureFormat.RGBAFloat, false, true);
 
                 Build(shader, layer, rt, out root, out Camera cam, out var camData,
-                      out mat, out Light[] pointLights);
+                      out mat, out Light[] pointLights, out Light sunLight);
+                RenderSettings.sun = sunLight;
 
                 sb.Append("── 布景　layer = ").Append(layer)
                   .Append("　RT = ").Append(k_Size).Append('×').Append(k_Size).Append(" ARGBHalf")
@@ -427,6 +434,98 @@ namespace Vista.Editor
                   .AppendLine("　（拆分只改控制流、不改算术，所以期望值是 0，"
                             + "而不是「落在精度内」—— 若量到 fp16 地板量级的非零，"
                             + "说明两侧的求值顺序被编译器排得不同，那本身值得查）");
+
+                // ── 归因（不参与判据）：URP 这一帧实际选中的主光是哪一盏。
+                //
+                // 为什么这一行必须存在：Build 里那句「太阳从相机后上方打过来，
+                // 好让球体的影子落在背板上」是一条**覆盖性断言** —— 它声称阴影分支
+                // 被覆盖了。而这条断言成立的前提是「布景那盏灯就是主光」，
+                // 那个前提靠 layer 隔离**保证不了**（理由见 Build 里的注释）。
+                // 断言若不成立，症状不是失败而是「判据 1 照样全绿，只是绿在一条
+                // 没有阴影的路径上」—— 一次覆盖范围的静默缩小，最难发现的那一类。
+                //
+                // 读的是 shader 里的 10/11 档而不是 C# 侧的 Shader.GetGlobalVector：
+                // 那两处读的不是同一个东西（前者是「本次渲染着色器看到了什么」，
+                // 后者是「现在 CPU 全局表里存着什么」）。
+                Apply(k_Configs[0], mat, camData, pointLights);
+                Shader.SetGlobalVector(s_CtrlId, new Vector4(10f, 0f, 0f, 0f));
+                Warmup(cam);
+                var mainDirRaw = RenderAndRead(cam, rt, readback)[k_Size / 2 * k_Size + k_Size / 2];
+                Shader.SetGlobalVector(s_CtrlId, new Vector4(11f, 0f, 0f, 0f));
+                Warmup(cam);
+                var mainColRaw = RenderAndRead(cam, rt, readback)[k_Size / 2 * k_Size + k_Size / 2];
+                Shader.SetGlobalVector(s_CtrlId, Vector4.zero);
+
+                // 10 档在 shader 里做了 *0.5+0.5 偏置（负分量不能与「未覆盖」混淆）。
+                var mainDir = new Vector3(mainDirRaw.r * 2f - 1f,
+                                          mainDirRaw.g * 2f - 1f,
+                                          mainDirRaw.b * 2f - 1f);
+                Vector3 rigDir = -sunLight.transform.forward;
+                float dirGap = Mathf.Max(Mathf.Abs(mainDir.x - rigDir.x),
+                                Mathf.Max(Mathf.Abs(mainDir.y - rigDir.y),
+                                          Mathf.Abs(mainDir.z - rigDir.z)));
+                sb.Append("── 归因　URP 主光　_MainLightPosition = (")
+                  .Append(mainDir.x.ToString("F4")).Append(", ")
+                  .Append(mainDir.y.ToString("F4")).Append(", ")
+                  .Append(mainDir.z.ToString("F4")).Append(")　布景那盏 = (")
+                  .Append(rigDir.x.ToString("F4")).Append(", ")
+                  .Append(rigDir.y.ToString("F4")).Append(", ")
+                  .Append(rigDir.z.ToString("F4")).Append(")　最大分量差 = ")
+                  .Append(dirGap.ToString("E3"))
+                  .Append("　_MainLightColor = (")
+                  .Append(mainColRaw.r.ToString("F4")).Append(", ")
+                  .Append(mainColRaw.g.ToString("F4")).Append(", ")
+                  .Append(mainColRaw.b.ToString("F4")).Append(')')
+                  .AppendLine();
+                sb.Append("　 怎么读：分量差远大于 ")
+                  .Append((2f * k_ReadbackFloor).ToString("E3"))
+                  .Append("（10 档解码把读回地板放大 2 倍）说明**接管没生效** —— "
+                        + "URP 选中的不是布景那盏，于是 Build 里「影子落在背板上」这条"
+                        + "覆盖性断言不成立，且读数会随当前打开的场景变化；"
+                        + "主光色若接近 0，则任何「乘在主光上」的判据都乘在零上，是空判。")
+                  .AppendLine();
+
+                // ── 覆盖性**测量**（不参与判据）：主光阴影到底有没有让某些像素变暗。
+                //
+                // 为什么要量而不是断言：配置 ①/② 的关键字表都是空的，两者唯一的差别是
+                // camData.renderShadows。所以「② 覆盖了阴影分支」这句话有两层含义，
+                // 而它们的强度差很远 ——
+                //   · 弱：_MAIN_LIGHT_SHADOWS 编进去了、那段代码跑了；
+                //   · 强：它算出的 shadowAttenuation 真的 < 1，即真有像素落在阴影里。
+                // 只有强的那层才让「阴影分支被比对过」有意义：若一个像素都没被遮住，
+                // 那段代码每次都返回 1，与没有阴影的路径在数值上完全一样，
+                // 判据 1 在 ② 上的通过就只是在 ① 上的通过又跑了一遍。
+                // 这里量的是强的那层：①/② 两次渲染的**逐像素最大差**。
+                Apply(k_Configs[0], mat, camData, pointLights);
+                Shader.SetGlobalVector(s_CtrlId, new Vector4(1f, 0f, 0f, 0f));
+                Warmup(cam);
+                var shadowOff = RenderAndRead(cam, rt, readback);
+                Apply(k_Configs[1], mat, camData, pointLights);
+                Warmup(cam);
+                var shadowOn = RenderAndRead(cam, rt, readback);
+                Shader.SetGlobalVector(s_CtrlId, Vector4.zero);
+
+                float shadowMaxDiff = 0f;
+                int shadowDiffPixels = 0;
+                for (int i = 0; i < shadowOff.Length; i++)
+                {
+                    Color a = shadowOff[i], b = shadowOn[i];
+                    if (Mathf.Max(a.r, Mathf.Max(a.g, a.b)) >= k_SentinelGate) continue;
+                    if (Mathf.Max(b.r, Mathf.Max(b.g, b.b)) >= k_SentinelGate) continue;
+                    float d = Mathf.Max(Mathf.Abs(a.r - b.r),
+                              Mathf.Max(Mathf.Abs(a.g - b.g), Mathf.Abs(a.b - b.b)));
+                    if (d > k_ReadbackFloor) shadowDiffPixels++;
+                    shadowMaxDiff = Mathf.Max(shadowMaxDiff, d);
+                }
+                sb.Append("── 覆盖　主光阴影　配置①(关) vs ②(开) 的逐像素最大差 = ")
+                  .Append(shadowMaxDiff.ToString("E3"))
+                  .Append("　超地板(").Append(k_ReadbackFloor.ToString("E3"))
+                  .Append(")的像素 ").Append(shadowDiffPixels).Append('/').Append(shadowOff.Length)
+                  .AppendLine();
+                if (shadowDiffPixels == 0)
+                    sb.AppendLine("　 　 **没有任何像素因阴影而改变** —— shadowAttenuation 恒为 1，"
+                                + "配置 ② 在数值上与 ① 等同，「阴影分支被比对过」这句话"
+                                + "只在「代码编进去了」这个弱含义上成立，记为部分未覆盖。");
 
                 bool ok = true;
 
@@ -905,6 +1004,7 @@ namespace Vista.Editor
 
                 string[] termNames = { "mainLightColor", "additionalLightsColor", "giColor", "vertexLightingColor" };
                 var detected = new float[4];
+                var detectedX10 = new float[4];
                 int liveTerms = 0;
                 for (int t = 0; t < 4; t++)
                 {
@@ -916,6 +1016,27 @@ namespace Vista.Editor
                     Measure(px, out detected[t], out int sentinel, out _, out _, out _);
                     if (sentinel > 0) detected[t] = float.NaN;
                     if (detected[t] > k_RelTol) liveTerms++;
+
+                    // ── 同一项再注一次 10 倍，只为了检验「占比」这个读数本身可不可信。
+                    //
+                    // 按代数，报出的相对误差 = δ·X / max(|参考|, 分母下限)，对 δ 是
+                    // **严格线性**的，所以 报出/δ（即占比）应当与 δ 无关。它若随 δ 变，
+                    // 只可能有两个原因，而两者都会让占比这个数失去意义：
+                    //   · 分母下限被触发（参考值 ≲ 1e-3）—— 那时报出的不是相对误差，
+                    //     占比也不是占比；
+                    //   · 取最大值的那个像素换了地方 —— 那时两次报的是两个不同像素的占比。
+                    //
+                    // 为什么这一条非做不可：本轮 giColor 报出 1.000E-002，而判定门是
+                    // 1.000E-002，占比恰好 50.00% = 门/注入。一个正好落在门上的读数，
+                    // 判定由打印出来的最后一位决定 —— 本项目已经被这种形态咬过
+                    //（尺子地板与期望值同量级时，尺子会替被测对象伪造一个结论）。
+                    // 与其解释这个巧合，不如换一把刻度不同的尺子再量一次。
+                    v[t] = k_Inject * 10f;
+                    Shader.SetGlobalVector(s_InjectId, v);
+                    Warmup(cam);
+                    var pxX10 = RenderAndRead(cam, rt, readback);
+                    Measure(pxX10, out detectedX10[t], out int sentinelX10, out _, out _, out _);
+                    if (sentinelX10 > 0) detectedX10[t] = float.NaN;
                 }
                 Shader.SetGlobalVector(s_InjectId, Vector4.zero);
 
@@ -924,19 +1045,72 @@ namespace Vista.Editor
                     bool broken = float.IsNaN(detected[t]);
                     bool live = detected[t] > k_RelTol;
 
-                    // 三态，不是两态：把「布景坏了」和「这一项没参与」分开报。
-                    // 合成一个「未覆盖」会把一次真实故障说成一句无害的说明。
+                    // ── 把「未覆盖」这个判定拆成两件事，因为它们差三个数量级。
+                    //
+                    // 注入 δ 在第 t 项上，报出的相对误差就是 δ·X/total（X 是该项的值），
+                    // 所以 detected/δ **就是该项在最佳像素上的占比** —— 一个可读的量，
+                    // 不需要再猜。于是「报不出来」有两种完全不同的成因：
+                    //   · 占比 ≈ 0：这一项这一帧真的没参与，判据 1 在它上面是空判；
+                    //   · 占比不小、只是 δ·占比 落在判据 1 自己的门之下：这一项**参与了**，
+                    //     判据 1 对它的灵敏度不够，一个 δ 量级的错误会被它放过。
+                    //
+                    // 上一版把两者都写成「为 0 或占比低于 1%」。那句话在第二种情形下是
+                    // 错的，而且错得很具体：本轮 giColor 占比 50%，被那句话说成 < 1%，
+                    // 差 50 倍。更糟的是它指向的修法也是错的（去查这一项为什么没参与，
+                    // 而真正该做的是把该项在布景里的占比抬高、或承认灵敏度上限）。
+                    float share = detected[t] / k_Inject;
+                    bool shareAtFloor = detected[t] <= relFloor;
+
+                    // 三态的判定不变（live 与否决定判据 1 的结论作用域），
+                    // 变的是**说法**：把成因分开，并给出占比这个读数。
                     sb.Append("　 ")
-                      .Append(broken ? "**布景坏** " : live ? "有分辨力 " : "未覆盖　  ")
+                      .Append(broken ? "**布景坏** " : live ? "有分辨力 " : "灵敏度不足  ")
                       .Append(termNames[t].PadRight(22))
                       .Append("注入 2% → 报出 ")
                       .Append(broken ? "（出现哨兵像素，本项无法判定）"
-                            : detected[t] <= relFloor
+                            : shareAtFloor
                               ? "≤ " + relFloor.ToString("E3") + "（尺子地板，上界）"
                               : detected[t].ToString("E3"));
+                    if (!broken)
+                        sb.Append("　该项占比 ")
+                          .Append(shareAtFloor ? "≤ " : "= ")
+                          .Append((share * 100f).ToString("F2")).Append('%');
+
+                    // ── 占比这个读数的交叉验证：换 10 倍注入再量一次。
+                    //
+                    // 报的是**两次的占比之差**，而不是「两次读数之比是不是 10」：
+                    // 后者在读数落到尺子地板上时会自动成立（地板/地板 = 1，
+                    // 看起来只是"比值不对"，却不指向原因），前者在两种失效下都会张开。
+                    bool bothBroken = broken || float.IsNaN(detectedX10[t]);
+                    float shareX10 = detectedX10[t] / (k_Inject * 10f);
+                    if (!bothBroken)
+                    {
+                        float shareGap = Mathf.Abs(shareX10 - share);
+                        // 容差：×1 那一档的读数被地板抬高 relFloor，折算到占比是
+                        // relFloor/δ；×10 那一档的地板折算量小 10 倍，取大的那个。
+                        float shareTol = relFloor / k_Inject;
+                        sb.Append("　（×10 注入复量 ")
+                          .Append((shareX10 * 100f).ToString("F2")).Append("%，差 ")
+                          .Append((shareGap * 100f).ToString("F2")).Append("pp）");
+                        if (shareGap > shareTol)
+                            sb.Append("　← **占比这个读数不可信**：占比按代数对注入量"
+                                    + "严格线性，随 δ 变只能是分母下限被触发"
+                                    + "（参考值 ≲ 1e-3）或最大值像素换了地方 —— "
+                                    + "两种情形下「占比」都不再是占比");
+                    }
+
                     if (!broken && !live)
-                        sb.Append("　← 这一项在本帧为 0 或占比低于 1%，"
-                                + "所以它在判据 1 里的「通过」不可采信");
+                    {
+                        // 占比自己就把成因分开了：低于注入量与判据门之比（1%/2% = 50%）
+                        // 才可能落在门下，而落在尺子地板上则是「真的没参与」。
+                        sb.Append(shareAtFloor
+                            ? "　← 这一项在本帧**没有参与**（占比落在尺子地板以下），"
+                            + "判据 1 在它上面是 0 == 0 的空判"
+                            : "　← 这一项**参与了**，但 2% × 占比 落在判据 1 自己的 1% 门"
+                            + "之下（门/注入 = 50%，占比不足 50% 的项必然如此）—— "
+                            + "判据 1 会放过该项里一个 2% 量级的错误。想覆盖它得把该项"
+                            + "在布景里的占比抬到 50% 以上，而不是去查它为什么没参与");
+                    }
                     sb.AppendLine();
                     if (broken) ok = false;
                 }
@@ -975,6 +1149,10 @@ namespace Vista.Editor
             }
             finally
             {
+                // 先还原全局、再销毁布景：RenderSettings.sun 指着即将被销毁的那盏灯，
+                // 反过来的话中间有一小段「sun 指向已销毁对象」的窗口，
+                // 那条窗口里任何一次编辑器重绘都会把它当成「没有太阳」。
+                RenderSettings.sun = prevSun;
                 if (root != null) Object.DestroyImmediate(root);
                 if (mat != null) Object.DestroyImmediate(mat);
                 if (readback != null) Object.DestroyImmediate(readback);
@@ -1004,7 +1182,8 @@ namespace Vista.Editor
         static void Build(Shader shader, int layer, RenderTexture rt,
                           out GameObject root, out Camera cam,
                           out UniversalAdditionalCameraData camData,
-                          out Material mat, out Light[] pointLights)
+                          out Material mat, out Light[] pointLights,
+                          out Light sunLight)
         {
             root = new GameObject("Vista Lit Accumulation Probe") { hideFlags = HideFlags.HideAndDontSave };
 
@@ -1038,6 +1217,13 @@ namespace Vista.Editor
             camData.antialiasing = AntialiasingMode.None;
 
             // ── 太阳。从相机后上方打过来，好让球体的影子落在背板上（覆盖阴影分支）。
+            //
+            // 注意「这盏灯就是 URP 的主光」**不是**自动成立的，也不能靠 layer 隔离来保证：
+            // 平行光不因为 layer 不在相机 cullingMask 里就从 visibleLights 里消失，
+            // 而 URP 的 GetMainLightIndex 第一条规则是「等于 RenderSettings.sun 的那盏
+            // 直接返回」。所以调用方要么把 RenderSettings.sun 指过来，要么承认
+            // 上面那句「影子落在背板上」只是**期望**而非事实。
+            // （这条是 #12 的自检实测出来的，那里三条判据一起被这个盲点带偏。）
             var lightGo = new GameObject("Sun") { hideFlags = HideFlags.HideAndDontSave };
             lightGo.transform.SetParent(root.transform, false);
             lightGo.layer = layer;
@@ -1046,6 +1232,7 @@ namespace Vista.Editor
             sun.intensity = 1.4f;
             sun.shadows = LightShadows.Soft;
             lightGo.transform.localRotation = Quaternion.Euler(35f, 18f, 0f);
+            sunLight = sun;
 
             // ── 两盏点光。位置一左一右贴着球，保证球面上有它们的贡献。
             pointLights = new Light[2];
