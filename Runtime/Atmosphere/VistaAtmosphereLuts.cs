@@ -402,26 +402,53 @@ namespace Vista
                 AllocateAerialPerspective(settings);
                 m_AllocatedAp = settings.Clone();
             }
+
+            // AP 核从 #18 起要读天光 SH（雾的环境项），所以在这里就把 buffer 备好 ——
+            // **不依赖** SH pass 有没有排入。SH pass 是可以关掉的（reflectionMode 的
+            // AmbientSh 档之外并不强制开），而 AP 核里那次 StructuredBuffer 读是无条件的。
+            EnsureSkyAmbientShBuffer();
             return true;
         }
 
         /// <summary>
-        /// 记录期调用：按需分配天空环境光 SH 缓冲（9 × float4 = 144 B）。
+        /// 按需分配天空环境光 SH 缓冲（9 × float4 = 144 B）并清零。
+        ///
+        /// **与 SH 投影核是否存在无关**，这是刻意的。雾的环境项（#18）要在 AP 核里
+        /// 读这个 buffer，而 AP 核与 SH 核在同一个 .compute 里 —— 于是「SH 核缺失时
+        /// AP 核也一定缺失」在今天恰好成立，把绑定挂在 <see cref="isSkyAmbientShValid"/>
+        /// 上今天也不会出错。但那是靠一个隔离机制间接保证的覆盖性断言：
+        /// 它失效的症状不是报错，而是判据在一条更窄的路径上照样全绿。
+        /// 所以这里把「buffer 恒可绑」做成无条件的事实，退化态是**清零**
+        /// （= 没有环境项），而不是未初始化的垃圾数据。
+        ///
+        /// SetData 只在分配那一次做：buffer 的内容此后由 SH 核每帧覆写，
+        /// 每帧清零会凭空多一次 144 B 的上传，而且会和 SH 核抢同一份数据。
         /// </summary>
-        /// <returns>SH 是否可用。false 时下游应回退到 URP 自带的环境光。</returns>
-        public bool PrepareSkyAmbientSh()
+        public void EnsureSkyAmbientShBuffer()
         {
-            if (!isSkyAmbientShValid) return false;
+            if (m_SkyAmbientSh != null) return;
 
             // Structured 而不是 Constant：数据是 GPU 产出的，走 constant buffer 就得先回 CPU
             // 再 SetGlobalVector 九次，凭空引入一帧以上的延迟 —— 而"天空变了间接光没跟上"
             // 正是这个模块要消灭的问题。stride 16 = float4，与 HLSL 侧 StructuredBuffer<float4> 对齐。
-            m_SkyAmbientSh ??= new GraphicsBuffer(
+            m_SkyAmbientSh = new GraphicsBuffer(
                 GraphicsBuffer.Target.Structured, k_ShCoeffCount, sizeof(float) * 4)
             {
                 name = "VistaSkyAmbientSh",
             };
-            return true;
+            m_SkyAmbientSh.SetData(new Vector4[k_ShCoeffCount]);
+        }
+
+        /// <summary>
+        /// 记录期调用：确保天空环境光 SH 缓冲存在。
+        /// </summary>
+        /// <returns>SH **投影**是否可用。false 时下游应回退到 URP 自带的环境光；
+        /// 注意 buffer 本身在返回 false 时也已分配好并清零，见
+        /// <see cref="EnsureSkyAmbientShBuffer"/>。</returns>
+        public bool PrepareSkyAmbientSh()
+        {
+            EnsureSkyAmbientShBuffer();
+            return isSkyAmbientShValid;
         }
 
         /// <summary>
@@ -871,8 +898,13 @@ namespace Vista
         /// 这样才能在同一帧里 A/B 两条路径 —— 也是自检能量化两者差值的前提。
         /// 多写一张 32³ fp16 的代价是 256 KB 与约 0.02 ms，不值得为它引入分支。
         /// </summary>
+        /// <param name="fog">
+        /// 雾配置。null / Off 档时下发零态，AP 表逐位等于没有雾（见 <c>FogMedium.hlsl</c>）。
+        /// **无条件下发**，包括关雾的那一帧 —— 跳过下发会让核拿着上一帧的 σ_t 继续算。
+        /// </param>
         public void RenderAerialPerspectiveLut<T>(
-            T d, in VistaAtmosphereViewData view, VistaAerialPerspectiveSettings settings)
+            T d, in VistaAtmosphereViewData view, VistaAerialPerspectiveSettings settings,
+            VistaFogSettings fog)
             where T : struct, IVistaLutDispatcher
         {
             if (!isAerialPerspectiveValid || m_ApScatter == null) return;
@@ -886,6 +918,7 @@ namespace Vista
             //   误差曲线一个数都没变，因为核根本没看到新视图。）
             view.Bind(d, m_SkyViewWidth, m_SkyViewHeight);
             view.BindAerialPerspective(d, settings);
+            view.BindFog(d, fog);
 
             d.SetTexture(m_LutCS, m_KernelApIdx,
                 VistaShaderIDs._VistaTransmittanceLut, VistaLutSlot.Transmittance);
@@ -895,6 +928,13 @@ namespace Vista
                 VistaShaderIDs._VistaApScatterLutRW, VistaLutSlot.ApScatter);
             d.SetTexture(m_LutCS, m_KernelApIdx,
                 VistaShaderIDs._VistaApTransmittanceLutRW, VistaLutSlot.ApTransmittance);
+            // 雾的天光环境项要读它。恒可绑（EnsureSkyAmbientShBuffer 与核是否存在无关），
+            // 所以退化态是"没有环境项"而不是"读到未初始化的数据"。
+            // 不按 fog.enabled 条件绑：那样关雾的帧会漏绑，而 HLSL 侧的
+            // VistaLoadSkyAmbientSh 是无条件读的，Unity 会每帧刷
+            // "Property _VistaSkyAmbientSh is not set" —— 一条真错误会被这堆噪声埋掉。
+            d.SetBuffer(m_LutCS, m_KernelApIdx,
+                VistaShaderIDs._VistaSkyAmbientSh, VistaLutBufferSlot.SkyAmbientSh);
 
             // 一个线程负责一整根柱（核内自己循环深度），所以 Z 方向不 dispatch。
             d.Dispatch(m_LutCS, m_KernelApIdx,
@@ -933,8 +973,15 @@ namespace Vista
         /// 另有 <c>(1, 0, 0)</c> / <c>(2, 0, 0)</c> 两个区间诊断（见核内注释）。
         /// 调完必须再跑一次正式核覆盖回去。
         /// </summary>
+        /// <param name="fog">
+        /// **必须与刚才那次 <see cref="RenderAerialPerspectiveLut{T}"/> 传的是同一份。**
+        /// 核内的 256 步参考解（<c>VistaApReference</c>）也含雾，两边配置不一致时
+        /// 报出来的误差里会混进一份与切片分布无关的偏置 —— 而那个数字长得完全像
+        /// 「切片不够密」，是最容易被接受因此最容易误导的形态。
+        /// </param>
         public void RenderApSliceError<T>(
-            T d, in VistaAtmosphereViewData view, VistaAerialPerspectiveSettings settings)
+            T d, in VistaAtmosphereViewData view, VistaAerialPerspectiveSettings settings,
+            VistaFogSettings fog)
             where T : struct, IVistaLutDispatcher
         {
             if (!isAerialPerspectiveValid || m_KernelApSliceErrorIdx < 0 || m_ApScatter == null) return;
@@ -942,6 +989,7 @@ namespace Vista
             // 与正式核同理，逐视图常量必须自己推一遍，不能指望别的 pass 先绑过。
             view.Bind(d, m_SkyViewWidth, m_SkyViewHeight);
             view.BindAerialPerspective(d, settings);
+            view.BindFog(d, fog);
 
             d.SetTexture(m_LutCS, m_KernelApSliceErrorIdx,
                 VistaShaderIDs._VistaTransmittanceLut, VistaLutSlot.Transmittance);
@@ -952,6 +1000,9 @@ namespace Vista
                 VistaShaderIDs._VistaApScatterLutRead, VistaLutSlot.ApScatter);
             d.SetTexture(m_LutCS, m_KernelApSliceErrorIdx,
                 VistaShaderIDs._VistaApTransmittanceLutRW, VistaLutSlot.ApTransmittance);
+            // 参考解的雾环境项要读它，和正式核同一份 SH。
+            d.SetBuffer(m_LutCS, m_KernelApSliceErrorIdx,
+                VistaShaderIDs._VistaSkyAmbientSh, VistaLutBufferSlot.SkyAmbientSh);
             d.Dispatch(m_LutCS, m_KernelApSliceErrorIdx,
                 VistaComputeUtils.DivRoundUp(settings.depth, 64), 1, 1);
         }
@@ -1005,12 +1056,13 @@ namespace Vista
 
         /// <summary>立即模式的 AP。调用前需先 <see cref="PrepareAerialPerspective"/>。</summary>
         public void RenderAerialPerspectiveLut(
-            CommandBuffer cmd, in VistaAtmosphereViewData view, VistaAerialPerspectiveSettings settings)
+            CommandBuffer cmd, in VistaAtmosphereViewData view, VistaAerialPerspectiveSettings settings,
+            VistaFogSettings fog = null)
         {
             if (cmd == null) throw new ArgumentNullException(nameof(cmd));
             if (!isAerialPerspectiveValid) return;
 
-            RenderAerialPerspectiveLut(new VistaImmediateLutDispatcher(cmd, this), view, settings);
+            RenderAerialPerspectiveLut(new VistaImmediateLutDispatcher(cmd, this), view, settings, fog);
             cmd.SetGlobalTexture(VistaShaderIDs._VistaApScatterLut, m_ApScatter);
             cmd.SetGlobalTexture(VistaShaderIDs._VistaApTransmittanceLut, m_ApTransmittance);
         }
@@ -1023,12 +1075,16 @@ namespace Vista
             RenderApRoundTrip(new VistaImmediateLutDispatcher(cmd, this), view, settings);
         }
 
-        /// <summary>立即模式的 AP 切片误差测量。</summary>
+        /// <summary>
+        /// 立即模式的 AP 切片误差测量。
+        /// <paramref name="fog"/> 必须与刚才那次 AP 正式核传的是同一份，理由见泛型重载。
+        /// </summary>
         public void RenderApSliceError(
-            CommandBuffer cmd, in VistaAtmosphereViewData view, VistaAerialPerspectiveSettings settings)
+            CommandBuffer cmd, in VistaAtmosphereViewData view, VistaAerialPerspectiveSettings settings,
+            VistaFogSettings fog = null)
         {
             if (cmd == null) throw new ArgumentNullException(nameof(cmd));
-            RenderApSliceError(new VistaImmediateLutDispatcher(cmd, this), view, settings);
+            RenderApSliceError(new VistaImmediateLutDispatcher(cmd, this), view, settings, fog);
         }
 
         /// <summary>立即模式的 SH 投影。调用前需先 <see cref="PrepareSkyAmbientSh"/>。</summary>

@@ -59,6 +59,12 @@ namespace Vista
         // 自检专用：参考解（逐法线的辐照度对照）
         public static readonly int _VistaSkyAmbientShRefRW       = Shader.PropertyToID("_VistaSkyAmbientShRefRW");
 
+        // ---- Fog: VistaFogCB (ShaderLibrary/FogMedium.hlsl) ----
+        // 失能态是全零，所以「没下发」只能表现为没有雾。见 FogMedium.hlsl 的「常量」一节。
+        public static readonly int _VistaFogAlbedo                = Shader.PropertyToID("_VistaFogAlbedo");
+        public static readonly int _VistaFogExtinct               = Shader.PropertyToID("_VistaFogExtinct");
+        public static readonly int _VistaFogHeight                = Shader.PropertyToID("_VistaFogHeight");
+
         // ---- Atmosphere: banding 签名（仅 Editor 自检）----
         // 走的是**运行时那个采样入口**，所以它读 _VistaSkyViewLut（SRV），
         // 而不是 _VistaSkyViewLutRW —— 同一张纹理同时绑 UAV 与 SRV 是 UB。

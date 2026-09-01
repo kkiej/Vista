@@ -35,6 +35,8 @@ namespace Vista
             public VistaAtmosphereLuts luts;
             public VistaAtmosphereViewData view;
             public VistaAerialPerspectiveSettings apSettings;
+            /// <summary>雾配置。null / Off 档时 AP 核走零态，逐位等于没有雾。</summary>
+            public VistaFogSettings fogSettings;
             public VistaSkyReflectionMode reflectionMode;
             /// <summary>见 SkyView pass 里填这个字段处的注释。</summary>
             public Vector4 apConsumer;
@@ -71,6 +73,7 @@ namespace Vista
         VistaAtmosphereLuts m_Luts;
         VistaAtmosphereParameters m_Parameters;
         VistaAerialPerspectiveSettings m_ApSettings;
+        VistaFogSettings m_FogSettings;
         VistaSkyReflectionMode m_ReflectionMode = VistaSkyReflectionMode.SkyViewLut;
         float m_GroundLevelWorldY;
         float m_EV100;
@@ -111,12 +114,14 @@ namespace Vista
 
         public void Setup(VistaAtmosphereLuts luts, VistaAtmosphereParameters parameters,
                           VistaAerialPerspectiveSettings apSettings,
+                          VistaFogSettings fogSettings,
                           VistaSkyReflectionMode reflectionMode,
                           float groundLevelWorldY, float ev100)
         {
             m_Luts = luts;
             m_Parameters = parameters;
             m_ApSettings = apSettings;
+            m_FogSettings = fogSettings;
             m_ReflectionMode = reflectionMode;
             m_GroundLevelWorldY = groundLevelWorldY;
             m_EV100 = ev100;
@@ -162,7 +167,14 @@ namespace Vista
             // ComputeCommandBuffer.SetComputeBufferParam 有直收 GraphicsBuffer 的重载，
             // 所以那样写**能编译能跑**，但图不知道这个 pass 碰了它，不会插 barrier。
             // 走 import + UseBuffer 才让依赖对图可见。
-            var skyAmbientSh    = shEnabled ? renderGraph.ImportBuffer(m_Luts.skyAmbientShBuffer) : default;
+            //
+            // 条件是"buffer 存在"而不是 shEnabled：AP 核（雾的环境项）也要读它，
+            // 而 SH **投影核**可以不可用（那时 buffer 是清零的，退化成没有环境项）。
+            // 挂在 shEnabled 上今天不会出错，因为两个核在同一个 .compute 里 ——
+            // 但那是一条靠隔离机制间接保证的断言，失效时的症状不是报错，
+            // 而是判据在一条更窄的路径上照样全绿。见 EnsureSkyAmbientShBuffer 的注释。
+            var skyAmbientSh    = m_Luts.skyAmbientShBuffer != null
+                ? renderGraph.ImportBuffer(m_Luts.skyAmbientShBuffer) : default;
 
             // CPU 侧出口的驱动。放在记录期最前面而不是 SH pass 的 execute 里：
             // 读回请求是 CPU 侧 API，与图无关；而且这样它拿到的必然是"上一帧已完成"的内容，
@@ -391,15 +403,23 @@ namespace Vista
                 data.luts = m_Luts;
                 data.view = view;
                 data.apSettings = m_ApSettings;
+                data.fogSettings = m_FogSettings;
                 data.transmittance = transmittance;
                 data.multiScattering = multiScattering;
                 data.apScatter = apScatter;
                 data.apTransmittance = apTransmittance;
+                data.skyAmbientSh = skyAmbientSh;
 
                 builder.UseTexture(transmittance, AccessFlags.Read);
                 builder.UseTexture(multiScattering, AccessFlags.Read);
                 builder.UseTexture(apScatter, AccessFlags.Write);
                 builder.UseTexture(apTransmittance, AccessFlags.Write);
+                // 雾的天光环境项要读它。本 pass 排在 "Vista Sky Ambient SH" 之后，
+                // 所以读到的是**本帧**的 SH，没有一帧延迟。
+                // UseBuffer 对 default handle 会抛，所以要判空 —— buffer 恒存在
+                // （见 EnsureSkyAmbientShBuffer），这个判空只兜"整个 LUT 模块无效"那条路。
+                if (skyAmbientSh.IsValid())
+                    builder.UseBuffer(skyAmbientSh, AccessFlags.Read);
 
                 // AP 的两张表在这里发布。与静态表不同，它们**每帧都由本 pass 产出**，
                 // 所以不存在"pass 不在但要有绑定"的问题，就地发布即可。
@@ -413,7 +433,8 @@ namespace Vista
 
                 builder.SetRenderFunc((LutPassData d, ComputeGraphContext ctx) =>
                     d.luts.RenderAerialPerspectiveLut(
-                        new VistaGraphLutDispatcher(ctx.cmd, Handles(d)), d.view, d.apSettings));
+                        new VistaGraphLutDispatcher(ctx.cmd, Handles(d)),
+                        d.view, d.apSettings, d.fogSettings));
             }
         }
 

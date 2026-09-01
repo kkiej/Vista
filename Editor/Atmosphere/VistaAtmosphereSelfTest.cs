@@ -12,7 +12,15 @@ namespace Vista.Editor
     /// 一旦写反或纹素中心内缩弄错，症状会延后到"最终天空颜色不对"，那时已无从定位。
     /// 这里挑闭式解已知或有明确物理约束的纹素直接比对，把地基钉死。
     /// </summary>
-    public static class VistaAtmosphereSelfTest
+    /// <remarks>
+    /// 声明成 partial 是为了让雾的判据（<c>VistaFogInApSelfTest.cs</c>）直接复用
+    /// 这里的 <see cref="Readback3D"/> / <see cref="ReduceApCurve"/> / <see cref="ApBandText"/>
+    /// 与那三个阈值常量，而不是照抄一份。本项目已经写死的一条纪律是
+    /// 「同一个量的第二份实现连 8 行的辅助函数也算」—— 误差归约这套东西尤其不能有两份，
+    /// 因为两份漂移之后的症状是「雾的判据和 AP 的判据对同一张表给出不同的百分比」，
+    /// 而那时没有任何办法判断哪一份是对的。
+    /// </remarks>
+    public static partial class VistaAtmosphereSelfTest
     {
         public struct Report
         {
@@ -518,8 +526,11 @@ namespace Vista.Editor
             int w = scatter.width, h = scatter.height, d = scatter.depth;
 
             // ---- 有限非负 + fp16 余量 ----
+            // 注意 scatter 从 #18 起存的是**预曝光**辐亮度（见 AerialPerspectiveLut）。
+            // fp16 余量必须判在**存储值**上（那才是 fp16 装的东西），
+            // 而报告里给的峰值解回绝对 cd/m²，好跟"晒到太阳的雪地 ~3e4"这类量级对照。
             bool finite = true;
-            float maxScatter = 0f;
+            float maxStored = 0f;
             for (int z = 0; z < d; ++z)
             for (int y = 0; y < h; ++y)
             for (int x = 0; x < w; ++x)
@@ -529,15 +540,19 @@ namespace Vista.Editor
                 if (!Sane(c) || !Sane(t)) finite = false;
                 // 透射率必须落在 [0,1]：>1 意味着积分符号反了
                 if (t.r > 1.001f || t.g > 1.001f || t.b > 1.001f) finite = false;
-                maxScatter = Mathf.Max(maxScatter, Mathf.Max(c.r, Mathf.Max(c.g, c.b)));
+                maxStored = Mathf.Max(maxStored, Mathf.Max(c.r, Mathf.Max(c.g, c.b)));
             }
-            bool inFp16Range = maxScatter < 60000f;
+            bool inFp16Range = maxStored < 60000f;
+            float maxScatter = maxStored / Mathf.Max(view.exposure, 1e-30f);
 
             // ---- 沿切片的累积单调性 ----
             // 散射用**相对**回退：不同柱子的量级差几个数量级（贴地朝下的柱子几乎全零），
             // 绝对阈值要么放过真 bug、要么被噪声打爆。低于整表峰值 1e-4 的柱子跳过，
             // 那里 fp16 只剩几位有效数字，测的是量化而不是逻辑。
-            float floor = maxScatter * 1e-4f;
+            // 用 maxStored 而不是 maxScatter：下面比较的 Lum() 读的是**存储值**，
+            // 地板和被比较的量必须同一个单位制 —— 混用会让地板整体差 4e4 倍，
+            // 症状是"单调性判据突然一条柱子都不跳过"或"全部跳过"，两种都不报错。
+            float floor = maxStored * 1e-4f;
             float worstScatterDrop = 0f, worstTransRise = 0f;
             for (int y = 0; y < h; ++y)
             for (int x = 0; x < w; ++x)
@@ -595,8 +610,14 @@ namespace Vista.Editor
             }
 
             sb.AppendLine(Mark(finite)          + " 全表有限非负、透射率 ≤ 1，散射峰值 "
-                                                + maxScatter.ToString("F0") + " cd/m²");
-            sb.AppendLine(Mark(inFp16Range)     + " 未逼近 fp16 上限 65504");
+                                                + maxScatter.ToString("E2") + " cd/m²（存储值 "
+                                                + maxStored.ToString("E2") + "，预曝光）");
+            // 这条判据自 #18 改成预曝光存储后**极难失败**：要失败得让绝对辐亮度超过
+            // 2.6E+009 cd/m²（60000 / 2.54E-005）。点名说明它已经从"可能触发的判据"
+            // 退成"回归探针"—— 不写明的话，一条永远绿的断言看起来和一条有效断言一样。
+            sb.AppendLine(Mark(inFp16Range)     + " 存储值未逼近 fp16 上限 65504（余量 "
+                                                + (65504f / Mathf.Max(maxStored, 1e-30f)).ToString("F0")
+                                                + "×；预曝光后此条已退为回归探针）");
             sb.AppendLine(Mark(scatterMonotonic)+ " 散射沿切片非减（累积量），最大相对回退 "
                                                 + worstScatterDrop.ToString("E2") + "（阈值 2e-3）");
             sb.AppendLine(Mark(transMonotonic)  + " 透射率沿切片非增，最大回升 "
@@ -688,13 +709,14 @@ namespace Vista.Editor
             // errMid / errMidT 测**切片分布**（三线性插值在两片之间还原得多准）。见核里的注释。
             // 距离由 C# 自己算（ApDistance 复刻了 packedParams），核里的通道
             // 让给原始亮度 —— 只有它能区分"LUT 偏高"和"参考解偏低"。
-            var curve = ReduceApCurve(errCol, settings, p);
+            var curve = ReduceApCurve(errCol, settings, p, view.exposure);
 
             // 5%：段内解析积分 + 每段 ≤16 步对散射这种低频量应该远好于此。
             // 超了说明 VISTA_AP_STEPS_MAX 在该分布的远端段被打满（Log 尤其容易）。
             bool okErrCenter = curve.maxErrCenter < k_ApErrCenterMax;
             string midText  = ApBandText(curve, false, k_ApErrMidMax,  out bool okErrMid);
             string midTText = ApBandText(curve, true,  k_ApErrMidTMax, out bool okErrMidT);
+            bool okPack = curve.packMaxResidual < k_ApPackResidualMax;
 
             sb.AppendLine("　── 分布 " + tag);
             sb.AppendLine(Mark(okRt)            + " 　round-trip 最大 |Δw| " + maxRt.ToString("E2") + "（阈值 1e-3）");
@@ -707,16 +729,23 @@ namespace Vista.Editor
             sb.AppendLine(Mark(okTexW)          + " 　texW 半片对齐　" + texWNear.ToString("F5") + " / "
                                                 + texWFar.ToString("F5") + "（应为 " + (0.5f / d).ToString("F5")
                                                 + " / " + ((d - 0.5f) / d).ToString("F5") + "）");
-            sb.AppendLine(Mark(okErrCenter)     + " 　切片中心 vs 256 步参考解　最大 "
+            sb.AppendLine(Mark(okErrCenter)     + " 　切片中心 vs 4096 步参考解　最大 "
                                                 + Pct(curve.maxErrCenter) + " @ "
                                                 + curve.atErrCenterKm.ToString("F3") + " km（阈值 "
                                                 + Pct(k_ApErrCenterMax) + "，测行进循环）"
                                                 + "　LUT " + curve.centerLut.ToString("E3")
                                                 + " vs 参考 " + curve.centerRef.ToString("E3"));
-            sb.AppendLine(Mark(okErrMid)        + " 　errMid 逐段 max（" + k_ApBandLegend + "，阈值 "
-                                                + Pct(k_ApErrMidMax) + "，相对柱子总量）　" + midText);
-            sb.AppendLine(Mark(okErrMidT)       + " 　errMidT 逐段 max（阈值 " + Pct(k_ApErrMidTMax)
-                                                + "，相对 T 自身）　" + midTText);
+            sb.AppendLine(Mark(okErrMid)        + " 　errMid 逐段 max（" + k_ApBandLegend + "，相对柱子总量）"
+                                                + "　判两条：实现＝实测≤固有+端点+" + Pct(k_ApMidDecompAllow)
+                                                + "（恒等式）；分布＝固有<" + Pct(k_ApErrMidMax) + "　" + midText);
+            sb.AppendLine(Mark(okErrMidT)       + " 　errMidT 逐段 max（相对 T 自身）"
+                                                + "　同上两条，分布门 " + Pct(k_ApErrMidTMax) + "　" + midTText);
+            sb.AppendLine(Mark(okPack)          + " 　(3,0,z) 通道打包一致　max|errMidT·max(refT,1e-4) − |lutT−refT|| = "
+                                                + curve.packMaxResidual.ToString("E2") + "（阈值 "
+                                                + k_ApPackResidualMax.ToString("E0") + " = fp16 在 T≈1 处的 ~3 ulp）");
+            sb.AppendLine("　 ΔT 绝对可见度豁免　" + curve.exemptT + "/" + curve.sampleCount
+                        + " 片，其中最大 |ΔT| " + curve.exemptMaxDeltaT.ToString("E2")
+                        + "（门 " + k_ApVisibleDeltaT.ToString("E0") + "，不判定）");
             sb.AppendLine("　 台阶强度 max|ΔerrMid| " + Pct(curve.maxMidStep) + " @ "
                         + curve.atMidStepKm.ToString("F3") + " km　"
                         + "每柱行进步数 " + curve.marchSteps + "（不判定，见 ReduceApCurve）");
@@ -734,7 +763,7 @@ namespace Vista.Editor
                         + " 比值 " + (g2.b > 1e-6f ? (g2.a / g2.b).ToString("F3") : "n/a") + "（应≈2）");
 
             return okRt && okW && distIncreasing && okNear && okFar && okTexW
-                && okErrCenter && okErrMid && okErrMidT;
+                && okErrCenter && okErrMid && okErrMidT && okPack;
         }
 
         /// <summary>C# 侧复刻 <c>VistaApSliceCoordToDistance</c>，用来定位"最接近某个距离"的切片。
@@ -798,6 +827,67 @@ namespace Vista.Editor
         /// 与上面两个阈值同源：都是 1% 的 Weber 对比度阈。</summary>
         const float k_ApVisibleFloor = 0.01f;
 
+        /// <summary>透射率误差的**绝对**可见度豁免线。
+        ///
+        /// 为什么必须有这一条：核里 errMidT = |ΔT| / max(refT, 1e-4)。浓雾把 refT 压到
+        /// 1e-4 这个地板附近时，分母不再是 refT 而是地板本身，errMidT 报出来的是
+        /// 「|ΔT| 相对地板有多大」——一个与真实可见度无关的数字。#18 实测：H 档
+        /// （无限标高浓雾）refT↓0.00E+000 而 T④ 报 49.83%，那不是误差，是地板。
+        /// 这正是本项目点过名的坑：「拿一条落在尺子地板之下的预测去分类，
+        /// 会在读数落进地板内时产生假失败」。
+        ///
+        /// 门槛怎么定 —— **两条下界都要满足，取更大的那个**：
+        ///   (1) 可见度：T 只作用在几何体项上（final = geometry·T + inScatter），
+        ///       所以 |ΔT| 造成的画面变化上界是 |ΔT| · L_几何，而最亮的合理背景就是
+        ///       visibleWhite（日照下 albedo 0.3 的漫反射面）。1% 的 Weber 阈
+        ///       ⇒ 可见度这一侧允许到 1e-2。
+        ///   (2) **这个量自己的测量地板**：deltaT 是从 (3,0,z) 里三个 fp16 通道
+        ///       代数还原出来的（errMidT × max(refT,1e-4)），fp16 在 T≈1 处
+        ///       1 ulp = 2⁻¹¹ = 4.9e-4，三次圆整 ⇒ ~1.5e-3 的纯圆整噪声。
+        ///       门设在 1.5e-3 以下，分类结果就由圆整噪声决定。
+        /// 取 3e-3：比地板 (2) 高一倍，仍是可见度 (1) 的 1/3（≤0.3% 参考白）。
+        /// #18 之前这里是 1e-3 —— 它满足 (1) 但**落在 (2) 的地板之下**，
+        /// 正是本项目点过名的「尺子的地板与被测量同量级时，尺子会自己伪造一个结论」。
+        /// 症状是压线读数：②H 档 T④ 报 9.99%，紧贴在豁免线上方。
+        ///
+        /// ⚠ 这个值与 <see cref="k_ApPackResidualMax"/> 数值相同（都是 3 fp16 ulp），
+        /// 但**不能**写成引用它：若哪天误差表换成 fp32，地板 (2) 会消失，
+        /// packResidual 该降到 1e-6 量级，而这条豁免线该按可见度 (1) 重推到 1e-2 ——
+        /// 两者往相反方向走。
+        ///
+        /// 为什么判 |ΔT| 而不判「refT 与 lutT 双双低于门」：后者在 refT 恰好落在
+        /// 地板上方（比如 2e-3）时不触发，而那时 |ΔT| = 1e-3 会被报成 50% ——
+        /// 洞正好开在最需要豁免的那一档。判 ΔT 本身则无条件地界定了可见效果的上界。</summary>
+        const float k_ApVisibleDeltaT = 3e-3f;
+
+        /// <summary>(3,0,z) 三个 T 相关通道的互相一致阈。
+        ///
+        /// 核里 errMidT 是用全精度的 lutTMid / refTMid 算出来的，之后三个量各自被
+        /// 圆到 fp16 才落表。于是 errMidT·max(refT,1e-4) 与 |lutT − refT| 的差只剩
+        /// refT / lutT 两次独立圆整：fp16 在 T≈1 处 1 ulp = 2⁻¹¹ = 4.9e-4，两个量
+        /// 各一次、deltaT 里再借 refT 一次，取 3 ulp ≈ 1.5e-3，留余量到 3e-3。
+        /// 而这条判据真要抓的失败（通道对错、写错纹素）残差是 0.1~1 的量级 ——
+        /// 分辨力有 100 倍，不是压线判据。</summary>
+        const float k_ApPackResidualMax = 3e-3f;
+
+        /// <summary>误差分解的允差：要求 实测 ≤ 固有 + 端点上界 + 这个数。
+        ///
+        /// 这不是"画质裕度"，而是**存储圆整**的允差。分解本身是代数恒等式加一次
+        /// 三角不等式，理论上严格成立；会破的唯一原因是三个量各自被圆到 fp16：
+        /// 实测 errMid 在核里用全精度算完才落表，而固有/端点两项是 C# 侧拿
+        /// 落过 fp16 的端点值重算的。fp16 在 1 ulp = 2⁻¹¹ = 4.9e-4（相对），
+        /// S 通道的分母 farC 本身就是柱子最大值、被除的都不超过它，
+        /// T 通道非豁免片的量级是 O(1)，两边都归一到"相对 1"这同一个尺度上，
+        /// 四次圆整取 3e-3 ≈ 6 ulp。
+        ///
+        /// ⚠ 它与 <see cref="k_ApPackResidualMax"/> 数值相同但**不能写成引用**：
+        /// 那个是三通道互验的残差门，这个是误差分解的允差。若哪天误差表换成 fp32，
+        /// 两者一个降到 1e-7 量级、另一个仍受 AP 表本身 fp16 的限制而不动。
+        ///
+        /// 分辨力：这条判据要抓的失败（读错纹素、通道对错、interp 不是两端点的中点）
+        /// 残差在 0.1~1 的量级，比允差高两个数量级以上，不是压线判据。</summary>
+        const float k_ApMidDecompAllow = 3e-3f;
+
         /// <summary>定档时的余量系数：能看见的段要压到阈值的一半以内才算候选。
         ///
         /// 理由不是"越严越好"，而是**这套阈值本身就是可见阈**，压线通过意味着
@@ -813,18 +903,66 @@ namespace Vista.Editor
             public float maxErrCenter, atErrCenterKm, centerRef, centerLut;
             public float[] bandMid, bandMidT, bandMidAtKm;
             public int[] bandCount;
+            /// <summary>T 通道的有效样本数：<see cref="bandCount"/> 减去被
+            /// <see cref="k_ApVisibleDeltaT"/> 豁免的那些片。两个通道的计数必须分开，
+            /// 否则「这一段的 T 误差全在可见度之下」和「这一段一片都没有」会挤在
+            /// 同一个 0 上，而它们的正确结论只是碰巧相同（都免检）—— 挤在一起以后
+            /// 报表读不出来到底豁免了什么。</summary>
+            public int[] bandCountT;
             public float maxMidStep, atMidStepKm;
             public int marchSteps;
             // 逐片的绝对量，给可见性下限用（见 ApBandVisible）
-            public float[] midKm, refS, refT;
+            public float[] midKm, refS, refT, lutT;
+            /// <summary>切片**中心**处的灰度量（不是中点）：参考解与 LUT 各一份，
+            /// 长度为 depth。前两个已解码成绝对 cd/m²，后两个是无量纲透射率。
+            /// 这四个数组是误差分解的全部输入，见 <see cref="FillApMidDecomposition"/>。</summary>
+            public float[] refCc, lutCc, refTc, lutTc;
+            /// <summary>逐片实测的中点重建误差（S 通道相对柱子总量、T 通道相对 refT），
+            /// 与 <see cref="exact"/> / <see cref="bound"/> 一一配对、同分母。
+            /// bandMid / bandMidT 是它们的逐段 max —— 聚合值留着当报表的头条数字，
+            /// 但判定要逐片做（见 <see cref="ApBandText"/>）。</summary>
+            public float[] mid, midT;
+            /// <summary>**固有**重建误差：4096 步参考解自己在这个切片分布上的中点插值误差。
+            /// 一个 LUT 值都不含 —— 它回答的是「这个分布最好能做到多少」。同分母。</summary>
+            public float[] exact, exactT;
+            /// <summary>两个端点各自的行进误差对中点的贡献上界（三角不等式）。同分母。
+            /// 见 <see cref="FillApMidDecomposition"/>。</summary>
+            public float[] bound, boundT;
+            /// <summary>这一片的中点落在哪一段。存下来是为了 ApBandText 不用第二次算
+            /// ApBandIndex —— 同一个分段一旦有两处实现，边界差半片的症状是
+            /// 「某一段的判定和它打印的片数对不上」，极难看出来。</summary>
+            public int[] bandIdx;
+            /// <summary>这一片的 |ΔT| 落在 <see cref="k_ApVisibleDeltaT"/> 之下（T 通道免检）。</summary>
+            public bool[] exemptSlice;
+            /// <summary>errMid 的分母，等于核里的 <c>farC</c>（这根柱子最远片的累积入散射，
+            /// 已解码成绝对 cd/m²，带 1e-4 地板）。误差分解必须用**同一个**分母，
+            /// 否则分解出来的两项和实测不同基，相加比较没有意义。</summary>
+            public float farC;
             public int sampleCount;
             public float visibleWhite;
+            /// <summary>被绝对可见度豁免的中点数与其中最大的 |ΔT|。报出来，
+            /// 免得「T 全绿」既可能是真的准、也可能是整段被豁免掉了。</summary>
+            public int exemptT;
+            public float exemptMaxDeltaT;
+            /// <summary>打包一致性残差：errMidT·max(refT,1e-4) 与 |lutT − refT| 的最大差。
+            /// 前者是核里那次除法的分子按代数还原，后者是同一个纹素里两个原始通道相减，
+            /// 两者本该相等。不等只有一个原因：(3,0,z) 的通道对应错了。
+            /// 这条把一个**从来没人读过**的通道（lutT）变成了活判据 ——
+            /// 「一个默认关闭、又没有判据覆盖的开关，等于一段永远不会被发现写错的代码」。</summary>
+            public float packMaxResidual;
         }
 
         /// <summary>把 SliceError 的两行原始输出压成分段统计 + 台阶强度 + 成本代理。</summary>
+        /// <param name="exposure">烘这张表时用的曝光倍率。核里三个辐亮度诊断通道
+        /// （refC / lutC / refSMid）存的是**预曝光**值 —— 因为它们的目标纹理是 fp16，
+        /// 而 #18 实测浓雾对着低太阳时连参考解都会被存储钳到 65504。这里乘回去，
+        /// 让下游（报告、visibleWhite 归一化、注入量分母）全程用绝对 cd/m²，
+        /// 阈值一个都不用动。曝光取自 <see cref="VistaAtmosphereViewData.exposure"/>，
+        /// 全项目只有那一处算 1/(1.2·2^EV100)。</param>
         static ApCurve ReduceApCurve(Volume errCol, VistaAerialPerspectiveSettings s,
-                                     in VistaAtmosphereParameters p)
+                                     in VistaAtmosphereParameters p, float exposure)
         {
+            float decode = 1f / Mathf.Max(exposure, 1e-30f);
             int d = s.depth, bands = k_ApBandMarks.Length;
             var c = new ApCurve
             {
@@ -832,10 +970,25 @@ namespace Vista.Editor
                 bandMidT    = new float[bands],
                 bandMidAtKm = new float[bands],
                 bandCount   = new int[bands],
+                bandCountT  = new int[bands],
                 marchSteps  = ApMarchStepsPerColumn(s),
                 midKm       = new float[Mathf.Max(d - 1, 1)],
                 refS        = new float[Mathf.Max(d - 1, 1)],
                 refT        = new float[Mathf.Max(d - 1, 1)],
+                lutT        = new float[Mathf.Max(d - 1, 1)],
+                mid         = new float[Mathf.Max(d - 1, 1)],
+                midT        = new float[Mathf.Max(d - 1, 1)],
+                exact       = new float[Mathf.Max(d - 1, 1)],
+                exactT      = new float[Mathf.Max(d - 1, 1)],
+                bound       = new float[Mathf.Max(d - 1, 1)],
+                boundT      = new float[Mathf.Max(d - 1, 1)],
+                bandIdx     = new int[Mathf.Max(d - 1, 1)],
+                exemptSlice = new bool[Mathf.Max(d - 1, 1)],
+                // 这四个是**逐切片中心**的，所以长度是 d 而不是 d−1。
+                refCc       = new float[d],
+                lutCc       = new float[d],
+                refTc       = new float[d],
+                lutTc       = new float[d],
                 // 判"看不看得见"的分母：日照下 albedo 0.3 的漫反射面。
                 // 取它而不是取柱子总量，是因为柱子总量本身会随切片布局变
                 // —— 那样又变成一个能被布局刷的判据了。
@@ -851,8 +1004,22 @@ namespace Vista.Editor
                 {
                     c.maxErrCenter = e.r;
                     c.atErrCenterKm = ApDistance(s, z);
-                    c.centerRef = e.b; c.centerLut = e.a;
+                    c.centerRef = e.b * decode; c.centerLut = e.a * decode;
                 }
+
+                // 切片中心的四个量。S 侧本来就在 (0,0,z) 的 zw 里（预曝光，解回绝对值）；
+                // T 侧是 #18 为误差分解新加的 (4,0,z)。这些是**端点**值，
+                // 下面 refS/refT/lutT 那三个是**中点**值，两组不可混用。
+                c.refCc[z] = e.b * decode;
+                c.lutCc[z] = e.a * decode;
+                Color e4 = errCol[4, 0, z];
+                c.refTc[z] = e4.r;
+                c.lutTc[z] = e4.g;
+
+                // errMid 的分母：核里取的是这根柱子最远片的 LUT 累积量（带 1e-4 地板）。
+                // 这里必须逐位取同一个量 —— 误差分解要除它。
+                if (z == d - 1)
+                    c.farC = Mathf.Max(e.a * decode, 1e-4f);
 
                 // 最后一片没有"下一片"，核里两个中点通道恒为 0；算进去会把统计洗低。
                 if (z >= d - 1) continue;
@@ -864,8 +1031,12 @@ namespace Vista.Editor
                 float midT = e3.r / VistaAtmosphereLuts.k_ApErrorScale;
 
                 c.midKm[z] = dMid;
-                c.refS[z]  = e3.a;   // 参考解在该中点的累积入散射（绝对 cd/m²，单调增）
+                c.refS[z]  = e3.a * decode;   // 参考解在该中点的累积入散射（解回绝对 cd/m²，单调增）
                 c.refT[z]  = e3.g;   // 参考解在该中点的灰度透射率（单调减）
+                c.lutT[z]  = e3.b;   // LUT 在该中点插值出的灰度透射率
+                c.mid[z]   = mid;
+                c.midT[z]  = midT;
+                c.bandIdx[z] = b;
                 c.sampleCount = z + 1;
 
                 c.bandCount[b]++;
@@ -874,7 +1045,26 @@ namespace Vista.Editor
                     c.bandMid[b] = mid;
                     c.bandMidAtKm[b] = dMid;
                 }
-                if (float.IsNaN(c.bandMidT[b]) || midT > c.bandMidT[b]) c.bandMidT[b] = midT;
+
+                // ---- T 通道：先还原 |ΔT|，再决定这一片算不算 ----
+                // deltaT 是核里 errMidT = |ΔT| / max(refT, 1e-4) 那次除法的分子，
+                // 按代数乘回去 —— 不是 |lutT − refT| 的第二份实现，那个量下一行才用，
+                // 而且只用来验通道没对错（packMaxResidual）。
+                float deltaT = midT * Mathf.Max(c.refT[z], 1e-4f);
+                c.packMaxResidual = Mathf.Max(c.packMaxResidual,
+                                              Mathf.Abs(deltaT - Mathf.Abs(c.lutT[z] - c.refT[z])));
+
+                if (deltaT < k_ApVisibleDeltaT)
+                {
+                    c.exemptSlice[z] = true;
+                    c.exemptT++;
+                    c.exemptMaxDeltaT = Mathf.Max(c.exemptMaxDeltaT, deltaT);
+                }
+                else
+                {
+                    c.bandCountT[b]++;
+                    if (float.IsNaN(c.bandMidT[b]) || midT > c.bandMidT[b]) c.bandMidT[b] = midT;
+                }
 
                 // 相邻区间的下垂量之差。errMid 本身是"插值比真值低多少"，
                 // 而**均匀**的下垂只是整幅画面雾偏淡一点点，人眼没有参照物、看不出来；
@@ -889,7 +1079,71 @@ namespace Vista.Editor
                 }
                 prevMid = mid;
             }
+            FillApMidDecomposition(ref c);
             return c;
+        }
+
+        /// <summary>把 errMid / errMidT 这两个读数**分解**成两个可分别归因的部分。
+        ///
+        /// ---- 为什么需要它（这一节是这条判据存在的全部理由）----
+        /// errMid 是中点线性插值的误差，它有两个完全不同的来源：
+        ///   a) 切片分布在这一段太疏 —— 曲线本身弯，两片之间就是插不准。
+        ///      这是**表达能力上限**，不是 bug；只有换分布（或换成近层 froxel 体）才能改。
+        ///   b) 行进循环本身积错了 —— 存进去的两个端点值就偏，插值只是把偏差搬到中间。
+        /// 一个固定的 2% / 1% 平门无法区分这两者。#18 实测：视角③ 的中景段读到 19.25%，
+        /// 而同一份代码在视角① 上读 0.4% —— 平门只会把前者判成失败，
+        /// 却说不出到底是"这个 Log 分布在 877 m 的雾拐点上装不下"还是"march 写错了"。
+        /// 而这两个结论导向的行动截然不同（前者 → #19 近层雾体；后者 → 去查积分器）。
+        ///
+        /// ---- 分解式（是恒等式，不是模型）----
+        /// 核里 errMid = |½(L_i + L_{i+1}) − R_mid| / farC，其中 L 是 LUT 的切片**中心**值、
+        /// R_mid 是 4096 步参考解在 w 中点的值。插一项参考解自己的中心值 R_i：
+        ///     |½(L_i+L_{i+1}) − R_mid| ≤ |½(R_i+R_{i+1}) − R_mid| + ½(|L_i−R_i| + |L_{i+1}−R_{i+1}|)
+        ///       └── 实测 ─────────┘   └── 固有 exact ──────┘   └── 端点行进误差 bound ──┘
+        /// 前一项**一个 LUT 值都不含**，是这个切片分布在这一段的能力上限；
+        /// 后一项是两个端点各自的行进误差，而它已经由 errCenter 单独设门（本项目 5%）。
+        /// 于是 errMid 里的每一分误差都被归到了一个有主的地方，不多不少。
+        ///
+        /// ---- 为什么不用曲率做泰勒预测（#18 走过的弯路，记下来）----
+        /// 第一版把 exact 用二阶差分估成 |g_{i−1} − 2g_i + g_{i+1}|/8。那是同一个量的
+        /// **近似**，代价是要配一个 2× 的经验裕度（因为三样本估到的是 2Δw 跨度上的
+        /// 平均曲率，而雾拐点附近 g'' 一片之内变几倍），而配了裕度之后：
+        ///   · 视角③ 配置 D 读到 实测/预测 = 2.6× —— 判成"模型不成立"，
+        ///     可它真实的原因只是泰勒展开在近似阶跃处失效；
+        ///   · 更糟的是"预测 < 门"与"预测 ≥ 门"两侧判法不同，在 预测 ≈ 门 处不连续，
+        ///     一片预测 1.9% 的切片零裕度、预测 2.1% 的切片有 2 倍裕度 ——
+        ///     正是本项目点过名的「一个正好压在门上的读数，判定由最后一位小数决定」。
+        /// 让核多写一行（切片中心的参考 T，见 (4,0,z)）就能把近似换成恒等式，
+        /// 经验常数从 1 个降到 0 个。**能算准的量不要去估。**
+        ///
+        /// ---- 为什么它不是把判据变成空判据 ----
+        /// 分解本身确实是恒等式（所以"实测 ≤ 固有 + 端点"这一条只抓实现错误：
+        /// 读错纹素、通道对错、interp 不是两端点的中点 —— 那些残差是 0.1~1 量级）。
+        /// 画质断言在**另一条**上：exact 必须低于画质门。exact 与被测代码无关，
+        /// 刷不动 —— 想让它变小只能真的把切片布密。所以两条判据合起来是：
+        ///     「实现没错」（恒等式）＋「分布够用」（exact 过门），各自独立可失败。
+        ///
+        /// ---- 首/末片 ----
+        /// 分解只需要 z 与 z+1 两个端点，两者对每一个中点都存在，
+        /// 所以**没有边缘片**（曲率版需要左右各一个邻居，首末两片拿不到，
+        /// 那两片当时只能退回平门）。这也是换掉曲率版的附带收益。
+        /// </summary>
+        static void FillApMidDecomposition(ref ApCurve c)
+        {
+            float invFar = 1f / Mathf.Max(c.farC, 1e-6f);
+            for (int z = 0; z < c.sampleCount; ++z)
+            {
+                // S 通道：分母与核里逐位相同（farC）。
+                c.exact[z] = Mathf.Abs(0.5f * (c.refCc[z] + c.refCc[z + 1]) - c.refS[z]) * invFar;
+                c.bound[z] = 0.5f * (Mathf.Abs(c.lutCc[z]     - c.refCc[z])
+                                   + Mathf.Abs(c.lutCc[z + 1] - c.refCc[z + 1])) * invFar;
+
+                // T 通道：分母是 max(refT_mid, 1e-4)，同样与核里逐位相同。
+                float invT = 1f / Mathf.Max(c.refT[z], 1e-4f);
+                c.exactT[z] = Mathf.Abs(0.5f * (c.refTc[z] + c.refTc[z + 1]) - c.refT[z]) * invT;
+                c.boundT[z] = 0.5f * (Mathf.Abs(c.lutTc[z]     - c.refTc[z])
+                                    + Mathf.Abs(c.lutTc[z + 1] - c.refTc[z + 1])) * invT;
+            }
         }
 
         static int ApBandIndex(float km)
@@ -915,7 +1169,7 @@ namespace Vista.Editor
         /// 独立验过），所以**该段远端**的值就是段内任意位置的上界。取第一个中点落在
         /// 段远边界之外的样本，它比真正的远边界更远，是个偏保守的上界。
         ///
-        /// 这条规则刷不动：refS / refT 来自 256 步参考解，是大气本身的性质，
+        /// 这条规则刷不动：refS / refT 来自 4096 步参考解，是大气本身的性质，
         /// 和切片怎么布无关。想让一段"被豁免"，只能是它真的没东西可看。
         /// </summary>
         static bool ApBandVisible(in ApCurve c, int b, out float lumRatio, out float occl)
@@ -932,14 +1186,27 @@ namespace Vista.Editor
             return lumRatio >= k_ApVisibleFloor || occl >= k_ApVisibleFloor;
         }
 
-        /// <summary>四段判据的布尔版（不建字符串），给扫描里的余量档与第二视角用。</summary>
+        /// <summary>四段判据的布尔版（不建字符串），给扫描里的余量档与第二视角用。
+        ///
+        /// ⚠ 它**故意不**走 <see cref="ApBandText"/> 的那两条断言（#18 起三者语义分岔）：
+        /// ApBandText 判的是「实现有没有错」（恒等式：实测 ≤ 固有+端点+允差）
+        /// 加「分布够不够用」（固有 &lt; 上限，可被显式声明放宽）。
+        /// 这里问的是第三个问题：「这个分布够不够好，能不能**进候选**」——
+        /// 它必须用**实测**的平门，而且还要再乘 <see cref="k_ApSelectMargin"/> 收紧。
+        /// 理由：一段误差"已被固有重建能力解释"恰恰意味着这个分布在那一段装不下曲线，
+        /// 那正是不该选它的理由，不是放过它的理由。
+        /// 三条判据答不同的问题，所以不是同一个量的多份实现。</summary>
         static bool ApBandsOk(in ApCurve c, bool transmittance, float threshold)
         {
-            float[] vals = transmittance ? c.bandMidT : c.bandMid;
+            float[] vals   = transmittance ? c.bandMidT   : c.bandMid;
+            int[]   counts = transmittance ? c.bandCountT : c.bandCount;
             for (int b = 0; b < k_ApBandMarks.Length; ++b)
             {
-                if (c.bandCount[b] <= 0)
+                if (counts[b] <= 0)
                 {
+                    // T 通道有两种 0：这一段一片都没有（要过 ApBandVisible），
+                    // 或者有片但每片的 |ΔT| 都在绝对可见度之下（已经论证过看不见，直接放过）。
+                    if (transmittance && c.bandCount[b] > 0) continue;
                     if (ApBandVisible(c, b, out _, out _)) return false;
                     continue;
                 }
@@ -951,10 +1218,11 @@ namespace Vista.Editor
         /// <summary>能看见的段里最差的那个百分比。只用于报表排序，不参与判定。</summary>
         static float ApWorstBand(in ApCurve c, bool transmittance)
         {
-            float[] vals = transmittance ? c.bandMidT : c.bandMid;
+            float[] vals   = transmittance ? c.bandMidT   : c.bandMid;
+            int[]   counts = transmittance ? c.bandCountT : c.bandCount;
             float worst = 0f;
             for (int b = 0; b < k_ApBandMarks.Length; ++b)
-                if (c.bandCount[b] > 0) worst = Mathf.Max(worst, vals[b]);
+                if (counts[b] > 0) worst = Mathf.Max(worst, vals[b]);
             return worst;
         }
 
@@ -962,15 +1230,50 @@ namespace Vista.Editor
         /// 段内的雾在 1% 可见阈值之下才豁免，否则仍然判死（近端被饿死的签名）。</summary>
         static string ApBandText(ApCurve c, bool transmittance, float threshold, out bool ok)
         {
+            return ApBandText(c, transmittance, threshold, threshold, out ok);
+        }
+
+        /// <summary>分段结论 + 误差分解判定。
+        ///
+        /// 两条独立的断言，各自可失败，报表上分开印（见 <see cref="FillApMidDecomposition"/>）：
+        ///   实现：实测 ≤ 固有 + 端点上界 + <see cref="k_ApMidDecompAllow"/>。恒等式，
+        ///         抓的是"读错纹素 / 通道对错 / interp 不是两端点的中点"这类实现错误。
+        ///   分布：固有误差 exact 必须低于 <paramref name="threshold"/>（画质门）。
+        ///         exact 只由 4096 步参考解与切片分布决定，与被测代码无关，刷不动。
+        ///
+        /// <paramref name="capacityCeiling"/> 是分布那一条的**已声明上限**：
+        /// 传 threshold（默认重载）= 不放宽。传更大的值 = 这个布景已知超出档 D 的
+        /// 切片包络（例如相机在 300 m 高空俯视一层 20 m 厚的雾，拐点那一片的片长
+        /// 236 m 远大于雾沿射线的 e 折 58 m），此时 exact 超门是**推导得出的预期**，
+        /// 而不是缺陷。放宽的代价必须印在同一行里（"固有超门 n 片"），
+        /// 否则就是让"未判达标"冒充"达标"。</summary>
+        static string ApBandText(ApCurve c, bool transmittance, float threshold,
+                                 float capacityCeiling, out bool ok)
+        {
             ok = true;
             var line = new StringBuilder();
-            float[] vals = transmittance ? c.bandMidT : c.bandMid;
+            float[] vals   = transmittance ? c.bandMidT   : c.bandMid;
+            int[]   counts = transmittance ? c.bandCountT : c.bandCount;
+            float[] meas   = transmittance ? c.midT       : c.mid;
+            float[] exact  = transmittance ? c.exactT     : c.exact;
+            float[] bound  = transmittance ? c.boundT     : c.bound;
+            int overGate = 0, judged = 0;
+            float worstExactAll = 0f, worstSlackAll = float.NegativeInfinity;
             for (int b = 0; b < k_ApBandMarks.Length; ++b)
             {
                 if (b > 0) line.Append(' ');
                 line.Append(k_ApBandMarks[b]);
 
-                if (c.bandCount[b] <= 0)
+                // T 通道：有片、但每片的 |ΔT| 都低于绝对可见度门槛。
+                // 打印成「ΔT免检(n片)」而不是复用下面那个 "0片:免检" —— 两者论证不同，
+                // 报表上必须能分辨是"没测到"还是"测到了但看不见"。
+                if (transmittance && counts[b] <= 0 && c.bandCount[b] > 0)
+                {
+                    line.Append("ΔT免检(").Append(c.bandCount[b]).Append("片)");
+                    continue;
+                }
+
+                if (counts[b] <= 0)
                 {
                     bool visible = ApBandVisible(c, b, out float lumRatio, out float occl);
                     ok &= !visible;
@@ -981,12 +1284,55 @@ namespace Vista.Editor
                     continue;
                 }
 
-                bool bandOk = vals[b] < threshold;
+                float worstExact = 0f;
+                // ⚠ 从 −∞ 起累加，而**不是**从 0：这是余量，负数才是正常态。
+                // 从 0 起的话读数永远非负，「恒等余量 0%」就同时意味着
+                // 「余量充足」和「实测那一路根本没写（meas ≡ 0）」——
+                // 正是本项目点过名的「读数接近 0 的档位无法自证自己执行过」。
+                float worstSlack = float.NegativeInfinity;
+                int nOver = 0;
+                for (int z = 0; z < c.sampleCount; ++z)
+                {
+                    if (c.bandIdx[z] != b) continue;
+                    if (transmittance && c.exemptSlice[z]) continue;
+                    judged++;
+                    worstExact = Mathf.Max(worstExact, exact[z]);
+                    // 恒等式的违反量（正数 = 违反）。报最差的那个，而不只报"过了没"——
+                    // 一个恒等式判据的余量本身就是它有没有真跑过的证据。
+                    worstSlack = Mathf.Max(worstSlack, meas[z] - exact[z] - bound[z]);
+                    if (exact[z] >= threshold) { nOver++; overGate++; }
+                }
+                worstExactAll = Mathf.Max(worstExactAll, worstExact);
+                worstSlackAll = Mathf.Max(worstSlackAll, worstSlack);
+
+                bool okImpl = worstSlack <= k_ApMidDecompAllow;
+                bool okDist = worstExact < capacityCeiling;
+                bool bandOk = okImpl && okDist;
                 ok &= bandOk;
+
                 line.Append(Pct(vals[b]));
                 if (!transmittance) line.Append('@').Append(c.bandMidAtKm[b].ToString("F2"));
-                line.Append('(').Append(c.bandCount[b]).Append("片)");
+                line.Append('(').Append(counts[b]).Append("片,固").Append(Pct(worstExact));
+                if (!okImpl) line.Append(",恒等违").Append(SlackPct(worstSlack));
+                if (nOver > 0) line.Append(',').Append(nOver).Append("片超门");
+                line.Append(')');
                 if (!bandOk) line.Append('✘');
+                else if (nOver > 0) line.Append('◇');
+            }
+
+            // 两条断言的代价与覆盖面都必须印出来：
+            //   判n片        —— 这一行不是空判据的证明（豁免掉全部切片时它会是 0）。
+            //   恒等余量      —— 实测 −（固有+端点）的最大值，负数越大越安全。
+            //                   一个恒等式判据的余量本身就是它有没有真跑过的证据：
+            //                   若它恒等于 −(固有+端点)（即实测恒为 0），说明 meas 那一路没写。
+            //   固有超门 n 片 —— 分布那一条被放宽到 capacityCeiling 的全部代价。
+            line.Append(" 判").Append(judged).Append("片 固有最差").Append(Pct(worstExactAll));
+            if (judged > 0) line.Append(" 恒等余量").Append(SlackPct(worstSlackAll));
+            if (overGate > 0)
+            {
+                line.Append(" 固有超门").Append(overGate).Append("片");
+                if (capacityCeiling > threshold)
+                    line.Append("(已声明上限 ").Append(Pct(capacityCeiling)).Append("，非画质达标)");
             }
             return line.ToString();
         }
@@ -1014,7 +1360,10 @@ namespace Vista.Editor
         static int ApMarchStepsPerColumn(VistaAerialPerspectiveSettings s)
         {
             const float stepMaxKm = 0.25f;
-            const int stepsMin = 2, stepsMax = 16;
+            // 与核里的 VISTA_AP_STEPS_MIN / VISTA_AP_STEPS_MAX 对齐。#18 把上限 16 → 64，
+            // 这里跟着改：不改的症状是报表里的「步/柱」还印 149，而实际跑 168 ——
+            // 一个**偏低**的成本代理会让"放开上限不花钱"看起来是量出来的。
+            const int stepsMin = 2, stepsMax = 64;
             int total = 0;
             float prev = 0f;
             for (int z = 0; z < s.depth; ++z)
@@ -1033,6 +1382,19 @@ namespace Vista.Editor
             return p >= 0.01f ? p.ToString("F2") + "%"
                  : p > 0f     ? p.ToString("E1") + "%"
                               : "0%";
+        }
+
+        /// <summary>带符号的百分比，专给「余量」这类**负数是正常态**的量用。
+        ///
+        /// ⚠ 不能复用 <see cref="Pct"/>：它把一切 ≤ 0 的值都打成 "0%"，于是
+        ///   「余量 −5%（充足）」「余量恰好 0（压线）」「−∞（这一段一片都没判）」
+        /// 三种完全不同的状态在报表上长得一样 —— 尺子自己造了个结论。
+        /// 小数位取 F3 是因为这个量的实际量级在 0.0x%（fp16 圆整级别）。</summary>
+        static string SlackPct(float v)
+        {
+            if (float.IsNaN(v)) return "n/a";
+            if (float.IsNegativeInfinity(v)) return "无判定片";
+            return (v * 100f).ToString("F3") + "%";
         }
 
         /// <summary>
@@ -1224,7 +1586,7 @@ namespace Vista.Editor
             Graphics.ExecuteCommandBuffer(cmd);
             cmd.Release();
 
-            return ReduceApCurve(Readback3D(luts.apTransmittanceLut), s, p);
+            return ReduceApCurve(Readback3D(luts.apTransmittanceLut), s, p, view.exposure);
         }
 
         static bool Sane(Color c) =>

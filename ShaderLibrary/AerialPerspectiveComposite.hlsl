@@ -9,15 +9,18 @@
 //  合成的消费者（Step 5 的 SH 投影要的是绝对光度量的散射项，不要合成）。
 //
 //  ------------------------------------------------------------------ 合成公式
-//      final = shaded · transmittance + inScatter · exposure
+//      final = shaded · transmittance + inScatter
 //
-//  两个乘子的单位制不同，这是最容易搞错的一处：
-//    shaded       已经是渲染目标单位（曝光已经折进 Light.intensity 里了，见 #8）
-//    inScatter    绝对光度量 cd/m²，**没有**乘曝光（见 VistaSampleAerialPerspective）
-//  所以只有散射项要补 VISTA_EXPOSURE。反过来给 shaded 再乘一次曝光，
-//  症状是画面整体暗掉四个数量级 —— 一眼能看出来；
-//  而漏乘散射项则是「远山糊成一片纯白」，也很显眼。两种错误都不会静默，
-//  但仍然把它写成一个函数，让全项目只有这一处做这个换算。
+//  两个加数现在同属渲染目标单位，因为 AP 散射表存的就是**预曝光**辐亮度
+//  （#18 起；理由是 fp16 会在浓雾对着低太阳时溢出，见 AerialPerspectiveLut）。
+//    shaded       渲染目标单位（曝光已折进 Light.intensity，见 #8）
+//    inScatter    渲染目标单位（曝光已折进表里）
+//  这里因此**没有**曝光换算。历史上这一层乘过一次 VISTA_EXPOSURE，
+//  改成预曝光存储时那一次必须去掉 —— 留着的症状是画面整体暗掉四个数量级，
+//  一眼能看出来。仍然把合成写成一个函数，让全项目只有这一处做这个加法。
+//
+//  想拿绝对 cd/m² 的消费者（Step 5 的 SH 投影）不走这一层，
+//  自己对 VistaSampleAerialPerspective 的结果乘 rcp(VISTA_EXPOSURE)。
 //
 //  ------------------------------------------------------------------ 两条消费路径共用这里
 //    变体 A  全屏合成 pass：从深度反投影出 positionWS，对不透明像素整屏合成一遍。
@@ -66,10 +69,8 @@ bool VistaApInShaderEnabled()
 void VistaGetAerialPerspectiveTerms(float2 screenUv, float3 positionWS,
                                     out float3 addTerm, out float3 mulTerm)
 {
-    float3 inScatter;
     VistaSampleAerialPerspective(screenUv, VistaApDistanceKm(positionWS),
-                                 inScatter, mulTerm);
-    addTerm = inScatter * VISTA_EXPOSURE;
+                                 addTerm, mulTerm);
 }
 
 // 合成。exposedColor 是渲染目标单位的着色结果。

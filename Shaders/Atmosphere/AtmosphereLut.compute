@@ -305,12 +305,19 @@ void SkyViewLutRoundTrip(uint3 id : SV_DispatchThreadID)
 
 // 单步最长 0.25 km：Rayleigh 标高 8 km、Mie 标高 1.2 km，0.25 km 的步长
 // 在最陡的 Mie 剖面上密度变化也只有 ~20%，段内解析积分足以吸收。
+// 雾开着时这个上限会被 VistaFogStepMaxKm 按雾的 e 折进一步收紧（理由见 FogMedium.hlsl）。
 #define VISTA_AP_STEP_MAX_KM 0.25
 #define VISTA_AP_STEPS_MIN   2.0
-#define VISTA_AP_STEPS_MAX   16.0
+// 16 → 64（#18）。两个原因：
+//   · 雾收紧后近场一段可能要 12 步以上（实测标高 20 m 俯视 20° 要 12 步）；
+//   · 16 这个上限本来就在**晴空**的最远三片上生效着（第 29/30/31 片分别需要
+//     17/22/28 步，全被截到 16）。放开后每柱 149 → 168 步（+13%），
+//     换到的是最远区间的精度，方向是对的。
+// 上界 64 对应的雾包络（camH/H ≤ 88）见 FogMedium.hlsl。
+#define VISTA_AP_STEPS_MAX   64.0
 
 // 高步数参考解，只给自检用（AerialPerspectiveSliceError）。
-#define VISTA_AP_REFERENCE_STEPS 256.0
+#define VISTA_AP_REFERENCE_STEPS 4096.0
 
 RWTexture3D<float4> _VistaApScatterLutRW;
 RWTexture3D<float4> _VistaApTransmittanceLutRW;
@@ -345,6 +352,23 @@ void AerialPerspectiveLut(uint3 id : SV_DispatchThreadID)
     // 这里再加一次地面反弹就是重复计能量（远山会发白）。
     s.includeGroundBounce = false;
 
+    // 雾的天光环境项。提到循环外**并且**提到切片循环外：这是整帧一个常量
+    // （天光探针是相机位置的一个 SH，沿视线不变），逐样本重算是纯浪费；
+    // 更要紧的是 VistaLoadSkyAmbientSh 要读 StructuredBuffer，
+    // 在 32×32 froxel 列 × 最多 16 步 × 32 切片的循环里做等于把一次
+    // frame-constant 的 buffer 读放大了上万倍。
+    //
+    // 为什么这一项不能省：HG g = 0.8 在 90° 侧散射处 p = 0.0136 sr⁻¹，
+    // 太阳 120000 lux 给的侧散射源项约 1636 cd/m²/σ_s，
+    // 而晴天的平均天光亮度 L̄ ≈ 5000 cd/m² —— 环境项比太阳的侧散射还大。
+    // 漏掉它的症状是"背光面与阴影里的雾偏黑"，会被误读成雾密度调大了。
+    //
+    // buffer 恒可绑（VistaAtmosphereLuts.EnsureSkyAmbientShBuffer 与 kernel
+    // 是否存在无关地分配并清零），所以退化态是"没有环境项"，不是垃圾数据。
+    float3 ambientSh[VISTA_SH_COEFF_COUNT];
+    VistaLoadSkyAmbientSh(ambientSh);
+    s.fogAmbientRadiance = VistaShAmbientMean(ambientSh);
+
     float3 luminance  = 0.0;
     float3 throughput = 1.0;
     float  tPrev      = 0.0;
@@ -358,7 +382,8 @@ void AerialPerspectiveLut(uint3 id : SV_DispatchThreadID)
         float segLen = tNext - tPrev;
         if (segLen > 0.0)
         {
-            float steps = clamp(ceil(segLen / VISTA_AP_STEP_MAX_KM),
+            float stepMax = VistaFogStepMaxKm(tPrev, tNext, rayDir.y, VISTA_AP_STEP_MAX_KM);
+            float steps = clamp(ceil(segLen / stepMax),
                                 VISTA_AP_STEPS_MIN, VISTA_AP_STEPS_MAX);
             float dt = segLen / steps;
 
@@ -367,13 +392,20 @@ void AerialPerspectiveLut(uint3 id : SV_DispatchThreadID)
                 float  t = tPrev + (i + VISTA_SAMPLE_SEGMENT_T) * dt;
                 float3 p = posKm + t * rayDir;
 
-                // #18 会把这里换成 VistaSampleFog(VistaFogHeightMeters(t, rayDir.y))。
-                // 现在传 None，是为了让 #17 的签名改动对本 kernel **逐位无影响**：
-                // 全零结构体让雾的三项都乘 0、常量折叠后指令数不变，
-                // 于是 #7 的深度分布曲线与 #15 的 A/B 一致性读数都不该动 ——
-                // 这是 #17 唯一可用的回归判据，不能靠"看起来没变"。
+                // 档 D（移动端）的雾就在这一行进来：无阴影查询、无新纹理、无历史。
+                // 高度从 t 推而不是从 p 反算 —— p.y 在 6360 km 上的 fp32 ulp 是
+                // 0.49 m，对标高 20 m 的地面雾会把密度剖面量化成 ~41 级台阶
+                // （见 FogMedium.hlsl）。
+                //
+                // 这里**不加** if (雾开着) 分支：σ_t = 0 时 extinction 与 scattering
+                // 都是精确的 0，`medium.extinction + 0.0` 与 `0.0 * phase` 对有限
+                // 浮点都是逐位精确的，所以关雾态天然就是"逐位等于没有雾"。
+                // 唯一的例外是 g = ±1 时 HG 在 cosθ = ±1 处发散，0·inf = NaN ——
+                // CPU 侧因此把 g 钳在 ±0.99（VistaFogSettings）。
+                VistaFogSample fog = VistaSampleFogAlongRay(t, rayDir.y);
+
                 VistaScatterSample smp =
-                    VistaEvaluateScatterSample(p, rayDir, sunDir, VistaFogSampleNone(), s);
+                    VistaEvaluateScatterSample(p, rayDir, sunDir, fog, s);
 
                 float3 sampleTransmittance = exp(-smp.extinction * dt);
                 luminance += throughput * VistaSegmentIntegral(smp.scattered, smp.extinction, dt);
@@ -382,8 +414,25 @@ void AerialPerspectiveLut(uint3 id : SV_DispatchThreadID)
         }
 
         // 灰度透射率同时写进 alpha：移动端路径只采这一张表就够（见 AerialPerspective.hlsl）
+        //
+        // 散射项**存预曝光后的值**（× VISTA_EXPOSURE），不存绝对 cd/m²。#18 实测的理由：
+        //   浓雾 + 视线几乎对着低太阳时（太阳 5°，中心柱仰角 1°，夹角 4°），
+        //   HG g = 0.8 给 p = 0.36/(4π·0.0439^1.5) = 3.11 sr⁻¹，
+        //   源项 120000 × 3.11 = 3.7E+005 cd/m²/（σ_s·dt），
+        //   实测 max|LUT| = 6.55E+004 —— 正好是 fp16 上限 65504，整柱被钳平。
+        //   （晴空日落时 SkyView LUT 已经读到 54400 = 83%，只是没跨过去。）
+        // 乘上曝光 2.54E-005 后 1E+006 cd/m² → 25，fp16 还剩四个数量级余量。
+        // HDRP 的体积雾缓冲同样存预曝光值，理由一样。
+        //
+        // 代价（必须写明）：这张表从此是**曝光相关**的。
+        //   · 合成端因此不再自己乘曝光（见 AerialPerspectiveComposite.hlsl）；
+        //   · 需要绝对光度量的消费者（Step 5 的 SH 投影）要乘 rcp(VISTA_EXPOSURE) 还原。
+        //     fp16 的相对精度与量级无关，所以还原不丢有效位，丢的只是原来会溢出的顶端。
+        //   · 表每帧重烘，曝光变了不需要额外的失效逻辑。
+        // 透射率是无量纲量，不乘。
         float greyTransmittance = dot(throughput, 1.0 / 3.0);
-        _VistaApScatterLutRW[uint3(id.xy, slice)]       = float4(luminance, greyTransmittance);
+        _VistaApScatterLutRW[uint3(id.xy, slice)]       =
+            float4(luminance * VISTA_EXPOSURE, greyTransmittance);
         _VistaApTransmittanceLutRW[uint3(id.xy, slice)] = float4(throughput, 1.0);
 
         tPrev = tNext;
@@ -457,13 +506,14 @@ void AerialPerspectiveRoundTrip(uint3 id : SV_DispatchThreadID)
 //
 //  输出借用 _VistaApTransmittanceLutRW；调用方读完重跑正式核覆盖。
 //  (0, 0, i) 的 RGBA = errCenter、errMid、参考解灰度亮度、LUT 灰度亮度。
-//  (3, 0, i) 的 RGBA = errMidT·VISTA_AP_ERR_SCALE、参考解灰度 T、LUT 灰度 T、参考解中点亮度。
-//  两行都存**原始值**而不是切片距离：距离在 C# 侧能精确复刻
+//  (3, 0, i) 的 RGBA = errMidT·VISTA_AP_ERR_SCALE、参考解**中点** T、LUT 中点 T、参考解中点亮度。
+//  (4, 0, i) 的 RG   = 参考解**中心** T、LUT 中心 T（给 errMid 的误差分解用，见下）。
+//  三行都存**原始值**而不是切片距离：距离在 C# 侧能精确复刻
 //  （见 VistaAtmosphereSelfTest.ApDistance），而原始值不能 ——
 //  没有它，"误差 24%" 这种报告无法区分"LUT 偏高"还是"参考解偏低"，
 //  而这两者的修法完全相反。
 //
-//  本核连同下面的区间诊断一共占用 x = 0..3 这四列（y = 0），故要求表宽 ≥ 4。
+//  本核连同下面的区间诊断一共占用 x = 0..4 这五列（y = 0），故要求表宽 ≥ 5。
 //  自检里恒为 32，但值得写明：RWTexture3D 的越界写会被静默丢弃，
 //  真踩到时的症状是"某个误差通道恒为 0"，看起来像"误差极小"而不是"没写"。
 // ============================================================================
@@ -476,7 +526,7 @@ TEXTURE3D(_VistaApScatterLutRead);
 #define VISTA_AP_ERR_SCALE 4096.0
 
 // 返回整个结果而不只是 luminance：errMidT 要用同一次参考解里的 transmittance。
-// 分两次调用会把参考解的成本翻倍（每次 256 步 × 两次 LUT 取样），
+// 分两次调用会把参考解的成本翻倍（每次 VISTA_AP_REFERENCE_STEPS 步 × 两次 LUT 取样），
 // 而且两次调用之间没有任何东西保证它们走的是同一段路。
 VistaScatteringResult VistaApReference(float3 posKm, float3 rayDir, float3 sunDir, float tMax)
 {
@@ -488,6 +538,17 @@ VistaScatteringResult VistaApReference(float3 posKm, float3 rayDir, float3 sunDi
     s.useMultiScattering  = true;
     s.includeGroundBounce = false;
     s.tMax                = tMax;
+
+    // 尺子必须和被测对象用同一份物理。AerialPerspectiveLut 从 #18 起逐样本含雾，
+    // 参考解如果不含雾，#7 的切片误差判据会在接雾当天报一个**纯属虚构**的巨大误差 ——
+    // 而那个数字长得完全像"切片分布不够密"，是最容易被接受因此最容易误导的形态。
+    // 环境项同理：AP kernel 里 fogAmbientRadiance 取的是天光 SH 的平均入射亮度，
+    // 参考解也必须取同一个，否则差值里会混进一个与切片分布无关的常量偏置。
+    float3 ambientSh[VISTA_SH_COEFF_COUNT];
+    VistaLoadSkyAmbientSh(ambientSh);
+    s.includeFog          = true;
+    s.fogAmbientRadiance  = VistaShAmbientMean(ambientSh);
+
     return VistaIntegrateScatteredLuminance(posKm, rayDir, sunDir, s);
 }
 
@@ -509,9 +570,18 @@ void AerialPerspectiveSliceError(uint3 id : SV_DispatchThreadID)
     float wCenter = (float)id.x * _VistaApSize.w;
     float dCenter = VistaApSliceCoordToDistance(wCenter);
 
+    // AP 表存的是**预曝光**辐亮度（见 AerialPerspectiveLut）。这里先乘 rcp 还原成
+    // 绝对 cd/m² 再比，而不是把参考解也压到预曝光域去比 ——
+    // 因为下面 `refC > 1e-4` 与 `max(farC, 1e-4)` 这两个地板是按**绝对**光度量定的。
+    // 换到预曝光域后同一个 1e-4 相当于绝对量 3.9 cd/m²，会把近端几片的误差
+    // 静默判成 0，症状是"误差极小"而不是"判据没跑"。这正是本项目点过名的那类坑：
+    // 「一个正好压在地板上的读数，判定由地板决定」。
+    float apDecode = rcp(VISTA_EXPOSURE);
+
     float4 lutCenter4 = LOAD_TEXTURE3D(_VistaApScatterLutRead, uint3(column, id.x));
-    float3 lutCenter  = lutCenter4.rgb;
-    float3 refCenter  = VistaApReference(posKm, rayDir, sunDir, dCenter).luminance;
+    float3 lutCenter  = lutCenter4.rgb * apDecode;
+    VistaScatteringResult refCenter4 = VistaApReference(posKm, rayDir, sunDir, dCenter);
+    float3 refCenter  = refCenter4.luminance;
 
     float errCenter = 0.0;
     float refC = dot(refCenter, 1.0 / 3.0);
@@ -527,12 +597,12 @@ void AerialPerspectiveSliceError(uint3 id : SV_DispatchThreadID)
         float dMid = VistaApSliceCoordToDistance(wMid);
 
         float4 lutNext4 = LOAD_TEXTURE3D(_VistaApScatterLutRead, uint3(column, id.x + 1u));
-        float3 interp   = 0.5 * (lutCenter + lutNext4.rgb);
+        float3 interp   = 0.5 * (lutCenter + lutNext4.rgb * apDecode);
         VistaScatteringResult refMid = VistaApReference(posKm, rayDir, sunDir, dMid);
 
         // 分母 = 这根柱子最远片上的累积量，也就是它最终会贴到画面上的雾量。
         // 用本地参考值当分母会让最近的一两片恒定爆表（见头部注释）。
-        float3 columnFar = LOAD_TEXTURE3D(_VistaApScatterLutRead, uint3(column, depth - 1u)).rgb;
+        float3 columnFar = LOAD_TEXTURE3D(_VistaApScatterLutRead, uint3(column, depth - 1u)).rgb * apDecode;
         float  farC = max(dot(columnFar, 1.0 / 3.0), 1e-4);
 
         refSMid = dot(refMid.luminance, 1.0 / 3.0);
@@ -546,9 +616,29 @@ void AerialPerspectiveSliceError(uint3 id : SV_DispatchThreadID)
         errMidT = abs(lutTMid - refTMid) / max(refTMid, 1e-4);
     }
 
-    _VistaApTransmittanceLutRW[uint3(0, 0, id.x)] = float4(errCenter, errMid, refC, lutC);
+    // 三个辐亮度诊断量（refC / lutC / refSMid）存**预曝光**值：它们的目标纹理也是
+    // fp16，而 #18 实测 refC 在浓雾对着低太阳时同样读回 6.55E+004（= 65504）——
+    // 也就是说连"参考解"这个诊断读数本身都被存储钳掉了，那时报出的百分比测的是
+    // 格式上限而不是步数。C# 侧按 view.exposure 乘回绝对 cd/m²，报告里的量级不变。
+    // 误差三项与两个透射率是无量纲比值/无量纲量，不受影响。
+    _VistaApTransmittanceLutRW[uint3(0, 0, id.x)] =
+        float4(errCenter, errMid, refC * VISTA_EXPOSURE, lutC * VISTA_EXPOSURE);
     _VistaApTransmittanceLutRW[uint3(3, 0, id.x)] =
-        float4(errMidT * VISTA_AP_ERR_SCALE, refTMid, lutTMid, refSMid);
+        float4(errMidT * VISTA_AP_ERR_SCALE, refTMid, lutTMid, refSMid * VISTA_EXPOSURE);
+
+    // ---- 切片**中心**处的透射率，参考解与 LUT 各一份 ----
+    // 上面 (3,0,·) 里那两个 T 是**中点**的（测插值），这两个是**端点**的（测行进）。
+    // 为什么需要它：errMid / errMidT 这两个读数是两个来源之和 ——
+    //     实测误差 ≤ 参考解自己在这一段上的插值误差 ＋ 两个端点各自的行进误差
+    // 前者是**切片分布的固有能力上限**（换分布才会变，是选档依据）；
+    // 后者由 errCenter 单独设门。有了端点的参考值，前者可以**精确算出来**
+    // （而不是用曲率做泰勒估计），于是这个分解不含任何经验裕度。
+    // 推导与它为什么不是空判据见 C# 侧 FillApMidDecomposition。
+    //
+    // 只有 T 需要新写：辐亮度的端点值 refC / lutC 上面 (0,0,·) 的 zw 已经有了。
+    // 这两个是无量纲量，不乘 VISTA_EXPOSURE。
+    _VistaApTransmittanceLutRW[uint3(4, 0, id.x)] =
+        float4(dot(refCenter4.transmittance, 1.0 / 3.0), lutCenter4.a, 0.0, 0.0);
 
     // ---- 区间诊断（只一个线程写，与上面的每片数据分开放在别的行）----
     // 上面那些百分比全部假定"两个积分器走的是同一段路、被积函数在这段路上连续"。

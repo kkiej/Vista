@@ -130,8 +130,10 @@ float3 VistaApFroxelRayDirection(float2 uv)
 //  径向而非平面深度：积分是沿视线做的，用平面深度会让视野边缘的雾比中心薄，
 //  广角下画面四角明显发清。
 //
-//  inScatter 是绝对光度量，调用方自己乘 VISTA_EXPOSURE ——
-//  不在这里乘，是为了让这个函数也能服务于需要绝对单位的消费者（Step 5 的 SH 投影）。
+//  inScatter 是**预曝光**辐亮度（表里就存的预曝光值，见 AerialPerspectiveLut 里
+//  为什么必须这样存）。也就是说它已经是渲染目标单位，合成端不再乘 VISTA_EXPOSURE。
+//  需要绝对光度量的消费者（Step 5 的 SH 投影）乘 rcp(VISTA_EXPOSURE) 还原 ——
+//  fp16 的相对精度与量级无关，还原不丢有效位。
 // ----------------------------------------------------------------------------
 void VistaSampleAerialPerspective(float2 screenUv, float distanceKm,
                                   out float3 inScatter, out float3 transmittance)

@@ -40,6 +40,12 @@ namespace Vista
         VistaAerialPerspectiveSettings m_AerialPerspective = new VistaAerialPerspectiveSettings();
 
         [SerializeField]
+        [Tooltip("雾介质设置。默认 Off —— 关态会把雾的 cbuffer 下发成零，逐位等于没有雾。\n"
+               + "AerialPerspective 档把雾并进 32³ AP LUT 的 march：无阴影查询、无新纹理、"
+               + "无历史，代价是拿不到光柱（那个要等近层 froxel 体）。")]
+        VistaFogSettings m_Fog = new VistaFogSettings();
+
+        [SerializeField]
         [Tooltip("天空镜面反射 cubemap 的辐射来源。\n"
                + "SkyViewLut：从 Sky-View LUT 逐 mip GGX 预积分，含地平线的橙红带（PC 默认）。\n"
                + "AmbientSh：从环境光 SH 重建，零 LUT 依赖、采样数 16（移动端分级）。\n"
@@ -87,6 +93,12 @@ namespace Vista
 
         /// <summary>AP froxel 设置。改尺寸会在下一帧重新分配 3D 表，其余立即生效。</summary>
         public VistaAerialPerspectiveSettings aerialPerspective => m_AerialPerspective;
+
+        /// <summary>
+        /// 雾设置。所有字段都是运行时可改的 uniform（没有 shader keyword，也没有
+        /// 依赖它的 GPU 资源），所以改完下一帧就生效，不需要通知任何人。
+        /// </summary>
+        public VistaFogSettings fog => m_Fog;
 
         /// <summary>
         /// 反射来源模式。可运行时改 —— Demo 视频要在同一帧里对比 PC 与移动端两条路径。
@@ -150,7 +162,7 @@ namespace Vista
                 return;
 
             m_Luts.SetSkyViewResolution(m_SkyViewResolution.x, m_SkyViewResolution.y);
-            m_Pass.Setup(m_Luts, m_Parameters, m_AerialPerspective, m_SkyReflection,
+            m_Pass.Setup(m_Luts, m_Parameters, m_AerialPerspective, m_Fog, m_SkyReflection,
                          m_GroundLevelWorldY, m_EV100);
             renderer.EnqueuePass(m_Pass);
 

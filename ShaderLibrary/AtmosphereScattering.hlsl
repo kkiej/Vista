@@ -145,6 +145,20 @@ struct VistaRaymarchSettings
     bool   includeGroundBounce; // 计入地面反弹的一次漫反射
     bool   useMultiScattering;  // 采样 MS LUT（建 MS LUT 时必须 false，否则自引用）
 
+    // 本积分器内部逐样本取雾（VistaSampleFogAlongRay）。**默认 false**。
+    //
+    // 为什么需要这个开关，而不是"反正 σ_t = 0 时雾是零态、一律取就好了"：
+    // 本积分器同时服务 Transmittance / MS / SkyView 三张 LUT 与地面反弹，
+    // 那些**永远**不能含雾（见 FogMedium.hlsl 的"与大气介质的关系"）；
+    // 而 #7 的切片误差判据要的 256 步 ground truth（VistaApReference）走的也是本积分器，
+    // 它**必须**含雾，否则 AP kernel 一接雾，判据立刻报一个纯属虚构的巨大误差 ——
+    // 这类"尺子和被测对象用了不同的物理"的假失败，比真失败更贵。
+    // 所以开关的语义不是性能，是"这条视线属于哪一类量"。
+    //
+    // 默认 false 还有一条回归性质：三张静态 LUT 与 SkyView 的调用方都不碰这个字段，
+    // 于是它们走的仍是 VistaFogSampleNone() 那条常量折叠路径，逐位不变。
+    bool   includeFog;
+
     // 雾的环境项入射亮度（绝对光度量 cd/m²）。必须由调用方用 VistaShAmbientMean 算，
     // 那是 SphericalHarmonics.hlsl 里唯一一份"各向同性相位下的平均入射亮度"。
     //
@@ -174,6 +188,7 @@ VistaRaymarchSettings VistaDefaultRaymarchSettings()
     s.applyPhase          = true;
     s.includeGroundBounce = true;
     s.useMultiScattering  = true;
+    s.includeFog          = false;
     s.fogAmbientRadiance  = 0.0;
     return s;
 }
@@ -186,11 +201,42 @@ struct VistaScatteringResult
     float3 multiScatAs1;    // 建 MS LUT 用：入射亮度恒为 1 时的散射传递量
 };
 
-// 步段内的取样位置。0.5 是中点，Hillaire 取 0.3——因为密度沿步段是指数衰减的，
-// 能量重心偏向近端，取 0.3 比中点更接近解析积分。
-// 提成宏而不是留在积分器里的局部 const：AP LUT 的行进循环在别的文件里，
-// 两处若取不同的段内位置，天空与远山雾色在地平线交界处会差一个可见的台阶。
-#define VISTA_SAMPLE_SEGMENT_T 0.3
+// ----------------------------------------------------------------------------
+//  步段内的取样位置
+//
+//  提成宏而不是留在积分器里的局部 const：AP LUT 的行进循环在别的文件里，
+//  两处若取不同的段内位置，天空与远山雾色在地平线交界处会差一个可见的台阶。
+//
+//  ---- 为什么是 0.5，而不是 Hillaire 论文里的 0.3 ----
+//  这个值**不是**"在段内哪里采样更准"的自由参数，它由段内积分器的形式唯一确定。
+//  VistaSegmentIntegral 用采到的 σ_s / σ_t 解析地算 ∫₀^dt σ_s·exp(-σ_t·s) ds，
+//  也就是说**段内衰减已经被精确处理了**，采样点只负责给出"这一段的介质是什么"。
+//  于是最优采样点是让常介质假设误差最小的那一点 = 透射率加权的质心：
+//      s*/dt = [1 − (1+x)·e^(−x)] / [x·(1 − e^(−x))]，　x = σ_t·dt
+//      x → 0 ⇒ 0.5　　x = 1 ⇒ 0.418　　x = 2 ⇒ 0.3435　　x = 3 ⇒ 0.281
+//  Hillaire 的 0.3 是 x ≈ 2.8 处的质心 —— 他的段光学深度就在那个量级。
+//  本项目的段不在那个区间：AP LUT 的 Log 分布 + VistaFogStepMaxKm 的收紧
+//  把每段的 x 压得很小（雾那边 x ≤ 0.4·σ_t·efold，晴空更小），所以正确的值是 **0.5**。
+//
+//  ---- 抄那个 0.3 的代价（实测）----
+//  段内取样偏离中心会让整条 march 从二阶退化成一阶（一阶偏差不再左右对称抵消）。
+//  症状是 **4 倍步数只把误差降到 1/3.7**（一阶该 4 倍、二阶该 16 倍），
+//  而当时我把剩下那部分读成了"三线性重建误差"，差点去改切片分布。
+//  改 0.3 → 0.5 之后：
+//      视角③ 切片误差 B/C/D/G　5.14 / 5.47 / 5.97 / 5.15 %　→　0.37 / 0.43 / 0.49 / 0.38 %
+//      晴空 切片中心 vs 4096 步参照　0.25~0.29 %　→　0.07 %
+//  一个从别人论文里抄来的经验常数，它的适用区间可能正好被你自己的另一处优化推出去。
+//
+//  ---- 为什么不做"按 τ 自适应的采样点" ----
+//  按上面的公式逐段算 s*/dt 是死代码：两个会让 0.5 失准的区间**互斥**。
+//    · x 大（段光学深度高）→ 只可能发生在均匀/准均匀介质里，
+//      而常密度段被 VistaSegmentIntegral **精确**积分，采样点取哪儿都一样；
+//    · 介质变化陡（雾）→ VistaFogStepMaxKm 把 dt 压到远小于 e 折长度，
+//      于是 x ≪ 1，而 x → 0 的质心**就是** 0.5。
+//  所以自适应能改善的区间是空集。这条要写下来，否则它看起来永远像一个待办优化。
+//  与 VistaFogStepMaxKm 里那条 x²/24 的上限推导是耦合的：改这个宏必须重核那条。
+// ----------------------------------------------------------------------------
+#define VISTA_SAMPLE_SEGMENT_T 0.5
 
 // ----------------------------------------------------------------------------
 //  单个采样点的介质求值
@@ -382,22 +428,39 @@ VistaScatteringResult VistaIntegrateScatteredLuminance(
         }
         else
         {
-            // 段边界是 [i·dt, (i+1)·dt]，取样点在段内 30% 处 —— 和上面变步长分支
-            // 同一个语义。曾经写成"dt = 相邻取样点之差"，那样第一段只有 0.3·dt、
-            // 末段整个丢掉，总覆盖变成 tMax·(N−0.7)/N：N=256 时少积 0.27%，
-            // 正好是 #7 里 errCenter 在所有 20 组配置上都读到 0.25~0.29% 的原因
-            // （尺子本身有个恒定偏置，把切片布局的差别整个盖住了）。
+            // 段边界是 [i·dt, (i+1)·dt]，取样点在段内 VISTA_SAMPLE_SEGMENT_T 处 ——
+            // 和上面变步长分支同一个语义。曾经写成"dt = 相邻取样点之差"，那样第一段
+            // 只有 segT·dt、末段整个丢掉，总覆盖变成 tMax·(N−1+segT)/N：
+            // N=256、segT=0.5 时少积 0.195%（当时 segT=0.3，是 0.27%）。
+            // ⚠ 这个 bug 曾被当成 #7 里 errCenter 在 20 组配置上都读到 0.25~0.29% 的
+            // **全部**原因（0.27% 与那个区间吻合得太好，当时就没再往下查）。
+            // 后来 segT 0.3→0.5 把同一个读数降到 0.07%，说明段内取样点偏离中心的
+            // 一阶偏差至少也占一大块。两个原因的量级重叠（都在 0.2~0.3%），
+            // 而我没有保留"dt 修好、segT 仍是 0.3"这个中间态的读数，
+            // 所以**两者各占多少现在已经无法区分**。
+            // 能确认的只有 segT 那一项（它有前后对照）。要补的话得把 dt 定义
+            // 故意改回错的再测一次 —— 值不值得看 #27。
             dt = tMax / sampleCount;
             t  = (i + VISTA_SAMPLE_SEGMENT_T) * dt;
         }
 
         float3 p = posKm + t * rayDir;
 
-        // 传 None：本积分器服务的是 Transmittance / MS / SkyView LUT 与地面反弹，
-        // 那些都是静态或球对称/方位对称的大气量，雾不能进（见 FogMedium.hlsl）。
+        // includeFog 的默认值是 false，于是本积分器服务的 Transmittance / MS /
+        // SkyView LUT 与地面反弹走的仍是全零字面量那条路 —— 那些都是静态或
+        // 球对称/方位对称的大气量，雾不能进（见 FogMedium.hlsl）。
         // 天空像素的雾靠雾体远端的 transmittance/inScatter 覆盖，不靠这里。
+        // true 的唯一使用者是 VistaApReference：判据的尺子必须和被测的 AP kernel
+        // 用同一份物理，否则接雾当天就会报一个虚构的失败。
+        //
+        // 写成 if/else 而不是 ?: —— HLSL 的三元运算符只对标量/矢量/矩阵生效，
+        // 两边是 struct 时 fxc 报 "type mismatch between conditional values"。
+        VistaFogSample fog = VistaFogSampleNone();
+        if (s.includeFog)
+            fog = VistaSampleFogAlongRay(t, rayDir.y);
+
         VistaScatterSample smp =
-            VistaEvaluateScatterSample(p, rayDir, sunDir, VistaFogSampleNone(), s);
+            VistaEvaluateScatterSample(p, rayDir, sunDir, fog, s);
 
         float3 sampleOpticalDepth   = smp.extinction * dt;
         float3 sampleTransmittance  = exp(-sampleOpticalDepth);

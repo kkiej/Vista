@@ -49,6 +49,23 @@ namespace Vista
         public Vector3 rayBottomLeft, rayBottomRight, rayTopLeft, rayTopRight;
 
         /// <summary>
+        /// 相机的世界 Y (m)，**未经过 km 缩放**。
+        ///
+        /// 为什么要单独存一份而不是从 <see cref="viewPosKm"/> 反算：
+        /// viewPosKm.y 在 6360 km 附近，fp32 在那个量级上的 ulp 是
+        /// 2^12 · 2^-23 = 4.883e-4 km ≈ **0.49 m**。雾的标高可以只有 20 m，
+        /// 用反算出来的相机高度会把整条密度剖面量化成 ~41 级台阶，
+        /// 症状是雾里出现随相机高度跳动的水平条带。
+        /// 见 <c>ShaderLibrary/FogMedium.hlsl</c> 的「为什么高度不能从 posKm 算」。
+        ///
+        /// 已知偏差：<see cref="Create"/> 会把 viewPosKm 钳制在大气层内，而这个字段
+        /// **不钳** —— 相机飞出大气顶时两者会不一致。那是刻意的：钳制的目的是保住
+        /// SkyView LUT 的参数化，而雾的高度剖面在那个高度上密度早已是 0，
+        /// 钳过的高度反而会让雾在大气顶外重新变浓。
+        /// </summary>
+        public float cameraWorldY;
+
+        /// <summary>
         /// 摄影式曝光：exposure = 1 / (1.2 · 2^EV100)。
         /// EV100 = 15 对应"晴天正午"（Sunny 16 法则），是最常用的基准。
         /// </summary>
@@ -77,6 +94,8 @@ namespace Vista
             float toKm = VistaAtmosphereParameters.worldToAtmosphere;
 
             var data = new VistaAtmosphereViewData();
+            // 在做 km 缩放之前先取世界 Y：雾的高度剖面必须避开 6360 km 这个大数。
+            data.cameraWorldY = cameraWorldPos.y;
             // 星球中心正在相机脚下 bottomRadius 处，所以世界 +Y 就是地面处的 up。
             data.planetCenterKm = new Vector3(
                 0f, groundLevelWorldY * toKm - parameters.bottomRadius, 0f);
@@ -203,6 +222,37 @@ namespace Vista
                 new Vector4(rayTopLeft.x, rayTopLeft.y, rayTopLeft.z, 0f));
             cmd.SetGlobalVector(VistaShaderIDs._VistaApRayTR,
                 new Vector4(rayTopRight.x, rayTopRight.y, rayTopRight.z, 0f));
+        }
+
+        /// <summary>
+        /// 推送雾的 cbuffer。
+        ///
+        /// 为什么和 <see cref="BindAerialPerspective{T}"/> 分开：雾有两个消费者
+        /// （档 D 的 AP LUT、档 A 的近层 froxel 体），后者不需要 AP 的切片分布与视锥四角。
+        /// 合成一个函数会让「近层雾体也得先配好 AP 的分布」这种伪依赖固化下来。
+        ///
+        /// <paramref name="fog"/> 为 null 时下发全零 —— 与 Off 档同一条路径。
+        /// 零态是 <c>FogMedium.hlsl</c> 刻意保住的性质：σ_t = 0 时消光与散射都精确为 0，
+        /// 于是「没配雾」「明确关雾」「忘了下发」三者殊途同归，都只能是没有雾。
+        ///
+        /// **每帧无条件调用**：cbuffer 里的相机高度逐帧变，而且雾从开到关的那一帧
+        /// 如果跳过下发，shader 会拿着上一帧的 σ_t 继续算 —— 那正是
+        /// <c>_VistaApConsumer</c> 踩过的坑（见 VistaShaderIDs 里那条注释）。
+        /// </summary>
+        public void BindFog<T>(T cmd, VistaFogSettings fog)
+            where T : struct, IVistaLutDispatcher
+        {
+            if (fog == null)
+            {
+                cmd.SetGlobalVector(VistaShaderIDs._VistaFogAlbedo, Vector4.zero);
+                cmd.SetGlobalVector(VistaShaderIDs._VistaFogExtinct, Vector4.zero);
+                cmd.SetGlobalVector(VistaShaderIDs._VistaFogHeight, Vector4.zero);
+                return;
+            }
+
+            cmd.SetGlobalVector(VistaShaderIDs._VistaFogAlbedo, fog.packedAlbedo);
+            cmd.SetGlobalVector(VistaShaderIDs._VistaFogExtinct, fog.packedExtinct);
+            cmd.SetGlobalVector(VistaShaderIDs._VistaFogHeight, fog.PackedHeight(cameraWorldY));
         }
     }
 }
