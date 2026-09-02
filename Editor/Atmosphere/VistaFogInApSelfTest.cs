@@ -179,14 +179,14 @@ namespace Vista.Editor
 
         // ───────────────────────── 入口 ─────────────────────────
 
-        [MenuItem("Window/Vista/Validate Fog in AP LUT", priority = 140)]
+        [MenuItem("Window/Vista/Validate Fog (AP + Sky)", priority = 140)]
         static void RunFogInApFromMenu()
         {
             VistaAtmosphereLuts luts = null;
             var report = RunFogInAp(VistaAtmosphereParameters.CreateEarth(), ref luts);
             string oneLine = report.text.Replace("\r", "").Replace("\n", "  |  ");
-            if (report.passed) Debug.Log("[Vista] AP LUT 雾自检通过  |  " + oneLine);
-            else Debug.LogError("[Vista] AP LUT 雾自检失败  |  " + oneLine);
+            if (report.passed) Debug.Log("[Vista] 雾自检通过（AP + 天空）  |  " + oneLine);
+            else Debug.LogError("[Vista] 雾自检失败（AP + 天空）  |  " + oneLine);
             luts?.Dispose();
         }
 
@@ -237,6 +237,12 @@ namespace Vista.Editor
             sb.AppendLine(Mark(okSpread) + " 视锥生效　|注入① − 注入②| = " + Pct(spread)
                         + "（门 " + Pct(k_FogViewSpreadMin) + "；相等即 SetFrustumRays 没生效，"
                         + "那时全部标高判据都退化成常密度的空判据）");
+
+            // ── 天空像素的雾（#18b，判据4~7）──
+            // 放在同一次跑里而不是另开一个菜单项：两条路径共用同一组雾配置与同一批
+            // 预热好的静态表，而「地平线上下必须接得上」正是它们唯一的耦合点。
+            // 拆成两个入口就没法保证两边用的是同一组参数 —— 那时"接缝"这件事无人验证。
+            ok &= ValidateSkyFog(luts, p, cases, sb);
 
             return new Report { passed = ok, text = sb.ToString() };
         }

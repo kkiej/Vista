@@ -168,6 +168,23 @@ float3 VistaSkyAmbientIrradiance(float3 n)
     VistaLoadSkyAmbientSh(sh);
     return VistaShIrradiance(sh, n);
 }
+
+// 平均入射亮度，只读 L_00 那一个系数。
+//
+// 为什么不直接 VistaLoadSkyAmbientSh + VistaShAmbientMean：后者按定义只用得到 sh[0]，
+// 而前者会把 9 个 float4 全读出来。在 compute 里那是被优化掉的死代码，但这个入口的
+// 消费者是**片元着色器**（#18b 的天空盒），那里 8 次多余的 StructuredBuffer 取样
+// 是真实开销。这里把 0 填进其余系数再走 VistaShAmbientMean，是为了让
+// "L_00·Y0" 这个常数仍然只有一份实现 —— 而那些 0 会被死代码消除掉。
+float3 VistaSkyAmbientMean()
+{
+    float3 sh[VISTA_SH_COEFF_COUNT];
+    sh[0] = _VistaSkyAmbientSh[0].rgb;
+    [unroll]
+    for (uint i = 1u; i < VISTA_SH_COEFF_COUNT; ++i)
+        sh[i] = 0.0;
+    return VistaShAmbientMean(sh);
+}
 #endif
 
 #endif // VISTA_SPHERICAL_HARMONICS_INCLUDED

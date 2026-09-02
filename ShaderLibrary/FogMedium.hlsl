@@ -25,9 +25,10 @@
 //      局部雾会破坏它。
 //  所以雾**只**进 AP LUT 的 march 与近层 froxel 的 march，
 //  静态 LUT 与 SkyView LUT 一律传 VistaFogSampleNone()。
-//  推论（重要）：天空像素的雾不是靠 SkyView LUT 里含雾拿到的，
-//  而是靠雾体远端的 transmittance/inScatter 覆盖上去 —— 与 UE5 的做法一致，
-//  也正是"分层"这个结构本来就该有的行为。
+//  推论（重要）：天空像素的雾不是靠 SkyView LUT 里含雾拿到的。
+//  档 A（近层 froxel）靠雾体远端的 transmittance/inScatter 覆盖上去；
+//  档 D（AP LUT）没有那个体，靠 VistaFogTransmittanceAlongSkyRay 的闭式解
+//  在天空盒里合成（#18b，见下面那一节）。两者都与 UE5 的分层做法一致。
 //
 //  ------------------------------------------------------------------ 为什么高度不能从 posKm 算
 //  march 用的位置是大气空间的 posKm，它的 y 在 6360 km 附近。
@@ -125,6 +126,18 @@ float VistaFogHeightMeters(float tKm, float rayDirWorldY)
     return _VistaFogHeight.x + tKm * rayDirWorldY * 1000.0;
 }
 
+// 单次散射反照率 σ_s/σ_t，已钳到 [0,1]。
+// saturate 在 shader 里做而不是信任 CPU：它保证 σ_s <= σ_t 在数据上就不可表示。
+// _VistaFogAlbedo 是 uniform，这条 saturate 会被提到循环外，逐样本零开销。
+//
+// 提成函数是因为有第二个消费者：天空像素的解析雾要的是这个**无量纲量本身**，
+// 而不是 σ_s —— 闭式解 ∫σ_s·ρ·T ds = albedo·(1 − T) 把 σ_t 约掉了。
+// 两处必须是同一个表达式，否则钳位分叉的症状是"天空的雾比远山的雾亮一点"。
+float3 VistaFogAlbedo()
+{
+    return saturate(_VistaFogAlbedo.xyz);
+}
+
 // 指数高度剖面。
 // h < 0（雾层底以下）钳到底部密度而不是让 exp 继续涨：
 // 不钳的话相机掉进一个坑里就会拿到指数级的密度，画面直接糊成一片纯色，
@@ -137,9 +150,7 @@ VistaFogSample VistaSampleFog(float heightMeters)
     VistaFogSample f;
     f.density    = density;
     f.extinction = _VistaFogExtinct.xyz * density;
-    // saturate 在 shader 里做而不是信任 CPU：它保证 σ_s <= σ_t 在数据上就不可表示。
-    // _VistaFogAlbedo 是 uniform，这条 saturate 会被提到循环外，逐样本零开销。
-    f.scattering = f.extinction * saturate(_VistaFogAlbedo.xyz);
+    f.scattering = f.extinction * VistaFogAlbedo();
     f.phaseG     = _VistaFogAlbedo.w;
     return f;
 }
@@ -241,6 +252,92 @@ float VistaFogStepMaxKm(float tNearKm, float tFarKm, float rayDirWorldY, float d
 }
 
 // ----------------------------------------------------------------------------
+//  沿一条直线到无穷的闭式光学深度
+//
+//  指数剖面沿任意直线的光学深度有闭式解。从高度 h 沿垂直分量 dy 走到无穷：
+//      τ = ∫₀^∞ σ_t·exp(-(h + s·dy)/H) ds = σ_t · (H / dy) · exp(-h/H)
+//  右边三项分别是 _VistaFogExtinct.xyz、**等效路径长度** H/dy、density。
+//  一个 rcp + 一次 exp，不需要沿那条直线再 march。
+//
+//  ---- 为什么等效路径长度由调用方给 ----
+//  H/dy 在 dy → 0 时无界，两个调用点都必须给它一个上界，但**上界的来历完全不同**：
+//    · 太阳方向（自遮蔽）：上界是**观感参数** _VistaFogExtinct.w ——
+//      无限大平板在太阳贴地时给出无穷光学深度，会把日出日落的雾压黑，
+//      而那恰好是雾最该好看的时刻。见下面那一节。
+//    · 天空视线：上界是**星球曲率给出的物理量** sqrt(2πRH)，没有美术旋钮。
+//  把两者硬塞进同一个参数，调用点就看不出"这个上限是哪来的"了 ——
+//  而本项目已经点过名：一条从别人论文里抄来的经验常数，它的适用区间可能
+//  正好被你的另一处优化推出去。上界的来历必须留在调用点看得见的地方。
+// ----------------------------------------------------------------------------
+
+// 标高，km。σ_t 是 1/km 而 _VistaFogHeight.y 是 1/m，所以这里必须换单位。
+// 1e-6 的下界只是防 rcp 出 inf：均匀雾（1/H = 0）在这里退化成"标高 1000 km"，
+// 那个值配上任何非零 σ_t 都给出 τ ≫ 1，也就是"无限厚的均匀雾把一切糊住"——
+// 那正是无限厚均匀雾的正确结论，所以这个兜底值不需要被当成钳位来解释。
+float VistaFogScaleHeightKm()
+{
+    return 0.001 * rcp(max(_VistaFogHeight.y, 1e-6));
+}
+
+// τ = σ_t · pathKm · density。pathKm 是上面那个 H/dy（含上界）。
+float3 VistaFogOpticalDepth(VistaFogSample fog, float pathKm)
+{
+    return _VistaFogExtinct.xyz * (pathKm * fog.density);
+}
+
+// ----------------------------------------------------------------------------
+//  天空像素的雾（#18b）
+//
+//  ---- 为什么天空像素需要单独一条路 ----
+//  AP 合成刻意排除天空像素（VISTA_AP_IS_SKY_DEPTH）：AP 是"相机到不透明物"
+//  这一段的量，而 SkyView LUT 存的已经是整条视线的完整积分，再叠一层等于
+//  把同一段大气算两遍。于是浓雾场景里**地平线以上仍是干净的蓝天**，
+//  而地平线以下的远山已经被雾糊住 —— 交界处一条硬边，看起来像"雾没生效"。
+//
+//  ---- 为什么是解析式，而不是"再存一份仅雾的 AP 表让天空去采"----
+//  后者听起来更统一（天空与不透明物走同一次 march，缝在结构上为零），但
+//  雾的透射率沿视线方向是 exp(-k/dir.y)，它对 dir.y 的导数在地平线处发散。
+//  AP 表在屏幕上只有 32×32，SkyView LUT 也只有 192×108 —— 用任何一张表去
+//  重建这个梯度，台阶都恰好落在**地平线**上，也就是这个特性唯一重要的地方。
+//  再加一张 32³ 的 fp16 表还要 +512 KB，而档 D 的存在理由本来就是移动端。
+//  所以这里走逐像素的闭式解：约 10 条 ALU，没有新纹理，梯度精确。
+//
+//  ---- dir.y <= 0 为什么不特判 ----
+//  平地板模型下朝下的射线穿过雾层底后密度被钳成常数，路径无限长 ⇒ τ = ∞。
+//  但**写成 return 0 会在地平线上造一条硬边**：稀薄雾里地平线上方 T ≈ 0.7、
+//  下方 T = 0，那道边比它修掉的错误更显眼。让 max(dir.y, 1e-3) 兜住反而是连续的，
+//  而且任何有意义的雾浓度下 τ = σ_t·1000H 都已经饱和成"全糊"。
+//  差别只在"稀薄到看不见的雾 + 地平线以下没有几何"这一种组合上，
+//  那时两个答案都是透明的。连续性优先。
+// ----------------------------------------------------------------------------
+//
+//  ---- 为什么等效路径长度单独一个函数 ----
+//  两项式还需要 τ **本身**（不只是 exp(−τ)）去算自遮蔽的入散射加权均值，
+//  见下面 VistaFogSunTransmittanceMean。让它自己再算一遍 min(H/dy, chapman)
+//  就是同一个量的第二份实现 —— 本项目已经点过名，哪怕只有两行也算，
+//  而分叉的症状（Chapman 上界只对 T 生效、对加权均值不生效）在画面上
+//  长得像"低太阳时雾偏亮"，与自遮蔽本身写错完全无法区分。
+float VistaFogSkyRayPathKm(float rayDirWorldY)
+{
+    float scaleHeightKm = VistaFogScaleHeightKm();
+
+    // 曲率上界：指数剖面沿掠射射线的柱密度有 Chapman 的经典极限
+    // ∫ρ ds → ρ(h)·sqrt(2πRH)，即等效路径长度封顶在 sqrt(2πRH)。
+    //   标高 50 m → 44.7 km　　200 m → 89.4 km　　20 m → 28.3 km
+    // 与下面 max(dir.y, 1e-3)（= 路径封顶在 1000·H）的交叉点在标高 40 m：
+    // 比它薄的雾由 1e-3 兜住，比它厚的雾由这条曲率上界兜住。
+    // 均匀雾（1/H = 0）时 scaleHeightKm 已被兜到 1000 km，Chapman 给 6320 km，
+    // 两者都远大于 1/σ_t —— 结论仍是"全糊"，不需要额外分支。
+    float chapmanKm = sqrt(6.2831853 * VISTA_BOTTOM_RADIUS * scaleHeightKm);
+    return min(scaleHeightKm * rcp(max(rayDirWorldY, 1e-3)), chapmanKm);
+}
+
+float3 VistaFogTransmittanceAlongSkyRay(VistaFogSample fog, float rayDirWorldY)
+{
+    return exp(-VistaFogOpticalDepth(fog, VistaFogSkyRayPathKm(rayDirWorldY)));
+}
+
+// ----------------------------------------------------------------------------
 //  太阳方向的自遮蔽（雾自己挡住阳光）
 //
 //  ---- 为什么有这一项 ----
@@ -249,10 +346,11 @@ float VistaFogStepMaxKm(float tNearKm, float tFarKm, float rayDirWorldY, float d
 //  缺的正是"雾顶亮、雾底暗"这个最能读出厚度的层次。
 //
 //  ---- 为什么它可以是解析的 ----
-//  指数剖面沿任意直线的光学深度有闭式解。从高度 h 沿垂直分量 sy 向上到无穷：
-//      τ = ∫₀^∞ σ_t·exp(-(h + s·sy)/H) ds = σ_t · (H / sy) · exp(-h/H)
-//  右边三项分别是 _VistaFogExtinct.xyz、标高/掠射放大、density。
-//  一个 rcp + 一次 exp，不需要沿太阳方向再 march。
+//  与天空视线用的是同一个闭式解（VistaFogOpticalDepth，见上一节），
+//  只是等效路径长度那一项换成了太阳方向的 H/sin(仰角)。
+//  同一个量只有一份实现 —— 这一条是刻意的：#18b 之前这个闭式解只有太阳一个消费者，
+//  接天空时若在天空盒里再写一遍，两份实现可以在标高的单位换算上分叉，
+//  而症状（远山的雾色与天空的雾色差一点）恰好长得像"切片分布不够密"。
 //
 //  ---- 为什么默认关 ----
 //  UE5 的 Volumetric Fog 与 HDRP 的 Volumetric Fog **都不做这一项**，
@@ -281,23 +379,91 @@ float VistaFogStepMaxKm(float tNearKm, float tFarKm, float rayDirWorldY, float d
 //  如果改成静默钳一个标高上限，症状会退化成"浓雾偏暗一点"，反而查不出来。
 //  CPU 侧（#18）在标高不是有限正数时应当直接把 _VistaFogHeight.w 置 0。
 //
-//  这一项在 #27 的验收里必须有一条判据点名跑过它，否则就该删掉 ——
-//  一个默认关闭、又没有判据覆盖的开关，等于一段永远不会被发现写错的代码。
+//  这一项的**闭式解本体**（VistaFogOpticalDepth）已经被 #18b 的天空雾判据覆盖了：
+//  那条判据拿 VistaFogTransmittanceAlongSkyRay 去对高步数数值积分，走的是同一个函数体。
+//  这个函数自己的两样东西也在 #18b 里补上了见证（判据7 逐方向计数）：
+//    · `.w < 0.5` 这个开关 —— 档 B 与档 G 只差这一个 bool，判据5 在两档上都判；
+//    · _VistaFogExtinct.w 这个掠射上限 —— 布景② 的太阳 5° 让 1/sin = 11.5 > 8，
+//      上限生效；布景① 的太阳 60° 让 1.15 < 8，上限不生效。两支都被走到。
+//  所以 #27 里那条「跑不出就删掉这个函数」已经作废 —— 它现在是有判据的代码。
 // ----------------------------------------------------------------------------
-float3 VistaFogTransmittanceToSun(VistaFogSample fog, float sunDirWorldY)
+float VistaFogSunPathKm(float sunDirWorldY)
 {
+    // 失能态 = 零态：返回 0 ⇒ τ = 0 ⇒ exp(0) = 1 **精确**。
+    // #18b 之前这里是 `return 1.0`（提前返回透射率），改成返回路径长度之后
+    // 关态仍然逐位为 1，而且下面那个加权均值也自动退化成 1（k = 0 的解析极限），
+    // 不需要在两个地方各写一次开关判断。
     if (_VistaFogHeight.w < 0.5)
-        return 1.0;
-
-    // 标高换成 km：σ_t 是 1/km，而 _VistaFogHeight.y 是 1/m。
-    float scaleHeightKm = 0.001 * rcp(max(_VistaFogHeight.y, 1e-6));
+        return 0.0;
 
     // sy <= 0（太阳在地平线下）时放大倍数直接钉到上限。
     // 那种情况下大气的 Transmittance LUT 已经把直射光压到接近 0，这里不需要再区分。
-    float amplify = min(rcp(max(sunDirWorldY, 1e-3)), _VistaFogExtinct.w);
+    // 上界是 _VistaFogExtinct.w 而不是天空视线那条曲率上界：理由见上一节
+    //「为什么等效路径长度由调用方给」。
+    return VistaFogScaleHeightKm() * min(rcp(max(sunDirWorldY, 1e-3)), _VistaFogExtinct.w);
+}
 
-    float3 tau = _VistaFogExtinct.xyz * (scaleHeightKm * fog.density * amplify);
-    return exp(-tau);
+float3 VistaFogTransmittanceToSun(VistaFogSample fog, float sunDirWorldY)
+{
+    return exp(-VistaFogOpticalDepth(fog, VistaFogSunPathKm(sunDirWorldY)));
+}
+
+// ----------------------------------------------------------------------------
+//  自遮蔽项沿天空射线的**入散射加权均值**（#18b 的修正）
+//
+//  ---- 这一项在修什么 ----
+//  march 逐样本调 VistaFogTransmittanceToSun(局部密度)，所以自遮蔽沿射线是变的：
+//  射线爬高 ⇒ ρ 掉 ⇒ 雾对阳光的遮挡变弱。而天空的两项式只有一个 J̄，
+//  #18b 的第一版把它冻在**相机处**的密度上 —— 那是 τ → ∞ 的极限（浓到只看得见
+//  第一个 e 折），在中等厚度下系统性偏暗。实测：太阳 5° + 自遮蔽开时相对差 34.8%，
+//  而同一档关掉自遮蔽只有 1.7% —— 差值全在这一项上。
+//
+//  ---- 它有精确闭式解 ----
+//  沿射线换元 x = e^{−t/L}（L = 等效路径长度，ρ = ρ₀x，u = τ(1−x)）：
+//      ∫₀^∞ σ_s ρ J e^{−u} dt = albedo·τ·∫₀¹ J(x) e^{−τ(1−x)} dx
+//  J 里只有自遮蔽随 x 变，且 T_sun(x) = e^{−k x}（k = 相机处的太阳向光学深度）：
+//      ∫₀¹ e^{−kx} e^{−τ(1−x)} dx = (e^{−k} − e^{−τ}) / (τ − k)
+//  再除掉 J 取常数时的那份 (1−e^{−τ})/τ，就得到应当代进两项式的等效透射率：
+//      T̄ = [(e^{−k} − e^{−τ}) / (τ − k)] · τ / (1 − e^{−τ})
+//  三个极限都对得上：k → 0 ⇒ T̄ = 1（没有自遮蔽）；τ → ∞ ⇒ T̄ = e^{−k}
+//  （旧实现正是这个极限）；τ → 0 ⇒ T̄ = (1−e^{−k})/k（权重在 x 上均匀）。
+//  代价约 6 条 ALU，而且没有任何经验常数 —— 这是**恒等式**，不是拟合。
+//
+//  ---- τ 必须是两项式自己用的那个 τ ----
+//  也就是含 dir.y 地板与 Chapman 上界的那一个，不是"物理上正确"的 H/dy。
+//  理由是代数的：两项式的 (1 − T) 用的是它，只有同一个 τ 才能让
+//  I = albedo·(direct·T̄ + ambient)·(1 − T) 与上面那条积分逐项相等。
+//  换成另一个 τ，恒等式就退化成两个近似的比较 —— 而"拿两个上界做相对比较"
+//  是本项目点过名的反模式。
+//
+//  ---- 为什么不能直接用级数展开 ----
+//  τ ≈ k 时分子分母同时趋零，是**灾难性相消**（与 VistaSegmentIntegral 同一类坑）。
+//  两处 rcp 各配一段级数：(1−e^{−d})/d → 1 − d/2、τ/(1−e^{−τ}) → 1 + τ/2。
+//  用 step + lerp 而不是 if：τ 与 k 是逐通道的 float3（σ_t 带色），
+//  标量分支会在三个通道厚度差很远时（浓雾偏红）挑错分支。
+// ----------------------------------------------------------------------------
+float3 VistaFogSunTransmittanceMean(float3 tauView, float3 tauSun)
+{
+    float3 eSun  = exp(-tauSun);
+    float3 eView = exp(-tauView);
+    float3 d     = tauView - tauSun;
+
+    // step(y, x) = (x >= y)，所以这里是「|d| 足够小」= 1。阈值 1e-4 处级数的截断项
+    // 是 d²/6 ≈ 1.7e-9，远在 fp32 的相对精度之下；而直算那条在 |d| = 1e-4 时
+    // 分子只剩 ~4 位有效数字，交叉点选在这里两边都还有余量。
+    float3 tiny  = step(abs(d), 1e-4);
+    // tiny = 1 时把分母挪开，避免 rcp(0) 出 inf 污染 lerp（inf·0 = NaN）。
+    float3 ratio = lerp((eSun - eView) * rcp(d + tiny),
+                        eSun * (1.0 - 0.5 * d),
+                        tiny);
+
+    float3 tinyT = step(tauView, 1e-4);
+    float3 norm  = lerp(tauView * rcp(max(1.0 - eView, 1e-30)),
+                        1.0 + 0.5 * tauView,
+                        tinyT);
+
+    // 雾关掉时 tauView = tauSun = 0 ⇒ 两条级数都生效 ⇒ 1.0 · 1.0，逐位为 1。
+    return ratio * norm;
 }
 
 #endif // VISTA_FOG_MEDIUM_INCLUDED

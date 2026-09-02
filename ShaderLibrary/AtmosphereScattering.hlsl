@@ -264,6 +264,52 @@ struct VistaScatterSample
     float3 extinction;  // 已兜底 >= 1e-9，可直接作除数
 };
 
+// ----------------------------------------------------------------------------
+//  雾的散射源项（每单位 σ_s 的入射亮度 J）
+//
+//  ---- 为什么从 VistaEvaluateScatterSample 里提出来 ----
+//  天空像素不走 march（AP 排除它们，见 FogMedium.hlsl 的"天空像素的雾"），
+//  但它需要**一模一样**的 J：同一个 HG 相位、同一份到太阳的大气透射率、
+//  同一个星球阴影、同一个自遮蔽、同一个环境项强度。
+//  在天空盒里重写一遍 J 就是"同一个量的第二份实现"——本项目已经点过名，
+//  哪怕只有 8 行也算。而它分叉的症状是**地平线上远山的雾色与天空的雾色差一点**，
+//  恰好长得像"AP 切片分布不够密"，会把人引到完全错的地方去查。
+//
+//  ---- 返回的是什么 ----
+//  J，单位 cd/m²（绝对光度量）。真正的源项是 σ_s·J：
+//    · march 里逐样本乘 fog.scattering（σ_s 随高度变）；
+//    · 天空的闭式解里 σ_s 被积分约掉了，只剩 albedo（见 VistaApplyFogToSky）。
+//  所以这个函数**不含** σ_s —— 含了的话第二个消费者就得把它除回去。
+// ----------------------------------------------------------------------------
+//  ---- 为什么自遮蔽是参数，而不是在这里算 ----
+//  两个消费者要的**不是同一个数**：march 逐样本要局部密度下的 T_sun，而天空的
+//  闭式解要它沿整条射线的入散射加权均值（VistaFogSunTransmittanceMean）。
+//  在这里调 VistaFogTransmittanceToSun 就等于把 march 的那一份写死，
+//  天空只能在外面再乘一个比值去纠正 —— 那是「同一个量的第二份实现」的变体，
+//  而且症状（低太阳时天空的雾与远山的雾亮度差一截）与相位写错无法区分。
+//  两个消费者各自算好自己的那一份传进来，J 的结构就仍然只有一处。
+// ----------------------------------------------------------------------------
+float3 VistaFogSourceRadiance(
+    VistaFogSample fog, float3 rayDir, float3 sunDir,
+    float3 sunTransmittance, float earthShadow, float3 fogSelfShadow,
+    float3 sunIlluminance, float3 ambientRadiance, bool applyPhase)
+{
+    float phase = applyPhase
+        ? VistaHenyeyGreensteinPhase(fog.phaseG, dot(rayDir, sunDir))
+        : VISTA_ISOTROPIC_PHASE;
+
+    // 雾自己对阳光的衰减只作用在雾这一项上（空气不会被雾的液滴挡住两次），
+    // 所以 fogSelfShadow 在这里，而不是乘到公共的 sunTransmittance 上。
+    float3 direct = sunIlluminance * (earthShadow * phase) * sunTransmittance
+                  * fogSelfShadow;
+
+    // 各向同性相位下 ∫p·L dω 就是平均入射亮度本身，所以这里是 L̄ 而**不是** L̄/4π ——
+    // 那个 1/4π 已经在 VistaShAmbientMean 的推导里约掉了（(1/4π)·∫L dω = L̄）。
+    // 写成后者的症状是阴影里的雾暗 12.6 倍，看起来像"环境项强度调小了"，很难反查。
+    // 不套 fogSelfShadow：自遮蔽只挡直射太阳，不挡天光。
+    return direct + ambientRadiance * _VistaFogHeight.z;
+}
+
 //  fog: 该点的雾介质。由调用方用 VistaSampleFog(VistaFogHeightMeters(t, rayDir.y)) 取 ——
 //  **不在这里取**，因为雾的高度必须从 t 推、不能从 p 反算（fp32 在 6360 km 上的
 //  ulp 是 0.49 m，理由见 FogMedium.hlsl）。让调用方传进来同时也让 #24 的局部雾体
@@ -280,24 +326,20 @@ VistaScatterSample VistaEvaluateScatterSample(
     float3 transmittanceToSun = VistaSampleTransmittanceToSun(r, muSun);
     float  earthShadow = VistaEarthShadow(p, sunDir);
 
-    // 雾自己对阳光的衰减只作用在雾的那一项上（空气不会被雾的液滴挡住两次），
-    // 所以它折进 fog 的散射系数里，而不是乘到公共的 transmittanceToSun 上。
-    float3 fogScattering = fog.scattering * VistaFogTransmittanceToSun(fog, sunDir.y);
-
+    // 只剩大气两个组分。雾的相位/自遮蔽/环境项统一在 VistaFogSourceRadiance 里，
+    // 见下面那一次累加。晴空时这里与 #18b 之前**逐位相同**（原来加的是 0.0，加 0 精确）。
     float3 phaseTimesScattering;
     if (s.applyPhase)
     {
         float cosTheta = dot(rayDir, sunDir);
         phaseTimesScattering =
               medium.scatteringRayleigh * VistaRayleighPhase(cosTheta)
-            + medium.scatteringMie      * VistaHenyeyGreensteinPhase(_VistaMieExtinct.w, cosTheta)
-            + fogScattering             * VistaHenyeyGreensteinPhase(fog.phaseG, cosTheta);
+            + medium.scatteringMie      * VistaHenyeyGreensteinPhase(_VistaMieExtinct.w, cosTheta);
     }
     else
     {
         phaseTimesScattering =
-            (medium.scatteringRayleigh + medium.scatteringMie + fogScattering)
-            * VISTA_ISOTROPIC_PHASE;
+            (medium.scatteringRayleigh + medium.scatteringMie) * VISTA_ISOTROPIC_PHASE;
     }
 
     float3 multiScattered = 0.0;
@@ -312,18 +354,96 @@ VistaScatterSample VistaEvaluateScatterSample(
                 * (earthShadow * transmittanceToSun * phaseTimesScattering)
                 + s.sunIlluminance * multiScattered;
 
-    // 雾的环境项：各向同性相位下 ∫p·L dω 就是平均入射亮度本身，
-    // 所以这里是 σ_s · L̄ 而**不是** σ_s · L̄ · (1/4π) —— 那个 1/4π 已经在
-    // VistaShAmbientMean 的推导里约掉了（(1/4π)·∫L dω = L̄）。写成后者的症状是
-    // 阴影里的雾暗 12.6 倍，看起来像"环境项强度调小了"，很难反查。
-    // 用 fog.scattering 而不是 fogScattering：自遮蔽只挡直射太阳，不挡天光。
-    o.scattered += fog.scattering * (s.fogAmbientRadiance * _VistaFogHeight.z);
+    // 雾的直射 + 环境项，一次累加。
+    // 与 #18b 之前不是逐位相同（雾那一项的结合顺序变了，fp32 相对扰动 ~1e-7），
+    // 但晴空是逐位相同的 —— fog.scattering = 0 时这整项精确为 0。
+    // 提取的收益（J 只有一份实现）远大于这个扰动，它比 fp16 的 LUT 存储精度还小两个数量级。
+    o.scattered += fog.scattering * VistaFogSourceRadiance(
+        fog, rayDir, sunDir, transmittanceToSun, earthShadow,
+        VistaFogTransmittanceToSun(fog, sunDir.y),
+        s.sunIlluminance, s.fogAmbientRadiance, s.applyPhase);
 
     // 不含雾：MS LUT 是静态的、球对称参数化的大气量，见 FogMedium.hlsl。
     o.msAs1 = medium.scatteringRayleigh + medium.scatteringMie;
     // 大气顶附近密度指数衰减到接近 0，除法要兜底
     o.extinction = max(medium.extinction + fog.extinction, 1e-9);
     return o;
+}
+
+// ----------------------------------------------------------------------------
+//  天空像素的雾合成（#18b）
+//
+//  ---- 公式 ----
+//      L' = L_sky·T_fog + albedo·J·(1 − T_fog)
+//  右项**不是**凑出来的经验式，它是精确解。令 u(t) = ∫₀^t σ_t ds，则 σ_t dt = du，
+//      ∫₀^∞ σ_s·ρ·J·e^(−u) dt = albedo·J·∫₀^{u_∞} e^(−u) du = albedo·J·(1 − T_∞)
+//  逐通道成立（σ_t 是 RGB，三个通道各自独立积分）。σ_s 在换元里被约掉了，
+//  所以这里乘的是无量纲的 albedo 而不是 fog.scattering —— 这也是
+//  VistaFogAlbedo() 需要单独提出来的原因。
+//
+//  ---- 三个近似里剩下的两个（第一个已经被消掉了）----
+//  ① J 沿视线取常数。**自遮蔽那一项已经不是近似了**：它随高度的变化有精确的
+//     入散射加权闭式解，见 VistaFogSunTransmittanceMean。#18b 的第一版把它冻在
+//     相机处，实测在「太阳 5° + 自遮蔽开」下相对差 34.8%（同一档关掉自遮蔽只有 1.7%），
+//     所以那不是"小近似"而是主项，必须算准。
+//     仍然取常数的是 T_atmSun 与 earthShadow 两项：相位是**精确**常数
+//     （cosθ 沿直线不变），而这两项在雾的有效路径（≤ 一个 e 折，≤ 数十 km）上
+//     几乎不变 —— 大气到太阳的透射率沿水平方向的变化尺度是数百 km。
+//  ② 整个 L_sky 都被 T_fog 衰减，包括那些**在雾层内部**产生的大气内散射
+//     （它们本该只被部分雾衰减）。误差 ≈「大气内散射有多大份额是在雾的沿线跨度内
+//     产生的」×(1 − T_fog)，两个因子的乘积在 T_fog ≈ 0.3 附近取极大：
+//       · 相机在雾里、非掠射：两者的沿线跨度分别是 H/dy 与 H_Rayleigh/dy，
+//         份额 = H/H_R = 50 m / 8 km ≈ 0.6%。实测 ≤ 1.8%，对得上。
+//       · 掠射（Chapman 区）：两个跨度**都**被曲率封顶成 sqrt(2πR·H)，
+//         份额变成 sqrt(H/H_R) = 7.9% —— 是比值的**平方根**，不再是比值。
+//         再乘上 O(1) 的分布因子，量级就到十几个百分点。
+//         实测最差 16.4%（相机 300 m、雾层 50 m、σ_t = 10/km、仰角 0.06°）。
+//     这个区间是两项式的**结构性上限**，不是可以调参调掉的东西：要修正它必须知道
+//     大气内散射沿线的分布，而那需要第二张表 —— 也就是 #18b 一开始否决掉的方案②。
+//     UE5 的 ExponentialHeightFog 叠在 SkyAtmosphere 上有同一个上限。
+//     判据5 给这个区间单独一条**实测基线**（不是质量门），见 VistaSkyFogSelfTest。
+//  ③ 雾的内散射不被大气透射率衰减。雾的有效路径 ~1 km 内大气透射率 >0.97。
+//
+//  ---- 为什么在曝光之前 ----
+//  J 是绝对光度量（cd/m²），L_sky 在这里也还是绝对量。调用点必须在
+//  `luminance *= VISTA_EXPOSURE` **之前**调这个函数，否则 (1−T) 那一项会缺一次曝光，
+//  症状是雾在天空上亮 4 万倍 —— 那个是能一眼看见的，所以不给它加运行时保护。
+//
+//  fogAmbientRadiance 由调用方传（用 VistaShAmbientMean / VistaSkyAmbientMean），
+//  理由与 VistaRaymarchSettings.fogAmbientRadiance 同：本文件不依赖那个 SSBO。
+// ----------------------------------------------------------------------------
+void VistaApplyFogToSky(
+    inout float3 skyLuminance, float3 posKm, float3 rayDir, float3 sunDir,
+    float3 sunIlluminance, float3 fogAmbientRadiance)
+{
+    // 相机处的雾。闭式解的 τ = σ_t·ρ(相机)·pathKm 用的就是这一份密度。
+    VistaFogSample fog = VistaSampleFogAlongRay(0.0, rayDir.y);
+
+    // τ 留在手上（不是只留 exp(−τ)）：下面那个加权均值必须用**同一个** τ，
+    // 否则 I = albedo·J̄·(1 − T) 就从恒等式退化成两个近似的比较。
+    float3 tauView      = VistaFogOpticalDepth(fog, VistaFogSkyRayPathKm(rayDir.y));
+    float3 transmittance = exp(-tauView);
+
+    // 自遮蔽沿射线是变的（爬高 ⇒ ρ 掉 ⇒ 遮挡变弱），而两项式只有一个 J̄。
+    // 冻在相机处等于取 τ → ∞ 的极限，实测在中等厚度 + 低太阳下偏暗 34.8%；
+    // 这里代进精确的入散射加权均值，见 VistaFogSunTransmittanceMean 的推导。
+    float3 tauSun     = VistaFogOpticalDepth(fog, VistaFogSunPathKm(sunDir.y));
+    float3 selfShadow = VistaFogSunTransmittanceMean(tauView, tauSun);
+
+    float  r  = length(posKm);
+    float3 up = posKm / r;
+
+    float3 sourceRadiance = VistaFogSourceRadiance(
+        fog, rayDir, sunDir,
+        VistaSampleTransmittanceToSun(r, dot(sunDir, up)),
+        VistaEarthShadow(posKm, sunDir),
+        selfShadow,
+        sunIlluminance, fogAmbientRadiance, true);
+
+    // 雾关掉时 σ_t = 0 ⇒ transmittance 逐通道精确为 1 ⇒ x·1 + albedo·J·0 = x，
+    // 逐位不变。这就是"失能态 = 零态"在这个缝上的表现，不需要 uniform 分支。
+    skyLuminance = skyLuminance * transmittance
+                 + VistaFogAlbedo() * (sourceRadiance * (1.0 - transmittance));
 }
 
 // ----------------------------------------------------------------------------

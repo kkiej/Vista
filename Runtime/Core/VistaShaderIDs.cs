@@ -71,6 +71,12 @@ namespace Vista
         public static readonly int _VistaSkyBandingParams         = Shader.PropertyToID("_VistaSkyBandingParams");
         public static readonly int _VistaSkyBandingRW             = Shader.PropertyToID("_VistaSkyBandingRW");
 
+        // ---- Atmosphere: 天空像素的雾闭式解判据（#18b，仅 Editor 自检）----
+        // 这个核不采任何 LUT（它自己 march），但要读 _VistaSkyAmbientSh —— 雾的
+        // 环境项必须与 AP kernel 用同一份天光，否则差值里混进一个与雾无关的常量偏置。
+        public static readonly int _VistaSkyFogParams             = Shader.PropertyToID("_VistaSkyFogParams");
+        public static readonly int _VistaSkyFogRW                 = Shader.PropertyToID("_VistaSkyFogRW");
+
         // ---- Atmosphere: 天空镜面反射 cubemap ----
         // 注意 RW 那个在 HLSL 里是 RWTexture2DArray（cube 的 UAV view 就是 2D array view），
         // 而只读那个是 TEXTURECUBE。同一张资源、两种 view，绑定点必须分开。

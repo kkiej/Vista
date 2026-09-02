@@ -775,7 +775,7 @@ namespace Vista.Editor
                         System.Action<CommandBuffer>> chainWith,
             Sample tApNoFog, Sample tSteadyNoFog)
         {
-            // σ_t = 1000/400 = 2.5 /km，与 Validate Fog in AP LUT 的 B 档逐字相同，
+            // σ_t = 1000/400 = 2.5 /km，与 Validate Fog (AP + Sky) 的 B 档逐字相同，
             // 两份报告才能对着看。均匀档只改标高，σ_t 一个字都不动 —— 这是本节归因的前提。
             var expFog = FogOf(400f, 50f);
             var uniFog = FogOf(400f, float.PositiveInfinity);
@@ -988,7 +988,7 @@ namespace Vista.Editor
         /// <summary>
         /// 带俯仰角的视图。必须显式给视锥四角：<c>Create</c> 的兜底视锥是水平的，
         /// 而雾的步长上限完全由 <c>dir.y</c> 驱动 —— 靠兜底值就只能量到平视那一档。
-        /// 30° 半张角 / 16:9 与 <c>Validate Fog in AP LUT</c> 一致。
+        /// 30° 半张角 / 16:9 与 <c>Validate Fog (AP + Sky)</c> 一致。
         /// </summary>
         static VistaAtmosphereViewData MakeProfilerView(
             VistaAtmosphereParameters p, Vector3 cameraPos, float pitchDeg, Vector3 sunDir)

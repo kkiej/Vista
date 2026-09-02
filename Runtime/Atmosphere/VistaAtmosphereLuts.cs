@@ -144,6 +144,30 @@ namespace Vista
         /// </summary>
         public const int k_SkyBandingMaxCount = 256;
 
+        /// <summary>
+        /// 天空雾判据（#18b）的方向数与输出步幅。
+        /// 32 个仰角（几何阶梯 0.05°→90°）× 2 个方位（正对太阳 / 反日点）。
+        /// 步幅与 <c>VISTA_SKYFOG_STRIDE</c> 一致，改一处必须改两处 ——
+        /// 不一致的症状是读回的分量整体错位，看起来像"闭式解全错"。
+        /// </summary>
+        public const int k_SkyFogElevCount = 32;
+        public const int k_SkyFogDirCount  = k_SkyFogElevCount * 2;
+        public const int k_SkyFogStride    = 7;
+
+        /// <summary>
+        /// 判据②参考解的步数。这把尺子量的是 VistaApplyFogToSky 的三个近似（~几个百分点），
+        /// 而它自己的中点法误差是 (dt/L)²/24 —— L 是雾沿射线的 e 折。核里把 dt/L 一并
+        /// 输出，C# 侧据此印出尺子地板并把地板不足的方向**排除并计数**，
+        /// 而不是让"尺子的地板与被测量同量级"这件事无声地通过。
+        /// </summary>
+        public const int k_SkyFogRefSteps = 16384;
+
+        /// <summary>
+        /// 判据①参考解的步数。步长按雾的 e 折定（25 个 e 折 / N 步），
+        /// 所以 dt/L = 25/N = 1.5e-3，误差 1e-7 —— 比被测的闭式解偏差小四个数量级。
+        /// </summary>
+        public const int k_SkyFogTauSteps = 16384;
+
         const string k_KernelTransmittance    = "TransmittanceLut";
         const string k_KernelMultiScattering  = "MultiScatteringLut";
         const string k_KernelSkyView          = "SkyViewLut";
@@ -154,6 +178,7 @@ namespace Vista
         const string k_KernelSkyAmbientSh     = "SkyAmbientSh";
         const string k_KernelSkyAmbientShRef  = "SkyAmbientShReference";
         const string k_KernelSkyBanding       = "SkyViewBandingSignature";
+        const string k_KernelSkyFogError      = "SkyFogError";
         const string k_KernelSkyReflection       = "SkyReflectionFilter";
         const string k_KernelSkyReflectionWide   = "SkyReflectionFilterWide";
         const string k_KernelSkyReflectionVerify = "SkyReflectionVerify";
@@ -170,6 +195,7 @@ namespace Vista
         GraphicsBuffer m_SkyAmbientShRef;
         GraphicsBuffer m_SkyReflectionVerify;
         GraphicsBuffer m_SkyViewBanding;
+        GraphicsBuffer m_SkyFogError;
 
         int m_SkyViewWidth  = k_SkyViewWidthDefault;
         int m_SkyViewHeight = k_SkyViewHeightDefault;
@@ -185,6 +211,7 @@ namespace Vista
         readonly int m_KernelSkyAmbientShIdx     = -1;
         readonly int m_KernelSkyAmbientShRefIdx  = -1;
         readonly int m_KernelSkyBandingIdx       = -1;
+        readonly int m_KernelSkyFogErrorIdx      = -1;
 
         // 反射走**另一个** .compute（见 VistaRuntimeResources 的理由：ImageBasedLighting.hlsl
         // 的 include 图会拖慢那九个大气核的每次迭代）。IVistaLutDispatcher 的每个方法
@@ -249,6 +276,9 @@ namespace Vista
 
         /// <summary>banding 签名采样输出。只在 <see cref="EnsureSkyViewBanding"/> 之后非 null。</summary>
         public GraphicsBuffer skyViewBandingBuffer => m_SkyViewBanding;
+
+        /// <summary>天空雾判据输出（#18b）。只在 <see cref="EnsureSkyFogError"/> 之后非 null。</summary>
+        public GraphicsBuffer skyFogErrorBuffer => m_SkyFogError;
 
         public int skyViewWidth  => m_SkyViewWidth;
         public int skyViewHeight => m_SkyViewHeight;
@@ -328,6 +358,8 @@ namespace Vista
                 m_KernelSkyAmbientShRefIdx = m_LutCS.FindKernel(k_KernelSkyAmbientShRef);
             if (m_LutCS.HasKernel(k_KernelSkyBanding))
                 m_KernelSkyBandingIdx = m_LutCS.FindKernel(k_KernelSkyBanding);
+            if (m_LutCS.HasKernel(k_KernelSkyFogError))
+                m_KernelSkyFogErrorIdx = m_LutCS.FindKernel(k_KernelSkyFogError);
         }
 
         /// <summary>
@@ -521,6 +553,22 @@ namespace Vista
             return true;
         }
 
+        /// <summary>
+        /// 仅供 Editor 自检：按需分配天空雾判据缓冲（64 方向 × 5 × float4 = 5 KB）。
+        /// </summary>
+        public bool EnsureSkyFogError()
+        {
+            if (!isValid || m_KernelSkyFogErrorIdx < 0) return false;
+
+            m_SkyFogError ??= new GraphicsBuffer(
+                GraphicsBuffer.Target.Structured,
+                k_SkyFogDirCount * k_SkyFogStride, sizeof(float) * 4)
+            {
+                name = "VistaSkyFogError",
+            };
+            return true;
+        }
+
         // ====================================================================
         //  执行期（GPU dispatch）
         //
@@ -694,6 +742,44 @@ namespace Vista
                 VistaShaderIDs._VistaSkyBandingRW, VistaLutBufferSlot.SkyViewBanding);
             d.Dispatch(m_LutCS, m_KernelSkyBandingIdx,
                 VistaComputeUtils.DivRoundUp(count, 64), 1, 1);
+        }
+
+        /// <summary>
+        /// 仅供 Editor 自检（#18b）：天空像素的雾闭式解 vs 高步数数值参考。
+        /// 结果写进 <see cref="skyFogErrorBuffer"/>，每方向 <see cref="k_SkyFogStride"/> 个 float4。
+        ///
+        /// 与 <see cref="RenderSkyViewBanding{T}"/> 不同，这个核**不采任何 LUT 表**（除了
+        /// 积分器自己要的 Transmittance / MultiScattering）—— 它自己 march。
+        /// 理由：判据②要比的两个操作数必须共用同一把尺子，若拿 Sky-View 表当 L_sky，
+        /// 差值里就混进了那张表的 fp16 + 双线性误差，而这条判据要隔离的是
+        /// VistaApplyFogToSky 自己公开的三个近似。表的误差另有判据。
+        /// 所以它**不要求** <see cref="RenderSkyViewLut{T}"/> 先跑；但要求
+        /// <see cref="RenderSkyAmbientSh{T}"/> 先跑（雾的环境项读那份 SH）。
+        /// </summary>
+        /// <param name="fog">被测的雾配置。全零（雾关）时判据③要求输出逐位等于无雾。</param>
+        public void RenderSkyFogError<T>(T d, in VistaAtmosphereViewData view, VistaFogSettings fog)
+            where T : struct, IVistaLutDispatcher
+        {
+            if (!isValid || m_KernelSkyFogErrorIdx < 0 || m_SkyFogError == null) return;
+
+            // 逐视图常量自己推一遍：核里要 _VistaViewPosKm（相机位置）、_VistaSunDirection、
+            // 以及 _VistaSun（太阳照度）。BindAerialPerspective 不需要 —— 这个核不读视锥。
+            view.Bind(d, m_SkyViewWidth, m_SkyViewHeight);
+            view.BindFog(d, fog);
+
+            d.SetGlobalVector(VistaShaderIDs._VistaSkyFogParams,
+                new Vector4(k_SkyFogDirCount, k_SkyFogRefSteps, k_SkyFogTauSteps, 0f));
+
+            d.SetTexture(m_LutCS, m_KernelSkyFogErrorIdx,
+                VistaShaderIDs._VistaTransmittanceLut, VistaLutSlot.Transmittance);
+            d.SetTexture(m_LutCS, m_KernelSkyFogErrorIdx,
+                VistaShaderIDs._VistaMultiScatteringLut, VistaLutSlot.MultiScattering);
+            d.SetBuffer(m_LutCS, m_KernelSkyFogErrorIdx,
+                VistaShaderIDs._VistaSkyAmbientSh, VistaLutBufferSlot.SkyAmbientSh);
+            d.SetBuffer(m_LutCS, m_KernelSkyFogErrorIdx,
+                VistaShaderIDs._VistaSkyFogRW, VistaLutBufferSlot.SkyFogError);
+            d.Dispatch(m_LutCS, m_KernelSkyFogErrorIdx,
+                VistaComputeUtils.DivRoundUp(k_SkyFogDirCount, 64), 1, 1);
         }
 
         // ====================================================================
@@ -1115,6 +1201,14 @@ namespace Vista
                 mode, arcStartDeg, arcStepDeg, count);
         }
 
+        /// <summary>立即模式的天空雾判据（#18b）。调用前需先 <see cref="EnsureSkyFogError"/>。</summary>
+        public void RenderSkyFogError(
+            CommandBuffer cmd, in VistaAtmosphereViewData view, VistaFogSettings fog)
+        {
+            if (cmd == null) throw new ArgumentNullException(nameof(cmd));
+            RenderSkyFogError(new VistaImmediateLutDispatcher(cmd, this), view, fog);
+        }
+
         /// <summary>
         /// 立即模式的反射 cubemap。调用前需先 <see cref="PrepareSkyReflection"/>，
         /// 并把它的返回值原样传进来。
@@ -1286,6 +1380,8 @@ namespace Vista
             m_SkyReflectionVerify = null;
             m_SkyViewBanding?.Dispose();
             m_SkyViewBanding = null;
+            m_SkyFogError?.Dispose();
+            m_SkyFogError = null;
             m_BakedParams = null;
         }
 

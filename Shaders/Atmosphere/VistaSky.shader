@@ -41,6 +41,10 @@ Shader "Vista/Sky"
 
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
             #include "Packages/com.kkiej.vista/ShaderLibrary/AtmosphereScattering.hlsl"
+            // 只为了 VistaSkyAmbientMean()（雾的天光环境项）。这个 include 带来一个
+            // StructuredBuffer 绑定，所以它在**天空盒**里，不在 AtmosphereScattering.hlsl 里 ——
+            // 后者被 Vista/Lit、水面等大量片元着色器 include，见那边 fogAmbientRadiance 的注释。
+            #include "Packages/com.kkiej.vista/ShaderLibrary/SphericalHarmonics.hlsl"
 
             // SRP Batcher 兼容：所有材质属性必须在 UnityPerMaterial 里
             CBUFFER_START(UnityPerMaterial)
@@ -106,7 +110,18 @@ Shader "Vista/Sky"
                     }
                 }
 
-                luminance *= _VistaSkyMultiplier * VISTA_EXPOSURE;
+                luminance *= _VistaSkyMultiplier;
+
+                // 雾（#18b）。必须在曝光**之前**：VistaApplyFogToSky 加进来的
+                // albedo·J·(1−T) 是绝对光度量（J 里的 sunIlluminance 是 12 万 lux）。
+                // 放到曝光之后的症状是天空上的雾亮 4 万倍。
+                //
+                // 太阳圆盘刻意在被衰减的那一项里：浓雾里看不见太阳本体，
+                // 只剩一团被 HG 相位抬亮的雾 —— 那正是 albedo·J·(1−T) 给出的东西。
+                VistaApplyFogToSky(luminance, posKm, rayDir, sunDir,
+                                   _VistaSun.xyz, VistaSkyAmbientMean());
+
+                luminance *= VISTA_EXPOSURE;
 
                 // fp16 渲染目标下 65504 就溢出成 inf，进而污染 bloom / tonemap。
                 // 太阳圆盘乘完曝光仍可达 1e4~1e5 量级，所以必须钳。

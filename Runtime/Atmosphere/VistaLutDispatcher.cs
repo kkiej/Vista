@@ -51,6 +51,8 @@ namespace Vista
         SkyReflectionVerify,
         /// <summary>仅 Editor 自检使用（banding 签名采样结果）。运行时路径不分配它。</summary>
         SkyViewBanding,
+        /// <summary>仅 Editor 自检使用（天空雾闭式解 vs 数值参考）。运行时路径不分配它。</summary>
+        SkyFogError,
     }
 
     /// <summary>
@@ -146,6 +148,7 @@ namespace Vista
             VistaLutBufferSlot.SkyAmbientShReference => m_Luts.skyAmbientShRefBuffer,
             VistaLutBufferSlot.SkyReflectionVerify   => m_Luts.skyReflectionVerifyBuffer,
             VistaLutBufferSlot.SkyViewBanding        => m_Luts.skyViewBandingBuffer,
+            VistaLutBufferSlot.SkyFogError           => m_Luts.skyFogErrorBuffer,
             _                                        => null,
         };
     }

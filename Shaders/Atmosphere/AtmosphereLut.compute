@@ -18,6 +18,7 @@
 #pragma kernel SkyAmbientSh
 #pragma kernel SkyAmbientShReference
 #pragma kernel SkyViewBandingSignature
+#pragma kernel SkyFogError
 
 // 不含 gles3：整套 LUT 走 compute + RWTexture。移动端目标是 Vulkan / Metal，
 // GLES3.x 上改用 fragment shader 写 LUT 的降级路径（见 CHANGELOG）。
@@ -997,4 +998,195 @@ void SkyViewBandingSignature(uint3 id : SV_DispatchThreadID)
     // 但通道分解要留着（见头部注释）。
     float lum = dot(L, float3(0.2126, 0.7152, 0.0722));
     _VistaSkyBandingRW[id.x] = float4(L, lum);
+}
+
+// ============================================================================
+//  天空像素的雾：闭式解判据（#18b）
+//
+//  ---- 被测的是什么 ----
+//  天空像素不走 march（AP 刻意排除它们，见 FogMedium.hlsl「天空像素的雾」），
+//  它套的是 VistaApplyFogToSky 的两项式
+//      L' = L_sky·T_fog + albedo·J·(1 − T_fog)
+//  这个核把它拆成两件可以分别证伪的事，各配一把独立的尺子：
+//    判据①  T_fog 的闭式解 vs 同一条射线上的高步数数值积分
+//    判据②  整个两项式  vs 同一条射线上的高步数含雾 march（refOn）
+//
+//  ---- 为什么①的尺子要自己写一遍循环，不能用 VistaApReference ----
+//  VistaIntegrateScatteredLuminance 的步长是视线全长均分（或 t² 分布），
+//  **没有** VistaFogStepMaxKm。一条到大气顶的天空射线长 100~1100 km，
+//  4096 步下 dt ≈ 25~270 m，而雾沿射线的 e 折是 20~200 m ⇒ x = dt/L ≈ 0.5，
+//  中点法的 x²/24 ≈ 1% —— 和被测的闭式解偏差同一个量级。
+//  「尺子的地板与被测量的期望值同量级时，尺子会自己伪造一个结论」。
+//  所以①的参考解按**雾的 e 折**定步长：25 个 e 折 / 16384 步 ⇒ x = 1.5e-3，
+//  x²/24 = 1e-7，比被测量小四个数量级。
+//  只复制**循环**，密度剖面与 σ_t 仍然走 VistaSampleFogAlongRay —— 物理只有一份。
+//  判据②没这个待遇：它测的是 VistaApplyFogToSky 的近似，而参考只能是含雾 march
+//  本身，于是尺子就是那个没有雾感知步长的积分器 —— 它的地板逐方向输出（见 [5].y），
+//  由 C# 侧排除。
+//
+//  ---- ②为什么用 refOff 而不是 SkyView LUT 当 L_sky ----
+//  真实调用点里 L_sky 来自 SkyView LUT，但那张表自己有 fp16 + 双线性的误差。
+//  拿它当操作数，测出来的差值里混着表的误差，而两个操作数（模型、refOn）
+//  用的还是**不同的尺子**。这里两边都用同一次 march：
+//      模型 = refOff.luminance·T + albedo·J·(1−T)　　真值 = refOn.luminance
+//  于是差值只包含 VistaApplyFogToSky 自己公开的三个近似，别的都约掉了。
+//  SkyView LUT 的误差另有判据（#7 的 SkyViewLutRoundTrip / 台阶签名），不在这里重复。
+//
+//  ---- 方向怎么排 ----
+//  仰角是几何阶梯 0.05° → 90°（比 1800^(1/(n/2−1))），因为闭式解的全部难点都在
+//  掠射端：T = exp(−k/dir.y) 对 dir.y 的导数在地平线处发散，均匀分仰角会把
+//  绝大多数样本浪费在天顶附近那段几乎是常数的区域。
+//  两个方位：0°（正对太阳，HG 相位最大）与 180°（反日点，相位最小），
+//  用来让 J 里的相位项真的跨越它的动态范围 —— 只测正对太阳的话，
+//  相位写错符号也能全绿。
+//  仰角一律 > 0，所以没有射线打到星球本体，refOn/refOff 的 tMax 都是大气顶。
+// ============================================================================
+
+// x = 方向总数（含两个方位）；y = refOn/refOff 的步数；z = ①参考解的步数；w 未用
+float4 _VistaSkyFogParams;
+
+// 每个方向 VISTA_SKYFOG_STRIDE 个 float4，见下面的写入处。
+RWStructuredBuffer<float4> _VistaSkyFogRW;
+
+#define VISTA_SKYFOG_STRIDE      7u
+// 积到多少个 e 折为止。截断掉的尾巴是 e^-25 = 1.4e-11，比 fp32 的相对精度还小。
+#define VISTA_SKYFOG_REF_EFOLDS  25.0
+
+// 沿射线到无穷的雾光学深度，数值积分。返回 τ（逐通道），并给出 dt/e折 供 C# 印尺子地板。
+//
+// 步长按雾的 e 折定：efold = H/dy。均匀雾（1/H = 0）时 VistaFogScaleHeightKm()
+// 兜到 1000 km，于是 tEnd = 25000/dy km —— 那不是"到无穷"的正确答案（均匀雾的
+// 柱密度真的是无穷），所以均匀雾这一档必须在 C# 侧被排除出判据①。
+// 这里不加分支去掩盖它：让读数明显地对不上，比静默钳一个值好查。
+float3 VistaSkyFogOpticalDepthRef(float rayDirWorldY, uint steps, out float stepOverEfold)
+{
+    float efoldKm = VistaFogScaleHeightKm() * rcp(max(rayDirWorldY, 1e-6));
+    float tEndKm  = VISTA_SKYFOG_REF_EFOLDS * efoldKm;
+    float dtKm    = tEndKm / (float)steps;
+
+    stepOverEfold = dtKm / efoldKm;   // = 25/steps，印出来是为了让"尺子够不够"可核
+
+    // 中点法。VISTA_SAMPLE_SEGMENT_T 在这里刻意**不复用** —— 那个常量是
+    // VistaSegmentIntegral 的段内取样位置（它还要配合段内解析衰减），
+    // 而这里是一个纯粹的一维求积，中点是 0.5 有独立的理由（一阶项对称抵消）。
+    float3 tau = 0.0;
+    for (uint i = 0u; i < steps; ++i)
+    {
+        float tKm = ((float)i + 0.5) * dtKm;
+        tau += VistaSampleFogAlongRay(tKm, rayDirWorldY).extinction;
+    }
+    return tau * dtKm;
+}
+
+VistaScatteringResult VistaSkyFogRef(float3 posKm, float3 rayDir, float3 sunDir,
+                                    uint steps, bool includeFog, float3 fogAmbient)
+{
+    VistaRaymarchSettings s = VistaDefaultRaymarchSettings();
+    s.sampleCount         = (float)steps;
+    s.sampleCountMax      = (float)steps;
+    s.variableSampleCount = false;
+    s.applyPhase          = true;
+    s.useMultiScattering  = true;
+    // 仰角一律 > 0 ⇒ 射线不打地面 ⇒ 这一项无论开关都不参与。显式关掉是为了让
+    // refOn/refOff 与 VistaApplyFogToSky 的模型在"含哪些项"上完全对齐。
+    s.includeGroundBounce = false;
+    s.tMax                = -1.0;
+    s.includeFog          = includeFog;
+    s.fogAmbientRadiance  = fogAmbient;
+    return VistaIntegrateScatteredLuminance(posKm, rayDir, sunDir, s);
+}
+
+[numthreads(64, 1, 1)]
+void SkyFogError(uint3 id : SV_DispatchThreadID)
+{
+    uint count = (uint)_VistaSkyFogParams.x;
+    if (id.x >= count)
+        return;
+
+    uint  elevCount = max(count / 2u, 2u);
+    uint  e         = id.x % elevCount;
+    float azDeg     = (id.x < elevCount) ? 0.0 : 180.0;
+
+    // 几何阶梯 0.05° → 90°。1800 = 90/0.05。
+    float elevDeg = 0.05 * pow(1800.0, (float)e / (float)(elevCount - 1u));
+
+    float el = radians(elevDeg);
+    float az = radians(azDeg);
+    // 与 VistaAtmosphereSelfTest.MakeView / SkyViewBandingSignature 同一套约定。
+    float3 rayDir = float3(sin(az) * cos(el), sin(el), cos(az) * cos(el));
+
+    float3 posKm  = _VistaViewPosKm.xyz;
+    float3 sunDir = _VistaSunDirection.xyz;
+
+    float3 ambientSh[VISTA_SH_COEFF_COUNT];
+    VistaLoadSkyAmbientSh(ambientSh);
+    float3 fogAmbient = VistaShAmbientMean(ambientSh);
+
+    // ---- 判据① 的两边 ----
+    VistaFogSample fog = VistaSampleFogAlongRay(0.0, rayDir.y);
+    float3 tAna = VistaFogTransmittanceAlongSkyRay(fog, rayDir.y);
+
+    float stepOverEfold;
+    float3 tauRef = VistaSkyFogOpticalDepthRef(
+        rayDir.y, (uint)_VistaSkyFogParams.z, stepOverEfold);
+    float3 tRef = exp(-tauRef);
+
+    // 分类用的三个路径长度。C# 侧只做比较，不做物理：
+    //   dir.y 被地板兜住 ⟺ pathFloored < pathSlab
+    //   Chapman 上界生效 ⟺ pathAna     < pathFloored
+    // 这两段都是对平板解的**刻意**偏离，必须排除出判据①（各有自己的覆盖性断言）。
+    float scaleHeightKm  = VistaFogScaleHeightKm();
+    float chapmanKm      = sqrt(6.2831853 * VISTA_BOTTOM_RADIUS * scaleHeightKm);
+    float pathSlabKm     = scaleHeightKm * rcp(max(rayDir.y, 1e-9));
+    float pathFlooredKm  = scaleHeightKm * rcp(max(rayDir.y, 1e-3));
+    // 这一个取自**被测函数本体**，不重写 min()：三条路径里只有它是被判的那一条，
+    // 在这里重算一遍就等于让分类器去比较两份实现，Chapman 上界写错时症状会变成
+    //「排除逻辑和闭式解一起错，判据照样全绿」。
+    float pathAnaKm      = VistaFogSkyRayPathKm(rayDir.y);
+
+    // ---- 判据② 的三边 ----
+    uint refSteps = (uint)_VistaSkyFogParams.y;
+    VistaScatteringResult refOff = VistaSkyFogRef(posKm, rayDir, sunDir, refSteps, false, 0.0);
+    VistaScatteringResult refOn  = VistaSkyFogRef(posKm, rayDir, sunDir, refSteps, true,  fogAmbient);
+
+    // 模型：被测函数本体。刻意 in-place 改 refOff 的副本，走的就是天空盒里那一行。
+    float3 model = refOff.luminance;
+    VistaApplyFogToSky(model, posKm, rayDir, sunDir, _VistaSun.xyz, fogAmbient);
+
+    // ---- 判据②那把尺子自己的地板 ----
+    // refOn/refOff 走的是 VistaIntegrateScatteredLuminance，它**没有** VistaFogStepMaxKm，
+    // 步长是 tMax 均分。所以它对雾的中点法误差是 (dt/L)²/24，L = 雾沿射线的 e 折。
+    // 这个比值必须逐方向输出：它随仰角变化，而 C# 侧要靠它把"尺子不够细"的方向
+    // **排除并计数**，而不是让「尺子的地板与被测量同量级」这件事无声地通过。
+    //
+    // tMax 这里重算一次而不是从 VistaScatteringResult 里带出来：仰角一律 > 0 ⇒
+    // tBottom < 0 ⇒ 积分器取的就是 tTop，同一个 helper 同一行表达式，没有第二份物理。
+    // 均匀雾（1/H = 0）时 efold 兜到 1000/dy km ⇒ 比值趋 0，这是**对的**：
+    // 密度是常数，中点法对常数精确，地板真的是 0。
+    float tTopKm  = VistaRaySphereIntersectNearest(posKm, rayDir, float3(0.0, 0.0, 0.0),
+                                                  VISTA_TOP_RADIUS);
+    float efoldKm = VistaFogScaleHeightKm() * rcp(max(rayDir.y, 1e-6));
+    float refStepOverEfold = (tTopKm / (float)refSteps) * rcp(efoldKm);
+
+    // ---- 判据7 的另外两个见证：VistaFogTransmittanceToSun 自己的两条分支 ----
+    // 都拿**被测函数自己**当参考，不在 C# 侧重写那个 min / 那个开关：
+    //   自遮蔽关   ⟺ sunPathKm == 0（函数在 .w < 0.5 时返回 0，这是它的零态）
+    //   掠射上限生效 ⟺ sunPathKm >= sunPathCapKm
+    // sunPathCapKm 传 0 进去，rcp(max(0, 1e-3)) = 1000 必然大于任何合理的
+    // _VistaFogExtinct.w，于是它一定走 min 的上界那一支 —— 用同一个函数体
+    // 造出"上界值"本身，比在 C# 里写 H·grazingMax 少一份实现。
+    float sunPathKm    = VistaFogSunPathKm(sunDir.y);
+    float sunPathCapKm = VistaFogSunPathKm(0.0);
+
+    uint b = id.x * VISTA_SKYFOG_STRIDE;
+    _VistaSkyFogRW[b + 0u] = float4(tAna,              pathAnaKm);
+    _VistaSkyFogRW[b + 1u] = float4(tRef,              pathSlabKm);
+    _VistaSkyFogRW[b + 2u] = float4(refOff.luminance,  pathFlooredKm);
+    _VistaSkyFogRW[b + 3u] = float4(refOn.luminance,   elevDeg);
+    _VistaSkyFogRW[b + 4u] = float4(model,             rayDir.y);
+    // 两把尺子的地板 + 视线长度 + 仰角。elevDeg 从核里带出来而不是在 C# 侧
+    // 重算几何阶梯：那个公式重写一遍就是第二份实现，写错的症状是报表里
+    // 「哪个仰角超标」指错方向，而所有判据照样绿。
+    _VistaSkyFogRW[b + 5u] = float4(stepOverEfold, refStepOverEfold, tTopKm, elevDeg);
+    _VistaSkyFogRW[b + 6u] = float4(sunPathKm, sunPathCapKm, 0.0, 0.0);
 }
