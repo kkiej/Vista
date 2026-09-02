@@ -135,7 +135,13 @@ namespace Vista
             // 为 false，PrepareSkyReflection 返回 Off，天空/AP/环境光全都照常工作。
             // 不在这里检查它，是因为把它并进上面那个 return 会让"反射核缺失"
             // 表现为"整个大气模块不生效"。
-            m_Luts = new VistaAtmosphereLuts(resources.atmosphereLutCS, resources.skyReflectionCS);
+            // 体积雾核同理可以为 null。它缺失时 froxelVolume.isValid 为 false，
+            // 近层雾整个不生效，雾回落到 AP LUT 那一层 —— 画面上是「有雾、没有光柱」。
+            // #19 阶段这个 compute 只被 Editor 自检消费（RenderGraph 接线在 #20），
+            // 但资源引用现在就接上：ResourcePath 的自动填充失败是静默的，
+            // 而自检里那条「资源容器里的 compute 非 null」的判据正好覆盖它。
+            m_Luts = new VistaAtmosphereLuts(resources.atmosphereLutCS, resources.skyReflectionCS,
+                                             resources.volumetricFogCS);
             m_Luts.SetSkyViewResolution(m_SkyViewResolution.x, m_SkyViewResolution.y);
 
             m_Pass ??= new VistaAtmospherePass();

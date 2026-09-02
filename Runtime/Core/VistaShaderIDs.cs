@@ -65,6 +65,24 @@ namespace Vista
         public static readonly int _VistaFogExtinct               = Shader.PropertyToID("_VistaFogExtinct");
         public static readonly int _VistaFogHeight                = Shader.PropertyToID("_VistaFogHeight");
 
+        // ---- Volumetrics: VistaFroxelCB (ShaderLibrary/FroxelVolume.hlsl) ----
+        // 失能态同样是全零：logRatio = 0 且 rcpLog = 0 ⇒ 编码坐标恒 0、距离恒 0，
+        // 不是 NaN。与 VistaFogCB 同一条「关掉 = 零态」的约定。
+        public static readonly int _VistaFroxelRange              = Shader.PropertyToID("_VistaFroxelRange");
+        public static readonly int _VistaFroxelSize               = Shader.PropertyToID("_VistaFroxelSize");
+
+        // ---- Volumetrics: froxel 体的三张表 ----
+        // 注入表有两个绑定点：写用 RW（RWTexture3D），读用 Read（Texture3D）。
+        // 同一张纹理同时绑 UAV 与 SRV 是 UB，与反射那张中转表是同一条教训。
+        public static readonly int _VistaFroxelInjectionRW        = Shader.PropertyToID("_VistaFroxelInjectionRW");
+        public static readonly int _VistaFroxelInjectionRead      = Shader.PropertyToID("_VistaFroxelInjectionRead");
+        public static readonly int _VistaFroxelInjectionHistoryRW = Shader.PropertyToID("_VistaFroxelInjectionHistoryRW");
+        public static readonly int _VistaFroxelInjectionHistory   = Shader.PropertyToID("_VistaFroxelInjectionHistory");
+        public static readonly int _VistaFroxelIntegralRW         = Shader.PropertyToID("_VistaFroxelIntegralRW");
+        public static readonly int _VistaFroxelIntegral           = Shader.PropertyToID("_VistaFroxelIntegral");
+        // 自检专用：逐片的分布报告
+        public static readonly int _VistaFroxelSliceReportRW      = Shader.PropertyToID("_VistaFroxelSliceReportRW");
+
         // ---- Atmosphere: banding 签名（仅 Editor 自检）----
         // 走的是**运行时那个采样入口**，所以它读 _VistaSkyViewLut（SRV），
         // 而不是 _VistaSkyViewLutRW —— 同一张纹理同时绑 UAV 与 SRV 是 UB。

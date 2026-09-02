@@ -197,6 +197,10 @@ namespace Vista
         GraphicsBuffer m_SkyViewBanding;
         GraphicsBuffer m_SkyFogError;
 
+        // 近层体积雾的 froxel 体。readonly：它自己管三张表的生命周期，
+        // 本类只在 Dispose 时把它一起收掉。
+        readonly VistaFroxelVolume m_FroxelVolume;
+
         int m_SkyViewWidth  = k_SkyViewWidthDefault;
         int m_SkyViewHeight = k_SkyViewHeightDefault;
 
@@ -280,6 +284,27 @@ namespace Vista
         /// <summary>天空雾判据输出（#18b）。只在 <see cref="EnsureSkyFogError"/> 之后非 null。</summary>
         public GraphicsBuffer skyFogErrorBuffer => m_SkyFogError;
 
+        // ------------------------------------------------------------ 近层体积雾（#19 起）
+        //
+        // froxel 体的资源由 VistaFroxelVolume 持有，本类只做**转发**。
+        // 为什么要转发而不是让调用方直接拿 froxelVolume 上的 RTHandle：
+        // VistaImmediateLutDispatcher 的槽位解析只有一个入口（这个对象），
+        // 多一条入口就多一处「绑错资源」的可能，而那类错误的症状是画面上出现另一张表的内容。
+        //
+        // 为什么资源不直接放在本类里：froxel 体的分配脏检查输入是**屏幕尺寸**，
+        // 而本类七张表的脏检查输入是大气参数，两者没有交集。合在一起的后果是
+        // 改一次分辨率会连带重烘三张静态大气表（Transmittance 那张 256×64 每像素 40 步）。
+
+        /// <summary>近层体积雾的 froxel 体。构造时若没传 compute，其 isValid 为 false。</summary>
+        public VistaFroxelVolume froxelVolume => m_FroxelVolume;
+
+        public RTHandle froxelInjection => m_FroxelVolume?.injection;
+        public RTHandle froxelInjectionHistory => m_FroxelVolume?.injectionHistory;
+        public RTHandle froxelIntegral => m_FroxelVolume?.integral;
+
+        /// <summary>froxel 分布判据输出（#19）。只在 <c>EnsureSliceReportBuffer</c> 之后非 null。</summary>
+        public GraphicsBuffer froxelSliceReportBuffer => m_FroxelVolume?.sliceReportBuffer;
+
         public int skyViewWidth  => m_SkyViewWidth;
         public int skyViewHeight => m_SkyViewHeight;
 
@@ -322,8 +347,18 @@ namespace Vista
         /// 镜面反射预滤波核。可选 —— 只用大气 LUT 的调用方（LUT 预览窗口、大气数值自检）
         /// 传 null 即可，那时 <see cref="isSkyReflectionValid"/> 为 false，其余功能不受影响。
         /// </param>
-        public VistaAtmosphereLuts(ComputeShader lutCS, ComputeShader reflectionCS = null)
+        /// <param name="volumetricFogCS">
+        /// 近层体积雾核。可选 —— 传 null 时 <c>froxelVolume.isValid</c> 为 false，
+        /// 雾整体回落到 AP LUT 那一层（有雾、无光柱），其余功能不受影响。
+        /// </param>
+        public VistaAtmosphereLuts(ComputeShader lutCS, ComputeShader reflectionCS = null,
+                                   ComputeShader volumetricFogCS = null)
         {
+            // 无条件构造（即使 compute 是 null）：让 froxelVolume 恒非 null，
+            // 于是「没传 compute」的退化态是 isValid == false，而不是每个访问点都要判 null。
+            // 与 EnsureSkyAmbientShBuffer 那条「把恒可用做成事实」是同一条理由。
+            m_FroxelVolume = new VistaFroxelVolume(volumetricFogCS);
+
             m_ReflectionCS = reflectionCS;
             if (m_ReflectionCS != null)
             {
@@ -1382,6 +1417,8 @@ namespace Vista
             m_SkyViewBanding = null;
             m_SkyFogError?.Dispose();
             m_SkyFogError = null;
+            // froxel 体自己持有三张 3D RT + 一个 buffer，Dispose 里两者都收。
+            m_FroxelVolume?.Dispose();
             m_BakedParams = null;
         }
 

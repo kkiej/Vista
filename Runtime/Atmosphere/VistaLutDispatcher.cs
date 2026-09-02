@@ -34,6 +34,25 @@ namespace Vista
         /// 而且它顺带**加强**了自检 —— 判据 1 现在还同时验证 element→CubemapFace 的映射。
         /// </summary>
         SkyReflectionArray,
+
+        // ---- 近层体积雾的 froxel 体（#19 起）----
+        // 这四个槽位目前**只在立即模式下可解析**：graph 侧的 Resolve 故意落到 default
+        // （无效 handle），与 SkyAmbientShReference 同一个形状。RenderGraph 的接线在 #20 ——
+        // 那时才有真正要写进去的内容。现在就在 graph 侧兜底会让「pass 没排入但槽位能解析」
+        // 变成一条能编译能跑的错误路径。
+        /// <summary>注入表的 UAV view（写）。</summary>
+        FroxelInjection,
+        /// <summary>
+        /// 注入表的 SRV view（读）。解析到**同一张**资源，但绑定点不同 ——
+        /// 同一张纹理同时绑 UAV 与 SRV 是 UB，所以调用方必须在两趟 dispatch 里分别用。
+        /// 单独一个槽位而不是复用 <see cref="FroxelInjection"/>：写成同一个的话，
+        /// 「在一趟 dispatch 里既绑 RW 又绑 Read」就变成一件看不出来的事。
+        /// </summary>
+        FroxelInjectionRead,
+        /// <summary>注入表的历史帧。内容路径在 #22（时间重投影）之前**未被覆盖**。</summary>
+        FroxelInjectionHistory,
+        /// <summary>沿视线累积的内散射 + 透射率。写入路径在 #21。</summary>
+        FroxelIntegral,
     }
 
     /// <summary>
@@ -53,6 +72,8 @@ namespace Vista
         SkyViewBanding,
         /// <summary>仅 Editor 自检使用（天空雾闭式解 vs 数值参考）。运行时路径不分配它。</summary>
         SkyFogError,
+        /// <summary>仅 Editor 自检使用（froxel 体逐片的分布报告）。运行时路径不分配它。</summary>
+        FroxelSliceReport,
     }
 
     /// <summary>
@@ -139,6 +160,10 @@ namespace Vista
             VistaLutSlot.ApTransmittance    => m_Luts.apTransmittanceLut,
             VistaLutSlot.SkyReflection      => m_Luts.skyReflectionCube,
             VistaLutSlot.SkyReflectionArray => m_Luts.skyReflectionArray,
+            VistaLutSlot.FroxelInjection        => m_Luts.froxelInjection,
+            VistaLutSlot.FroxelInjectionRead    => m_Luts.froxelInjection,
+            VistaLutSlot.FroxelInjectionHistory => m_Luts.froxelInjectionHistory,
+            VistaLutSlot.FroxelIntegral         => m_Luts.froxelIntegral,
             _                               => null,
         };
 
@@ -149,6 +174,7 @@ namespace Vista
             VistaLutBufferSlot.SkyReflectionVerify   => m_Luts.skyReflectionVerifyBuffer,
             VistaLutBufferSlot.SkyViewBanding        => m_Luts.skyViewBandingBuffer,
             VistaLutBufferSlot.SkyFogError           => m_Luts.skyFogErrorBuffer,
+            VistaLutBufferSlot.FroxelSliceReport     => m_Luts.froxelSliceReportBuffer,
             _                                        => null,
         };
     }

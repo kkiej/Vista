@@ -1,0 +1,126 @@
+// ============================================================================
+//  近层体积雾（Step 3 档 A）
+//
+//  #19 只交付「资源 + 分布 + 判据」，所以这里目前只有两个核，两个都是为判据服务的：
+//    FroxelPlaceholder   把切片几何写进注入表 —— 它**不是**雾，是一份能被读回来对账的
+//                        已知内容。存在的理由是「RWTexture3D 绑定失败」这个坑：
+//                        RTHandle 的 2D 便捷重载会静默建成 Tex2D，症状只有 Editor.log
+//                        里一行 warning，画面上表现为整张表全零。让判据读到一个
+//                        **非零且可预测**的内容，那条路径才算被覆盖过。
+//    FroxelSliceVerify   把注入表当 SRV 读回来 + 做解析侧的恒等式，写进报告 buffer。
+//
+//  逐 froxel 的光照注入（级联阴影 + 主光）是 #20，深度积分是 #21，
+//  时间重投影是 #22。在那之前 VistaFogSettings.Mode 里**不会**出现 Froxel 档 ——
+//  一个选了什么都不发生（或者发生占位内容）的枚举值等于把哑档位摆给美术。
+// ============================================================================
+
+#pragma kernel FroxelPlaceholder
+#pragma kernel FroxelSliceVerify
+
+// 与大气那批核同一条排除线：GLES 没有 RWTexture3D，编译只会产出一堆噪声。
+#pragma only_renderers d3d11 vulkan metal playstation xboxone xboxseries switch
+
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+#include "Packages/com.kkiej.vista/ShaderLibrary/FroxelVolume.hlsl"
+
+RW_TEXTURE3D(float4, _VistaFroxelInjectionRW);
+
+// 同一张资源的 SRV view。绑定点必须与 UAV 分开：同一张纹理同时绑 UAV 与 SRV 是 UB，
+// 这与反射那张中转表的教训是同一条（见 VistaLutSlot.SkyReflectionArray）。
+TEXTURE3D(_VistaFroxelInjectionRead);
+
+// 每片两个 float4。布局见 VistaFroxelVolumeSelfTest 里的说明 ——
+// 那边是唯一的消费者，把语义写在消费端而不是这里，是为了让「读错字段」
+// 在判据的报表上直接显形。
+RWStructuredBuffer<float4> _VistaFroxelSliceReportRW;
+
+// ----------------------------------------------------------------------------
+//  占位：把切片几何写进注入表
+//
+//  四个通道故意各不相同且量级分明（segNear 到 segFar 之间差一个 ρ）——
+//  若 XY 与 Z 轴被写反、或者索引差一片，读回来的比值就不是 ρ，判据能直接抓到。
+//  写成 (1,1,1,1) 那种「能证明写过」的哨兵值就抓不到轴序错误。
+// ----------------------------------------------------------------------------
+[numthreads(8, 8, 1)]
+void FroxelPlaceholder(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_VistaFroxelSize.xyz))
+        return;
+
+    float slice = (float)id.z;
+    _VistaFroxelInjectionRW[id] = float4(
+        VistaFroxelStoredDistance(slice),
+        VistaFroxelSampleDistance(slice),
+        VistaFroxelSegmentNear(slice),
+        VistaFroxelSegmentFar(slice));
+}
+
+// ----------------------------------------------------------------------------
+//  判据核：一个线程一片
+//
+//  r0 走**纹理往返**（fp16），r1 走**解析**（fp32）。两者分开是必须的：
+//  fp16 的相对 ulp 是 2^-11 ≈ 4.9e-4，把恒等式建立在读回来的 fp16 值上，
+//  判据的地板就被抬到 1e-3 —— 那时「纹理坐标恒等式」（要求 1e-6）根本无法判定，
+//  而它恰好是这套分布约定唯一的立足点。
+// ----------------------------------------------------------------------------
+[numthreads(64, 1, 1)]
+void FroxelSliceVerify(uint3 id : SV_DispatchThreadID)
+{
+    uint slice = id.x;
+    uint sliceCount = (uint)_VistaFroxelSize.z;
+    if (slice >= sliceCount)
+        return;
+
+    // ---- r0：从注入表读回来（fp16）----
+    // 固定取 (0,0) 那一列。XY 方向的映射（视锥四角插值）不在本判据的覆盖范围内 ——
+    // 它由 AP 的 round-trip 判据覆盖，两者共用同一个 VistaApFroxelRayDirection。
+    // 把它折进来会让一次失败无法归因到「距离映射」还是「方向映射」。
+    float4 fromRt = LOAD_TEXTURE3D(_VistaFroxelInjectionRead, uint3(0, 0, slice));
+
+    // ---- r1：解析侧的三条恒等式 ----
+    float stored = VistaFroxelStoredDistance((float)slice);
+
+    // ① 编解码 round-trip。相对误差。
+    float roundTrip = VistaFroxelDecodeDistance(VistaFroxelEncodeDistance(stored))
+                    * rcp(max(stored, 1e-9)) - 1.0;
+
+    // ② 纹理坐标恒等式：存储距离编码回去必须**正好**落在纹素中心。
+    //    这是「读端不需要半纹素偏移」的全部依据，所以要判绝对误差而不是相对。
+    float texCenter = ((float)slice + 0.5) * VISTA_FROXEL_RCP_SLICES;
+    float encodeErr = VistaFroxelEncodeDistance(stored) - texCenter;
+
+    // ③ 求值点的位置。判「几何均值」这条恒等式的**乘法形式**：
+    //      sample² == segNear · segFar
+    //    而不是「求值点落在分段里的度量位置 frac」那条减法形式。
+    //
+    //    减法形式（frac = (sample − segNear)/(segFar − segNear)）第一版就是那么写的，
+    //    实测在五个档上给出 0.95e-6 ~ 7.5e-6，全部越过 1e-6 的解析门；
+    //    而读数严格按 1/(ρ−1) 排序（D 档 ρ−1 = 0.0366 最坏 7.5e-6，
+    //    B 档 ρ−1 = 0.18 最好 0.95e-6），也就是**尺子自己的抵消误差**：
+    //    三个量都 ≈ d，两两相减只剩 (ρ−1)·d，fp32 的 3e-7·d 绝对误差被放大成
+    //    3e-7/(ρ−1) 的相对误差。那不是被测代码的缺陷，是判据的地板。
+    //    「尺子的地板与被测量的期望值同量级时，尺子会自己伪造一个结论」——
+    //    这里更糟：它伪造的是一个**失败**。
+    //
+    //    乘法形式没有相减，地板回到 3 次 exp 的 ~1e-6；而它要拒绝的最小错答案
+    //    （把求值点写成度量中点）在五档里最小的 D 档是 3.3e-4，仍有 33 倍余量。
+    //    片 0 走度量中点那一支（几何均值退化成 0），所以它判的是另一条恒等式
+    //    sample == 0.5·segFar —— 同样是比值形式、同样没有相减。
+    //    分支只在片 0，与被测函数里的分支位置**逐字对应**，一次失败仍然可归因。
+    float segNear = VistaFroxelSegmentNear((float)slice);
+    float segFar  = VistaFroxelSegmentFar((float)slice);
+    float sample  = VistaFroxelSampleDistance((float)slice);
+    float samplePos = slice >= 1
+        ? sample * sample * rcp(max(segNear * segFar, 1e-12)) - 1.0
+        : sample * rcp(max(0.5 * segFar, 1e-9)) - 1.0;
+
+    // ④ 相邻切片比。这是「相对分辨率处处相同」的**定义**，
+    //    判它比重算一遍闭式解更有力（后者只能抓打包错，抓不到公式错）。
+    //    片 0 没有前一片，填 0 —— 判据侧按 slice >= 1 过滤，且要点名这一格是空的。
+    float ratio = slice >= 1
+        ? stored * rcp(max(VistaFroxelStoredDistance((float)slice - 1.0), 1e-9))
+        : 0.0;
+
+    _VistaFroxelSliceReportRW[slice * 2 + 0] = fromRt;
+    _VistaFroxelSliceReportRW[slice * 2 + 1] = float4(roundTrip, encodeErr, samplePos, ratio);
+}

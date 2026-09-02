@@ -65,6 +65,23 @@ namespace Vista
         /// </summary>
         public Shader aerialPerspectiveCompositeShader => m_AerialPerspectiveCompositeShader;
 
+        // --------------------------------------------------------------- Step 3 体积雾
+
+        // 单独一个 .compute 而不是塞进 AtmosphereLut.compute：#20 之后这里的核要
+        // include URP 的 Shadows.hlsl（逐 froxel 采级联阴影）与 Lighting.hlsl，
+        // 而那两个头会把 per-object light data 那一整套 include 图拖进来。
+        // 让十一个大气核为此多编译一遍，改大气 shader 的迭代成本会直接翻倍 ——
+        // 这与反射核当初拆出去是同一条理由。
+        [SerializeField, ResourcePath("Shaders/Volumetrics/VolumetricFog.compute")]
+        private ComputeShader m_VolumetricFogCS;
+
+        /// <summary>
+        /// 近层体积雾的 froxel 体（注入 / 积分 / 自检）。
+        /// 为 null 时近层雾不可用，雾整体回落到 AP LUT 那一层 —— 画面上是「没有光柱」，
+        /// 不是「没有雾」。
+        /// </summary>
+        public ComputeShader volumetricFogCS => m_VolumetricFogCS;
+
         /// <summary>取当前管线下的 Vista 资源容器，不在 URP 下时返回 null。</summary>
         public static VistaRuntimeResources Get()
             => GraphicsSettings.GetRenderPipelineSettings<VistaRuntimeResources>();
