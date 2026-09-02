@@ -405,8 +405,11 @@ void AerialPerspectiveLut(uint3 id : SV_DispatchThreadID)
                 // CPU 侧因此把 g 钳在 ±0.99（VistaFogSettings）。
                 VistaFogSample fog = VistaSampleFogAlongRay(t, rayDir.y);
 
+                // sunShadow = 1：AP 覆盖 [0, 32 km]，逐样本查级联阴影既超出相机的
+                // 阴影距离、也付不起 168 步 × 32×32 柱的采样量。光柱由近层 froxel 体
+                // 负责（#20），分层的判据是「付不付得起逐 froxel 的阴影采样」。
                 VistaScatterSample smp =
-                    VistaEvaluateScatterSample(p, rayDir, sunDir, fog, s);
+                    VistaEvaluateScatterSample(p, rayDir, sunDir, fog, s, 1.0);
 
                 float3 sampleTransmittance = exp(-smp.extinction * dt);
                 luminance += throughput * VistaSegmentIntegral(smp.scattered, smp.extinction, dt);

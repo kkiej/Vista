@@ -88,11 +88,36 @@ A(单次)/B = 1.21　→ 方向符合预期：帧内延迟不可能低于允许�
 
 ## 安装
 
-在目标工程的 `Packages/manifest.json` 中加入（路径相对 `Packages/` 目录）：
+两种方式服务的是不同的人，都列在这里。
+
+**A. 使用者 / 评审 —— 钉版本的 git URL（推荐从这条开始）**
+
+在目标工程的 `Packages/manifest.json` 中加入：
+
+```json
+"com.kkiej.vista": "https://github.com/kkiej/Vista.git#main"
+```
+
+不关心磁盘布局，克隆下来即可跑。生产工程应把 `#main` 换成一个 tag 或 commit
+哈希 —— 不钉版本时 UPM 只在**首次解析**那一刻取默认分支的 tip，
+之后靠 `packages-lock.json` 冻住，于是「同一份 manifest 在两台机器上装到不同的包」
+是可能的（一台已有 lock、一台没有）。
+
+**B. 开发 Vista 本身 —— 本地路径**
 
 ```json
 "com.kkiej.vista": "file:../../Vista"
 ```
+
+路径相对 `Packages/` 目录，所以这一行要求 Vista 与目标工程是**兄弟目录**。
+
+为什么开发期必须是 B 而不是 A：git URL 引入的包会被 UPM 克隆进
+`Library/PackageCache/`，那份拷贝是**只读**的。于是改一行 shader 的成本从
+「存盘」变成「commit → push → 改 manifest 里的哈希 → 重解析」。
+`file:` 引入的包在 Package Manager 里显示为本地包，改动存盘即触发重编译。
+
+代价是 `file:` **不可复现**：它指向工作区当前状态，包括未提交的改动。
+所以只在开发 Vista 的工程里用 B，其余一律用 A。
 
 ## 目录约定
 

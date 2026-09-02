@@ -50,6 +50,26 @@ namespace Vista
             public TextureHandle skyReflection;
             public TextureHandle skyReflectionArray;
             public BufferHandle skyAmbientSh;
+
+            // ---- 近层体积雾（#20）----
+            public TextureHandle froxelInjection;
+            public TextureHandle froxelInjectionHistory;
+            public TextureHandle froxelIntegral;
+            public BufferHandle froxelShadowProbe;
+            /// <summary>注入核要的分配口径（切片数 + 距离范围）。</summary>
+            public VistaFroxelVolumeDesc froxelDesc;
+            /// <summary>
+            /// 相机世界坐标。**记录期抓的、逐帧下发的**，不复用 URP 的
+            /// <c>_WorldSpaceCameraPos</c> —— 后者由谁最后一次 SetupCameraProperties
+            /// 决定，反射探针那六个面各绑一次，主相机的注入排在后面就会拿到探针的位置。
+            /// 症状是光柱整体偏移一段，而画面上完全看不出成因。
+            /// 探针的 CAM_DRIFT_MM 槽位就是这条依赖的读数。
+            /// </summary>
+            public Vector3 froxelCameraWS;
+            /// <summary>主光阴影贴图这一帧到底有没有内容。见注入 pass 里填它处的注释。</summary>
+            public bool froxelShadowmapBound;
+            /// <summary>本帧要不要跑覆盖性探针（仅 Editor 自检请求时为 true）。</summary>
+            public bool froxelProbeRequested;
         }
 
         /// <summary>
@@ -68,6 +88,10 @@ namespace Vista
             skyReflection   = d.skyReflection,
             skyReflectionArray = d.skyReflectionArray,
             skyAmbientSh    = d.skyAmbientSh,
+            froxelInjection = d.froxelInjection,
+            froxelInjectionHistory = d.froxelInjectionHistory,
+            froxelIntegral  = d.froxelIntegral,
+            froxelShadowProbe = d.froxelShadowProbe,
         };
 
         VistaAtmosphereLuts m_Luts;
@@ -77,6 +101,16 @@ namespace Vista
         VistaSkyReflectionMode m_ReflectionMode = VistaSkyReflectionMode.SkyViewLut;
         float m_GroundLevelWorldY;
         float m_EV100;
+        VistaVolumetricFogSettings m_VolumetricFog;
+
+        /// <summary>
+        /// 上一次打印过的远边界夹紧诊断。存它只为**去重** ——
+        /// <see cref="RecordRenderGraph"/> 每帧跑一次，无条件 LogError 是每秒 60 条，
+        /// 会把日志刷成噪声，于是「不静默夹紧」这件事的效果等于静默。
+        /// 存 string 而不是 bool：夹紧的目标值会随相机远裁剪面变，
+        /// 换了数字就该再报一次。
+        /// </summary>
+        string m_LastFroxelClampDiagnostic;
 
         /// <summary>
         /// CPU 侧的环境光出口。pass 持有它而不是 feature：它的驱动时机就是记录期，
@@ -116,7 +150,8 @@ namespace Vista
                           VistaAerialPerspectiveSettings apSettings,
                           VistaFogSettings fogSettings,
                           VistaSkyReflectionMode reflectionMode,
-                          float groundLevelWorldY, float ev100)
+                          float groundLevelWorldY, float ev100,
+                          VistaVolumetricFogSettings volumetricFog)
         {
             m_Luts = luts;
             m_Parameters = parameters;
@@ -125,6 +160,7 @@ namespace Vista
             m_ReflectionMode = reflectionMode;
             m_GroundLevelWorldY = groundLevelWorldY;
             m_EV100 = ev100;
+            m_VolumetricFog = volumetricFog;
         }
 
         public override void RecordRenderGraph(RenderGraph renderGraph, ContextContainer frameData)
@@ -142,6 +178,44 @@ namespace Vista
             // 解析后的模式，不是请求的模式：SH 不可用时它会退到 LUT（见 PrepareSkyReflection）。
             var reflectionMode = m_Luts.PrepareSkyReflection(m_ReflectionMode);
 
+            // ---------------------------------------------------------------- 近层 froxel 体（#20）
+            // 相机类型闸门不是风格问题，是一笔实打实的开销：
+            // VistaFroxelVolumeDesc.Equals **只比较 width/height/depth**，而反射探针的
+            // 立方体面分辨率（如 256²）与主相机必然不同 —— 两者交替出现，就是每帧
+            // Release() + Allocate() 三张 RGBA16F 3D 表。而反射探针本来也不需要近层雾：
+            // 它烘的是天空的镜面反射，近处几十米的雾不进那张 cubemap。
+            bool froxelEnabled = m_VolumetricFog != null
+                && m_VolumetricFog.enableInjection
+                && m_Luts.froxelVolume != null && m_Luts.froxelVolume.isValid
+                && (cameraData.cameraType == CameraType.Game
+                    || cameraData.cameraType == CameraType.SceneView);
+
+            var froxelDesc = default(VistaFroxelVolumeDesc);
+            if (froxelEnabled)
+            {
+                froxelDesc = m_VolumetricFog.Resolve(
+                    cameraData.cameraTargetDescriptor.width,
+                    cameraData.cameraTargetDescriptor.height,
+                    cameraData.camera.nearClipPlane,
+                    // 相机侧的阴影距离（URP 里 = min(asset.shadowDistance, farClipPlane)），
+                    // 阴影全关时它是 0 —— ResolveFarDistance 会据此跳过夹紧。
+                    cameraData.maxShadowDistance,
+                    out string clampDiagnostic);
+
+                // 去重后再报：诊断串里带着被夹到的数值，所以数值变了就该再报一次；
+                // 夹紧解除（变回 null）时也要更新，否则下一次同样的夹紧会被吞掉。
+                if (clampDiagnostic != m_LastFroxelClampDiagnostic)
+                {
+                    m_LastFroxelClampDiagnostic = clampDiagnostic;
+                    if (clampDiagnostic != null)
+                        Debug.LogError(clampDiagnostic);
+                }
+
+                // 记录期分配 + 推分布常量，与 PrepareLuts / PrepareAerialPerspective 同一时机
+                // （都在 ImportTexture 之前）。cmd 传 null ⇒ 走 Shader.SetGlobalVector。
+                froxelEnabled = m_Luts.froxelVolume.Prepare(froxelDesc, null);
+            }
+
             var view = VistaAtmosphereViewData.Create(
                 m_Parameters,
                 cameraData.camera.transform.position,
@@ -149,9 +223,10 @@ namespace Vista
                 GetSunDirection(lightData),
                 m_EV100);
 
-            // 视锥四角只有 AP 需要。Create 里已经填了一个 60°/16:9 的兜底，
-            // 这里用真实相机覆盖 —— 反射探针那样的立方体面相机不走 AP，兜底值不会被用到。
-            if (apEnabled)
+            // 视锥四角由 AP 与近层注入共用（两者都要把 froxel 索引变回世界射线）。
+            // Create 里已经填了一个 60°/16:9 的兜底，这里用真实相机覆盖 ——
+            // 反射探针那样的立方体面相机两条路都不走，兜底值不会被用到。
+            if (apEnabled || froxelEnabled)
                 view.SetFrustumRays(cameraData.camera);
 
             var transmittance   = renderGraph.ImportTexture(m_Luts.transmittanceLut);
@@ -175,6 +250,14 @@ namespace Vista
             // 而是判据在一条更窄的路径上照样全绿。见 EnsureSkyAmbientShBuffer 的注释。
             var skyAmbientSh    = m_Luts.skyAmbientShBuffer != null
                 ? renderGraph.ImportBuffer(m_Luts.skyAmbientShBuffer) : default;
+
+            // 近层体只导入**这一步真会写的那一张**。历史表（#22 时间重投影）与积分表（#21）
+            // 留成 default —— 它们在 VistaLutHandles 里有槽位，但本节没有任何 pass 绑它们。
+            // 刻意不"顺手一起导入"：一个被导入却没人 Use 的资源会让 RenderGraph 的
+            // 依赖图上多出两条不存在的边，也会让「这两条写入路径未被覆盖」这件事
+            // 在代码里看不出来。判据里对应有一条点名它们的 ⓘ。
+            var froxelInjection = froxelEnabled
+                ? renderGraph.ImportTexture(m_Luts.froxelVolume.injection) : default;
 
             // CPU 侧出口的驱动。放在记录期最前面而不是 SH pass 的 execute 里：
             // 读回请求是 CPU 侧 API，与图无关；而且这样它拿到的必然是"上一帧已完成"的内容，
@@ -392,6 +475,117 @@ namespace Vista
                         d.luts.CopySkyReflectionToCube(
                             CommandBufferHelpers.GetNativeCommandBuffer(ctx.cmd)));
                 }
+            }
+
+            // ---------------------------------------------------------------- 近层注入（#20）
+            if (froxelEnabled)
+            {
+                // 主光阴影贴图。URP 的记录顺序不是「应该是这样」，是 grep 过的：
+                //   UniversalRendererRenderGraph.OnBeforeRendering(:733，由 :647 调用) 在 :750
+                //     resourceData.mainShadowsTexture = m_MainLightShadowCasterPass.Render(...)
+                //   RecordCustomRenderGraphPasses(RenderPassEvent.BeforeRenderingPrePasses) 在 :1009
+                //     （OnMainRendering 内）—— 严格在后。
+                // 所以本 pass 待在 BeforeRenderingPrePasses 就能拿到有效的阴影贴图，
+                // 不需要改 renderPassEvent。
+                // 这条要 grep 而不能靠推测：假设反了的失效形态是
+                // **阴影贴图恒无效 ⇒ 整个场景没有光柱、且不报错**。
+                // （:715 那一处同名赋值属于 OnOffscreenDepthTextureRendering 的纯深度路径，无关。）
+                var resourceData = frameData.Get<UniversalResourceData>();
+                var mainShadows = resourceData.mainShadowsTexture;
+                bool shadowmapBound = mainShadows.IsValid();
+                var froxelCameraWS = cameraData.camera.transform.position;
+
+                using (var builder = renderGraph.AddComputePass<LutPassData>(
+                           "Vista Froxel Injection", out var data))
+                {
+                    data.luts = m_Luts;
+                    data.view = view;
+                    data.fogSettings = m_FogSettings;
+                    data.transmittance = transmittance;
+                    data.multiScattering = multiScattering;
+                    data.skyAmbientSh = skyAmbientSh;
+                    data.froxelInjection = froxelInjection;
+                    data.froxelDesc = froxelDesc;
+                    data.froxelCameraWS = froxelCameraWS;
+                    data.froxelShadowmapBound = shadowmapBound;
+
+                    builder.UseTexture(transmittance, AccessFlags.Read);
+                    builder.UseTexture(multiScattering, AccessFlags.Read);
+                    builder.UseTexture(froxelInjection, AccessFlags.Write);
+                    // 雾的天光环境项（VistaSkyAmbientMean）要读它。判空的理由同 AP pass。
+                    if (skyAmbientSh.IsValid())
+                        builder.UseBuffer(skyAmbientSh, AccessFlags.Read);
+
+                    // 声明它不只是为了"拿到"纹理 —— 阴影贴图是 URP 用
+                    // SetGlobalTextureAfterPass 发布的全局（MainLightShadowCasterPass.cs:413），
+                    // 我们不需要自己绑。真正要紧的是让图把本 pass 排在阴影 pass 之后：
+                    // _MAIN_LIGHT_SHADOWS_CASCADE 是那个 pass 在**执行期**用
+                    // cmd.SetKeyword 设的（:277），光是记录顺序在后并不保证执行顺序在后。
+                    if (shadowmapBound)
+                        builder.UseTexture(mainShadows, AccessFlags.Read);
+
+                    // _VistaFroxelCameraWS 与 view/雾的 cbuffer 都是全局
+                    builder.AllowGlobalStateModification(true);
+                    // 消费者（#21 的深度积分）还不存在，图会认为这张表没人读。
+                    builder.AllowPassCulling(false);
+
+                    builder.SetRenderFunc((LutPassData d, ComputeGraphContext ctx) =>
+                        d.luts.RenderFroxelInjection(
+                            new VistaGraphLutDispatcher(ctx.cmd, Handles(d)),
+                            d.view, d.fogSettings, d.froxelDesc,
+                            d.froxelCameraWS, d.froxelShadowmapBound));
+                }
+
+#if UNITY_EDITOR
+                // 覆盖性探针（Window/Vista/Log Volumetric Fog State）。
+                //
+                // **必须是独立的一趟 pass**：它读的是注入表实际写进去的内容，
+                // 与注入挤在同一个 pass 里读到的是未定义值 —— 分开才能让 RenderGraph
+                // 在两者之间插入 UAV barrier。
+                //
+                // 只在 Editor 编译：它是纯诊断，而且用了 InterlockedMin/Max + 一次
+                // CPU 读回。留在运行时会变成「一个默认关闭、又没人看的开关」。
+                var froxelVolume = m_Luts.froxelVolume;
+                if (froxelVolume.probeRequested)
+                {
+                    // 一次请求只跑一帧。不自动清会让探针每帧累加，
+                    // 而 min/max 是跨帧单调的 —— 读数会变成「历史上最暗的那一帧」，
+                    // 那是个看起来合理、却与「当前这一帧」无关的数。
+                    froxelVolume.probeRequested = false;
+                    froxelVolume.EnsureShadowProbeBuffer();
+                    // 初值由 CPU 侧 SetData 写，不由 shader 里的清零线程写 ——
+                    // 理由见 VistaFroxelVolume.ResetShadowProbeBuffer 的注释。
+                    froxelVolume.ResetShadowProbeBuffer();
+
+                    var froxelShadowProbe = renderGraph.ImportBuffer(froxelVolume.shadowProbeBuffer);
+
+                    using (var builder = renderGraph.AddComputePass<LutPassData>(
+                               "Vista Froxel Shadow Probe", out var data))
+                    {
+                        data.luts = m_Luts;
+                        data.view = view;
+                        data.froxelInjection = froxelInjection;
+                        data.froxelShadowProbe = froxelShadowProbe;
+                        data.froxelProbeRequested = true;
+
+                        // ReadWrite 而不是 Read：核走的是 UAV 绑定点
+                        // （_VistaFroxelInjectionRW），要看的就是 fp16 纹理里
+                        // 实际存下来的量级。声明成 Read 会让图按 SRV 转换状态。
+                        builder.UseTexture(froxelInjection, AccessFlags.ReadWrite);
+                        builder.UseBuffer(froxelShadowProbe, AccessFlags.ReadWrite);
+                        if (shadowmapBound)
+                            builder.UseTexture(mainShadows, AccessFlags.Read);
+
+                        builder.AllowGlobalStateModification(true);
+                        // 唯一的消费者是 CPU 读回，图看不见。
+                        builder.AllowPassCulling(false);
+
+                        builder.SetRenderFunc((LutPassData d, ComputeGraphContext ctx) =>
+                            d.luts.RenderFroxelShadowProbe(
+                                new VistaGraphLutDispatcher(ctx.cmd, Handles(d)), d.view));
+                    }
+                }
+#endif
             }
 
             if (!apEnabled)

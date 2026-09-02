@@ -1026,6 +1026,92 @@
     - 接手点对 `far·ρ^(−0.5/N)`（一个**与实现里 `near·ρ^((N−0.5)/N)` 不同的表达式**）
       最差 1.6e-7；对 GPU 读回的最后一片最差 5.0e-4。
 
+- **逐 froxel 光照注入：级联阴影 + 主光 + 天空环境（#20）。**
+  近层体第一次装进真实的能量：`FroxelInjection` 核逐 froxel 求
+  `(σ_s·J 预曝光, 灰度 σ_t)`，接进 `VistaAtmospherePass` 的
+  `RenderPassEvent.BeforeRenderingPrePasses`。深度积分是 #21，时间重投影是 #22，
+  所以 `VistaFogSettings.Mode` 里**仍然没有** `Froxel` 档 ——
+  注入挂在 `VistaVolumetricFogSettings.enableInjection` 这个开发者开关上（默认关）。
+  - **阴影查询直接调三个底层函数，不走 `MainLightRealtimeShadow`。**
+    后者（`Shadows.hlsl:385`）在 `MAIN_LIGHT_CALCULATE_SHADOWS` 未定义时
+    **直接 `return 1.0`** —— 关键字漏设的症状是「整个场景没有光柱、且不报错」。
+    改调 `GetMainLightShadowSamplingData()` / `GetMainLightShadowParams()` /
+    `SampleShadowmap()`（`Shadows.hlsl:151 / 186 / 306`，三个都没有关键字门），
+    漏设的后果退化成「全按级联 0 查」= 远处光柱错位，一个**能被看见、能被归因**的症状。
+  - **`#pragma multi_compile _ _MAIN_LIGHT_SHADOWS_CASCADE`，只声明这一个。**
+    不声明 `_MAIN_LIGHT_SHADOWS_SCREEN`：`TransformWorldToShadowCoord`
+    （`Shadows.hlsl:356`）对它是 `#if defined`，没声明就在**编译期**选中级联矩阵那一支，
+    于是这个核永远不会去读屏幕空间阴影图（compute 里根本没有屏幕坐标）。
+    不声明 `_SHADOWS_SOFT*`：tent 是 4/9 tap，逐 froxel（默认档 207 万个）付不起，
+    而体积雾是低频的 —— HDRP 的 `VBufferLighting` 同样只取 1 tap。
+  - **`isPerspectiveProjection` 必须传 `false`。** 走 `#else` 那一支时
+    `TransformWorldToShadowCoord` 返回的 `w` 恒为 `0.0`（`Shadows.hlsl:361`），
+    传 `true` 会让 `SampleShadowmap` 做 `xyz /= w` = 除以 0 ⇒ 整张表 NaN，
+    而 NaN 会顺着三线性插值蔓延到全屏。判据⑦ 实测 0 / 16384 非有限。
+  - **URP 的记录顺序 grep 过了，注入 pass 不需要改 event。**
+    `UniversalRendererRenderGraph.cs`：`OnRecordRenderGraph`(:588) →
+    `OnBeforeRendering`(:647，体在 :733) 里记录阴影 pass 并赋
+    `resourceData.mainShadowsTexture`(:750)，而 `BeforeRenderingPrePasses`
+    要到 `OnMainRendering`(:990) 里的 :1009 才被记录 —— 严格**在阴影之后**。
+    `_MAIN_LIGHT_SHADOWS_CASCADE` 也是在阴影 pass 的 render func 内
+    用 `cmd.SetKeyword`(:277) 设的 GlobalKeyword，全局关键字对 compute 生效。
+    两条都由判据实测确认（flags 读回 `0x13` = RAN|SHADOWMAP|CASCADE，URP asset 4 级联）。
+  - **`_MainLightShadowmapTexture` 不需要逐核绑**：阴影 pass 用
+    `builder.SetGlobalTextureAfterPass(...)`（`MainLightShadowCasterPass.cs:413`）
+    把它发布成全局纹理。两张静态大气表与 SH buffer 反而**逐核显式绑**，
+    理由是 Task #7 那笔旧账（依赖「Sky-View 一定先跑」的那一版里，改相机高度与太阳角度
+    一个读数都不动，而且不报错）。
+  - **消光存灰度而不是 RGB，包络量过了。** 一个 `float4` 就够，分通道要三张表全部翻倍。
+    默认档 `D = 61.374 m`：Rayleigh `τ_blue = 2.0e-3` vs 灰度 `1.07e-3`
+    ⇒ 透射率差 **0.096%**；夹到阴影距离的极端档 `D = 500 m` ⇒ **0.78%**；
+    雾自己的 `σ_t` 中性色时**精确**为 0 误差。都在 1% 的 Weber 门内。
+    顺带一条**反直觉的结论**：近层体的 `σ_t` **必须含大气**（Rayleigh + Mie + 臭氧）——
+    `D = 500 m` 时蓝光的大气 `τ` 是 1.66%，已经越过门，
+    「近层只算雾、大气整段留给 AP」是不成立的。
+  - **相位函数在注入时求值**（HDRP / UE5 路线），不留到 #21 积分时。
+    代价是每个 froxel 只有一个相位方向、时间重投影时相位跟着历史一起被拖 ——
+    #22 的 ghosting 读数因此**没有对照臂**（没做运行时 A/B 开关），
+    这条是「接受 HDRP/UE5 的已知局限」，不是「量过之后选的」。
+  - **`Window/Vista/Log Volumetric Fog State`：11 格覆盖性判据全绿。**
+    它**不是**数值判据（能量对不对由 #19 的分布判据与 AP 那批误差判据兜着），
+    要抓的是**跨模块接线**这一类失效。走 `Camera.Render()` 同步渲一帧
+    而不是 `SceneView.RepaintAll()`：后者是排队重绘，菜单回调返回时还没画完，
+    读回来的会是**上一次**请求的结果 —— 而 min/max 是跨帧单调的，
+    那种错位会长得非常像一个合理的读数。
+    - 原始槽位 `[199999, 1000000, 19, 16384, 1034, 0, 0, 381, 0, 998626, 800000, 2048, 2048, 1]`。
+    - ⓿ 槽位容量 `buffer.count = 14 = k_ShadowProbeSlots = 本文件期望`。
+      三处对不上的症状不是报错 —— D3D11 上越界 UAV 写是**静默丢弃**，
+      判据会读到恒为初值的格子并把它当成「这一路没执行」。
+    - ① flags `0x13`（含「跑过」位 RAN）。没有 RAN 位的话，一个从未派发的核留下的全零
+      与「级联关 + 阴影图未绑 + 屏幕空间关 + 软阴影关」这个**完全合法**的组合
+      在报表上长得一模一样。
+    - ② 编译期关键字：CASCADE `true`（期望从 URP asset 的 `cascades 4` 推），
+      SCREEN / SOFT 都必须 `false`。
+    - ④ 探针网格 `16384 / 16384`（32×32×16，**固定值不跟体积分辨率走**：
+      跟着变会让「换档后 min 变了」分不清是阴影变了还是采样点变了）。
+    - ⑤a 阴影值域 `[0.199999, 1.000000]`；⑤b 被遮 `1034 / 16384`。
+    - ⑥a atlas 尺寸 `GetDimensions ⇒ 2048×2048`。
+    - ⑥b atlas 深度 `min 0.000000 / max 0.998626` ⇒ 跨度 `9.986e-1`（门 > 1e-3）。
+    - ⑦ 非有限 froxel `0 / 16384`。
+    - ⑧ fp16 余量：注入 rgb 最大 `3.810e-1`（预曝光后）⇒ 距 65504 天花板 **×1.719e5**。
+      这个读数是从 RGBA16F 的 UAV **读回来的**，不是 CPU 侧重算 ——
+      fp16 的饱和只有走一趟纹理往返才算量过。
+    - ⑨ `|_WorldSpaceCameraPos − _VistaFroxelCameraWS| = 0 mm`（门 ≤ 1 mm）。
+      `GetMainLightShadowFade`（`Shadows.hlsl:434`）用 URP 的 `_WorldSpaceCameraPos`
+      算淡出距离，而 `_VistaFroxelCameraWS` 存在的理由恰恰是不信任那个全局。
+      仍然调它、不自己重写那一行 `saturate` ——「同一个量的第二份实现连 8 行的
+      辅助函数也算」。代价就是这条依赖，而这一格把它变成一个**能失败的数字**。
+    - 实测分配口径 `138×74×64, near 0.30 m, far 50.0 m（从 64 夹下来）,
+      handoff 48.041 m, ρ 1.083219`；夹紧诊断按设计只报一次。
+    - **两条未覆盖路径按设计点名**：注入历史表（#22）与积分表（#21）的**写入**路径
+      本节一次都没跑过，`VistaAtmospherePass` 里也刻意没有 `ImportTexture` 它们 ——
+      顺手导入会让「没人写」这件事在代码里看不出来。
+  - **Vista 的 `VolumetricFog.compute` 是本项目第一个 `#include` URP `Shadows.hlsl`
+    的 compute shader，编译干净、跑通。** `Shadows.hlsl` 自己 include 了 core 的
+    `Common.hlsl` / `ShadowSamplingTent.hlsl` / `GlobalSamplers.hlsl`、URP 的 `Core.hlsl`、
+    core 的 `CommonMaterial.hlsl` 与 `Shadows.deprecated.hlsl`（:4–9），
+    所以只 include 它一个就够。此前标记的风险没有成立。
+
 ### 取舍
 
 - **AP 出厂档 = d=32 / Logarithmic / near 20 m（PC）；移动档 = d=16 / Power k=3。**
@@ -1755,6 +1841,92 @@
   「同一个量的第二份实现连 8 行的辅助函数也算」。
 
 ### 坑
+
+- **`_MainLightShadowmapSize` 只在软阴影档才被下发，硬阴影档下读到的是别人留下的脏值 ——
+  而那个脏值是一个看起来完全合法的 `1×1`。**
+  #20 的 ⑥ 号判据（阴影 atlas 有没有内容）第一版按这个全局算采样坐标，
+  读回来 `atlas 深度 min 0.000000 / max 0.000000 ⇒ 跨度 0`，**红**。
+  - **归因的入口是同一趟里另一格读数与它矛盾**：判据⑤b 同时报 `1034 / 16384` 个探针点被遮。
+    atlas 是常数、却有一千多个点查出了遮挡 —— 这两件事不可能同时为真，
+    所以「场景里没有投影物」这个最自然的解释当场被排除，问题在尺子自己身上。
+  - 去 URP 源码 grep 而不是猜：`MainLightShadowCasterPass.cs:334` 把
+    `_ShadowOffset0`（:336）、`_ShadowOffset1`（:339）、`_ShadowmapSize`（:343）
+    **三行一起**包在 `if (shadowData.supportsSoftShadows)` 里。本项目是硬阴影档，
+    这一帧根本不下发，读到的是上一个走过别的路径的相机留下的值。
+  - 实测那个值是 **1**，出处是同文件 `:34` 的
+    `s_EmptyShadowmapSize = new Vector4(1, 1, 1, 1)`（由 `:29` 的
+    `k_EmptyShadowMapDimensions = 1` 来），在 `SetShadowParamsForEmptyShadowmap`（:245，
+    从 :426 调）里设 —— 也就是某个走过 empty-shadowmap 路径的相机
+    （SceneView / 材质预览 / 反射探针）留下的。
+  - **`1` 比 `0` 更坏。** `1×1` 是一个完全合法的 atlas 尺寸，拿它算格心
+    `(2i+1)·smW / (2·32)` 全部得 0，1024 个探针点塌到同一个 texel，
+    不越界、不报错、不产生 NaN，症状与「场景里没有投影物」逐字相同。
+    读到 0 至少还能被一句 `smW > 0` 抓住。
+  - URP 自己不受影响：那个尺寸只被 tent 软阴影的 offset 消耗
+    （`Shadows.hlsl:160` 把它塞进 `shadowSamplingData`），1 tap 的硬阴影路径根本不读它。
+    所以这是一条**只有 Vista 会踩**的坑 —— 复用引擎全局时，"URP 自己用得没问题"
+    不等于"它在所有画质档下都有效"。
+  - **修法：向被测资源自己问，而不是问引擎全局。**
+    核里改成 `_MainLightShadowmapTexture.GetDimensions(smW, smH)`，实测 2048×2048。
+    少一个跨模块依赖，而且它的失效有唯一归因（返回 0 就是纹理没绑）。
+    同时把两个尺寸都记进探针槽位（11 / 12），并拆出独立的一格 ⑥a 判它 > 0，
+    让 ⑥a 失败时 ⑥b 印「未覆盖」而不是「失败」—— 与核内那句 `if (smW > 0u && smH > 0u)`
+    的跳过**逐字对应**。
+  - 那个不可靠的全局也留在探针里（槽 13）当**对照读数**，判据把它和真实尺寸并排打印。
+    理由：「它为什么曾经是个常数」应该在报表上有出处，而不是留在注释里 ——
+    注释会被后来的人当成过时的担忧删掉，一个打印出来的 `1（真实 atlas 宽是 2048）` 不会。
+
+- **reversed-Z 让「阴影 atlas 是不是空的」这条判据产生了一次假通过，
+  而它坏在自己唯一的职责上。**
+  第一版的规则是「`min < 0.999` ⇒ atlas 有内容」，隐含假设「清空态是 1.0」。
+  - D3D11 / Vulkan / Metal 上 URP 的阴影投影矩阵带 reversed-Z 翻转
+    （`MainLightShadowCasterPass.cs:296-299` 那个 no-op 矩阵的 `m22 = usesReversedZBuffer ? 1 : 0`
+    是同一件事的另一半），**清空后的 atlas 深度读回来是 0.0**。
+    于是 atlas 全空时 `min = 0 < 0.999`，判据宣布「有内容」——
+    一个假通过，而这一格存在的**唯一**理由就是把「atlas 是空的」与
+    「atlas 有内容但我们查出来恒 1」分开归因。
+  - 「尺子和被测对象用了不同的物理，产生的假失败比真失败更贵」这条的**更坏的镜像**：
+    它产生的可以是一个假通过，而假通过恰好坏在该判据唯一的职责上。
+  - **修法：改判「atlas 是不是一个常数」，也就是 `max − min`。**
+    「空 atlas 是一个常数」不依赖任何深度约定，reversed-Z 与正向 Z 都成立。
+    实测 `min 0.000000 / max 0.998626 ⇒ 跨度 9.986e-1`（门 > 1e-3）。
+    顺带这两个数把约定本身也读出来了：`min ≈ 0 且 max > 0` ⇒ reversed-Z。
+  - 残余风险点名：全部 1024 个采样点在光空间共面时 atlas 也会是常数 ——
+    那要求整个 atlas 只有一个正对光的平面，可忽略，但要写在报表里。
+  - **这一条同时反过来印证了上一条。** 旧规则（`min < 0.999 ⇒ 有内容`）
+    在 `1×1` 那个 bug 下会读到 `min = 0` 并**全绿**。两个缺陷各自都能藏住对方，
+    只有先把假通过修成真判据，那个 `1×1` 才有机会红出来。
+  - 一般化：**判据的规则若要拿读数去跟「清空值 / 默认值」比，先问那个值是否依赖平台约定。**
+    改判「是不是一个常数」就与约定无关了。
+
+- **`SampleShadowmap` 的返回下界是 `1 − shadowStrength` 而不是 0，
+  而那个没有归因的 `min = 0.2` 编码着一条缺失的判据成因。**
+  URP `Shadows.hlsl:306` 的 `SampleShadowmap` 最后一步是
+  `return lerp(1.0, s, _MainLightShadowParams.x)`，`x` 就是主光的 shadowStrength。
+  - 判据⑤a 读到 `阴影值域 min 0.199999`。这个数当时**无法归因** ——
+    既不是 0（完全遮挡）也不是别的什么已知量，很容易被当成噪声或者 fp 误差接受。
+    「一个没有归因输入的整数读数会被当成噪声接受，而它其实编码着一个判据缺失的成因」。
+  - 把 `GetMainLightShadowParams().x` 也记进探针（槽 10），读回 `0.800000`，
+    地板 `1 − 0.8 = 0.2`，与实测 `0.199999` 差 `-0.000001`（定点编码的 1e-6 量化）。
+    归因闭合。
+  - **真正的收获不是解释了那个 min，而是补上了「一个点都没被遮」的第三种成因**：
+    `strength == 0` 时 `SampleShadowmap` 恒返回 1，而那与「阴影矩阵算错了」
+    在报表上长得一模一样。在记下 strength 之前，这条成因根本不在候选列表里。
+  - **这一格印成 ⓘ 而不是门。** 值域 `[1−strength, 1]` 是 `lerp` 的构造性保证，
+    判它等于「一个本轮无法失败的守卫」。但它的**输入**（strength）要打印出来，
+    因为那才是能变、能出错、能解释别的读数的东西。
+
+- **一次全绿的运行，必须逐格复核「绿的理由对不对」，而不是只看颜色 ——
+  本段的第二次复核抓到了第一次复核漏掉的缺陷。**
+  #20 的判据一共全绿过两次，两次都有问题：
+  - 第一次全绿：⑥ 的规则拿 `min` 去比一个**假设的**清空值 1.0，是假通过（见上）。
+  - 第二次（把 ⑥ 改成判跨度之后）：⑥ 红了，真因是 `_MainLightShadowmapSize`（见上）。
+  - 第三次全绿之后再复核，发现**我自己写的 ⓘ 文案与读数矛盾** ——
+    注释里断言「硬阴影档 ⇒ 这个全局读到 0 是预期的」，而实测是 1。
+    于是又去 grep 出 `s_EmptyShadowmapSize`，才拿到那条「1×1 看起来完全合法」的结论。
+  - 规则：**颜色只说明「按当前规则通过」，复核要问的是「当前规则要拒绝的最小错答案是什么，
+    这次的读数真的能拒绝它吗」**。把那个最小错答案的数值印在报表上，
+    是让这件事下次不必靠记性的唯一办法。
 
 - **判据自己的抵消误差伪造了一个「失败」—— 4 档全红，被测代码是对的。**
   #19 的求值点判据第一版写成「求值点落在分段里的度量位置」这个**减法**形式：
@@ -2770,9 +2942,21 @@
   现在自检只验证这两张 RT **被正确分配**（Tex3D / 尺寸 / RGBA16F / UAV / 三个句柄互不相同），
   内容一律为零，而**零内容与"从来没被写过"在报表上长得一样** ——
   所以这两格在自检输出里有一条显式的 ⓘ 点名，不靠读者自己发现。
-- **AP 的 `nearDistanceKm` 还没有接上 `desc.handoffMeters`（#20 的活）。**
-  在接上之前，近层体与 AP LUT 都从 t = 0 开始积分，两层同开会把近段的雾算两遍；
-  这也是 `Mode.Froxel` 现在不存在的第二个理由。
+- **AP 的积分起点还没有接上 `desc.handoffMeters`。**（#19 原本写的是「#20 的活」，
+  **这句是错的**，见下。）在接上之前，近层体与 AP LUT 都从 t = 0 开始积分，
+  两层同开会把近段的雾算两遍；这也是 `Mode.Froxel` 现在不存在的第二个理由。
+  - **只把 `nearDistanceKm` 填成 `handoffMeters` 是不够的。** `AerialPerspectiveLut`
+    在切片循环前把 `tPrev` 初始化成 `0.0`（`AtmosphereLut.compute:375`），
+    所以第 0 片的行进区间是 `[0, near]` —— 把 near 推远只会让第 0 片**变长**，
+    近段的雾照样被算进去，双计一点没少。要真去掉双计，`tPrev` 的初值必须一起移到
+    handoff 上，而那会改变 AP LUT 的语义（从「相机到 t 的累积」变成
+    「handoff 到 t 的累积」），读端的合成也要跟着改。
+  - 所以这件事的归属是 **#21 / #25**，不是 #20：#21 拥有近层积分表的语义定义，
+    #25 拥有统一采样函数（近层与 AP 在哪个距离上交接、谁负责哪一段）。
+    **#20 因此刻意一个字都不碰 AP。**
+  - 顺带：Task #7 的 AP 档位扫描是在**无雾**且 `near = 20 m` 下做的，
+    handoff 接上之后 `near` 会变成 48~500 m 量级，Log vs Power 的结论可能翻转 ——
+    那条重扫已经在 Step 3 的待办里点名了。
 
 - ~~LUT 七个 pass 的实测耗时（目标合计 < 0.3 ms）~~ —— **已完成**，数据见 Added 的
   计时器一节。当时对反射的估算是"0.4M 次取样 ≈ 0.03 ms"，实测第一版是 0.391 ms，

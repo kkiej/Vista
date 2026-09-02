@@ -52,6 +52,12 @@ namespace Vista
                + "Off：不产出，镜面反射回落到场景自带的反射探针。")]
         VistaSkyReflectionMode m_SkyReflection = VistaSkyReflectionMode.SkyViewLut;
 
+        [SerializeField]
+        [Tooltip("近层体积雾（froxel 体）的分辨率与深度范围。介质参数在上面的 Fog 里 —— "
+               + "近层与 AP LUT 共用同一份介质定义。\n"
+               + "注意：本节的开关目前只产出一张 3D 注入表，画面上看不到变化（积分是 #21）。")]
+        VistaVolumetricFogSettings m_VolumetricFog = new VistaVolumetricFogSettings();
+
         VistaAtmosphereLuts m_Luts;
         VistaAtmospherePass m_Pass;
         VistaAerialPerspectiveCompositePass m_ApCompositePass;
@@ -99,6 +105,26 @@ namespace Vista
         /// 依赖它的 GPU 资源），所以改完下一帧就生效，不需要通知任何人。
         /// </summary>
         public VistaFogSettings fog => m_Fog;
+
+        /// <summary>
+        /// 近层体积雾设置。与 <see cref="fog"/> 分开的理由见 VistaVolumetricFogSettings 的头注：
+        /// 这里是「体积怎么切」，那里是「介质是什么」，换分辨率不该动介质。
+        ///
+        /// Editor 自检（Window/Vista/Log Volumetric Fog State）靠它读出
+        /// <c>enableInjection</c> 的状态并在关着的时候点名 —— 所以它必须是 public。
+        /// </summary>
+        public VistaVolumetricFogSettings volumetricFog => m_VolumetricFog;
+
+#if UNITY_EDITOR
+        /// <summary>
+        /// 仅 Editor 自检：近层 froxel 体。用来置 <c>probeRequested</c> 并读回覆盖性探针。
+        ///
+        /// 不把整个 <c>m_Luts</c> 开出去：那会让场景侧能改到七张大气表的分配口径，
+        /// 而那些的脏检查是由本类的参数驱动的 —— 从外面动一下的症状是
+        /// 「表被重烘了但参数没变」，在 profiler 上表现为一个无法归因的尖峰。
+        /// </summary>
+        public VistaFroxelVolume froxelVolume => m_Luts?.froxelVolume;
+#endif
 
         /// <summary>
         /// 反射来源模式。可运行时改 —— Demo 视频要在同一帧里对比 PC 与移动端两条路径。
@@ -169,7 +195,7 @@ namespace Vista
 
             m_Luts.SetSkyViewResolution(m_SkyViewResolution.x, m_SkyViewResolution.y);
             m_Pass.Setup(m_Luts, m_Parameters, m_AerialPerspective, m_Fog, m_SkyReflection,
-                         m_GroundLevelWorldY, m_EV100);
+                         m_GroundLevelWorldY, m_EV100, m_VolumetricFog);
             renderer.EnqueuePass(m_Pass);
 
             // 全屏合成（变体 A）。三个条件都必须在**排入之前**判掉，而不是排进去再在

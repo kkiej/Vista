@@ -70,6 +70,19 @@ namespace Vista
         // 不是 NaN。与 VistaFogCB 同一条「关掉 = 零态」的约定。
         public static readonly int _VistaFroxelRange              = Shader.PropertyToID("_VistaFroxelRange");
         public static readonly int _VistaFroxelSize               = Shader.PropertyToID("_VistaFroxelSize");
+        // xyz: 相机世界位置 (m)，w: 阴影贴图是否已绑定（1 = 是）。
+        //
+        // 为什么不复用 _VistaViewPosKm：那个值在 6360 km 量级上，fp32 的 ulp 是 0.49 m，
+        // 拿它当阴影查询的起点会让阴影坐标按半米量化 —— 症状是光柱边缘随相机移动跳格。
+        // 也不用 URP 的 _WorldSpaceCameraPos：Editor 立即模式（自检）下那个全局
+        // 由上一个渲染过的相机留着，而自检根本没有相机。
+        //
+        // w 分量作阴影可用性开关而不是靠 shader keyword：keyword 漏设的症状是
+        // 「整个场景没有光柱、且不报错」（URP 的 MainLightRealtimeShadow 在
+        // MAIN_LIGHT_CALCULATE_SHADOWS 未定义时直接 return 1.0），而一个 CPU 下发的
+        // uniform 可以被判据直接读出来点名。零态（全零）= 无阴影 = 恒为 1，与其余
+        // cbuffer 同一条「关掉 = 零态」的约定。
+        public static readonly int _VistaFroxelCameraWS           = Shader.PropertyToID("_VistaFroxelCameraWS");
 
         // ---- Volumetrics: froxel 体的三张表 ----
         // 注入表有两个绑定点：写用 RW（RWTexture3D），读用 Read（Texture3D）。
@@ -82,6 +95,8 @@ namespace Vista
         public static readonly int _VistaFroxelIntegral           = Shader.PropertyToID("_VistaFroxelIntegral");
         // 自检专用：逐片的分布报告
         public static readonly int _VistaFroxelSliceReportRW      = Shader.PropertyToID("_VistaFroxelSliceReportRW");
+        // 自检专用：阴影覆盖性探针（min/max 的定点编码 + 关键字状态）
+        public static readonly int _VistaFroxelShadowProbeRW      = Shader.PropertyToID("_VistaFroxelShadowProbeRW");
 
         // ---- Atmosphere: banding 签名（仅 Editor 自检）----
         // 走的是**运行时那个采样入口**，所以它读 _VistaSkyViewLut（SRV），

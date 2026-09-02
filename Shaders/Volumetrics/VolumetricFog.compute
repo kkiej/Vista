@@ -1,26 +1,53 @@
 // ============================================================================
 //  近层体积雾（Step 3 档 A）
 //
-//  #19 只交付「资源 + 分布 + 判据」，所以这里目前只有两个核，两个都是为判据服务的：
+//  #19 交付「资源 + 分布 + 判据」，#20 交付逐 froxel 的光照注入。四个核：
 //    FroxelPlaceholder   把切片几何写进注入表 —— 它**不是**雾，是一份能被读回来对账的
 //                        已知内容。存在的理由是「RWTexture3D 绑定失败」这个坑：
 //                        RTHandle 的 2D 便捷重载会静默建成 Tex2D，症状只有 Editor.log
 //                        里一行 warning，画面上表现为整张表全零。让判据读到一个
 //                        **非零且可预测**的内容，那条路径才算被覆盖过。
 //    FroxelSliceVerify   把注入表当 SRV 读回来 + 做解析侧的恒等式，写进报告 buffer。
+//    FroxelInjection     #20：逐 froxel 求 (σ_s·J, σ_t)，含级联阴影。
+//    FroxelShadowProbe   #20 的覆盖性判据：证明阴影查询这条路真的执行过、且不是恒 1。
 //
-//  逐 froxel 的光照注入（级联阴影 + 主光）是 #20，深度积分是 #21，
-//  时间重投影是 #22。在那之前 VistaFogSettings.Mode 里**不会**出现 Froxel 档 ——
-//  一个选了什么都不发生（或者发生占位内容）的枚举值等于把哑档位摆给美术。
+//  深度积分是 #21，时间重投影是 #22。在那之前 VistaFogSettings.Mode 里**不会**出现
+//  Froxel 档 —— 一个选了什么都不发生（或者只产出一张没人读的表）的枚举值
+//  等于把哑档位摆给美术。#20 的注入因此挂在一个开发者开关上（默认关），
+//  而那个开关关着的时候由 Window/Vista/Log Volumetric Fog State 点名。
 // ============================================================================
 
 #pragma kernel FroxelPlaceholder
 #pragma kernel FroxelSliceVerify
+#pragma kernel FroxelInjection
+#pragma kernel FroxelShadowProbe
 
 // 与大气那批核同一条排除线：GLES 没有 RWTexture3D，编译只会产出一堆噪声。
 #pragma only_renderers d3d11 vulkan metal playstation xboxone xboxseries switch
 
-#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+// ---------------------------------------------------------------- 阴影关键字
+//  只声明级联这一个。
+//
+//  · **不**声明 _MAIN_LIGHT_SHADOWS_SCREEN：TransformWorldToShadowCoord
+//    （URP Shadows.hlsl:356）对它是 #if defined，没声明就在**编译期**选中
+//    级联矩阵那一支，于是这个核永远不会去读屏幕空间阴影图（compute 里根本没有
+//    屏幕坐标）。声明了反而会让那条路悄悄生效，症状是光柱位置整体错开。
+//  · **不**声明 _SHADOWS_SOFT*：SampleShadowmap 的软阴影阶梯是 4/9 tap 的 tent，
+//    逐 froxel 付不起（默认档 240×135×64 = 207 万个 froxel）。而体积雾是低频的，
+//    1 tap 的硬阴影在雾里看不出锯齿 —— HDRP 的 VBufferLighting 同样只取 1 tap。
+//  · 漏设 _MAIN_LIGHT_SHADOWS_CASCADE 的降级是「所有点都按级联 0 查」，
+//    也就是远处光柱错位 —— 一个**可归因**的症状。这比用 MainLightRealtimeShadow
+//    好：那个函数在 MAIN_LIGHT_CALCULATE_SHADOWS 未定义时直接 return 1.0，
+//    漏设的症状是「整个场景没有光柱、且不报错」。
+//    这两条都由 FroxelShadowProbe 把编译期状态读回来点名。
+#pragma multi_compile _ _MAIN_LIGHT_SHADOWS_CASCADE
+
+// Shadows.hlsl 自己 include 了 Core.hlsl 与 core 的 Common.hlsl，所以放在最前面。
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Shadows.hlsl"
+#include "Packages/com.kkiej.vista/ShaderLibrary/AtmosphereDef.hlsl"
+#include "Packages/com.kkiej.vista/ShaderLibrary/AtmosphereScattering.hlsl"
+#include "Packages/com.kkiej.vista/ShaderLibrary/AerialPerspective.hlsl"
+#include "Packages/com.kkiej.vista/ShaderLibrary/SphericalHarmonics.hlsl"
 #include "Packages/com.kkiej.vista/ShaderLibrary/FroxelVolume.hlsl"
 
 RW_TEXTURE3D(float4, _VistaFroxelInjectionRW);
@@ -33,6 +60,11 @@ TEXTURE3D(_VistaFroxelInjectionRead);
 // 那边是唯一的消费者，把语义写在消费端而不是这里，是为了让「读错字段」
 // 在判据的报表上直接显形。
 RWStructuredBuffer<float4> _VistaFroxelSliceReportRW;
+
+// #20 的覆盖性探针。定点编码 + 原子操作，槽位语义写在唯一的消费端
+// （VistaVolumetricFogState）—— 与上面那个报告 buffer 同一条约定：
+// 把语义写在消费端而不是这里，「读错字段」才会在判据的报表上直接显形。
+RWStructuredBuffer<uint> _VistaFroxelShadowProbeRW;
 
 // ----------------------------------------------------------------------------
 //  占位：把切片几何写进注入表
@@ -123,4 +155,307 @@ void FroxelSliceVerify(uint3 id : SV_DispatchThreadID)
 
     _VistaFroxelSliceReportRW[slice * 2 + 0] = fromRt;
     _VistaFroxelSliceReportRW[slice * 2 + 1] = float4(roundTrip, encodeErr, samplePos, ratio);
+}
+
+// ============================================================================
+//  #20 逐 froxel 光照注入
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+//  主光可见度：级联阴影，1 tap
+//
+//  ---- 为什么直接调 SampleShadowmap，而不是 MainLightRealtimeShadow ----
+//  后者（Shadows.hlsl:385）在 MAIN_LIGHT_CALCULATE_SHADOWS 未定义时**直接 return 1.0**。
+//  也就是关键字漏设的症状是「整个场景没有光柱、且不报错」——
+//  正是项目里那条「一个默认关闭、又没有判据覆盖的开关，等于一段永远不会被发现写错的代码」。
+//  直接调底层那三个函数，漏设关键字的后果退化成「全按级联 0 查」（远处光柱错位），
+//  是个能被看见、能被归因的症状。三个函数都**没有**关键字门：
+//    GetMainLightShadowSamplingData()  Shadows.hlsl:151
+//    GetMainLightShadowParams()        Shadows.hlsl:186（已含 shadowStrength）
+//    SampleShadowmap(...)              Shadows.hlsl:306（已含 BEYOND_SHADOW_FAR）
+//
+//  ---- isPerspectiveProjection 必须传 false ----
+//  TransformWorldToShadowCoord 走 #else 那一支时返回的 w 恒为 0.0（Shadows.hlsl:361）。
+//  传 true 会让 SampleShadowmap 做 xyz /= w，即除以 0 —— 症状是整张表 NaN，
+//  而 NaN 会顺着三线性插值蔓延到全屏。
+//
+//  ---- 已知的隐藏依赖：GetMainLightShadowFade 读 URP 的 _WorldSpaceCameraPos ----
+//  它（Shadows.hlsl:434）用 positionWS − _WorldSpaceCameraPos 求距离，而
+//  _VistaFroxelCameraWS 存在的理由恰恰是不信任那个全局（Editor 立即模式下它由上一个
+//  渲染过的相机留着）。这里仍然调它、不自己重写那一行 saturate ——
+//  「同一个量的第二份实现连 8 行的辅助函数也算」，而淡出因子那一行同样算。
+//  代价是这个核对 _WorldSpaceCameraPos 有依赖，所以 FroxelShadowProbe 把
+//  |_WorldSpaceCameraPos − _VistaFroxelCameraWS.xyz| 读回来当判据的一项：
+//  这条隐藏依赖于是变成一个能失败的打印数字，而不是一句注释里的担忧。
+// ----------------------------------------------------------------------------
+float VistaFroxelSunShadow(float3 positionWS)
+{
+    // 阴影贴图没绑（关阴影 / 反射探针 / 自检）时恒为全亮。
+    // 不靠关键字判断而靠 CPU 下发的 uniform，理由见 VistaShaderIDs._VistaFroxelCameraWS。
+    if (_VistaFroxelCameraWS.w < 0.5)
+        return 1.0;
+
+    float4 coord = TransformWorldToShadowCoord(positionWS);
+    float  s = SampleShadowmap(
+        TEXTURE2D_SHADOW_ARGS(_MainLightShadowmapTexture, sampler_LinearClampCompare),
+        coord, GetMainLightShadowSamplingData(), GetMainLightShadowParams(),
+        /*isPerspectiveProjection*/ false);
+
+    // 1 = 完全淡出 ⇒ 淡出区恢复全亮，与不透明物体的阴影同一条渐变。
+    return lerp(s, 1.0, GetMainLightShadowFade(positionWS));
+}
+
+// ----------------------------------------------------------------------------
+//  一个 froxel 的注入结果
+//
+//  提成函数是为了让 FroxelInjection 与将来 #22 的重投影版本共用同一段能量计算；
+//  抖动不在这里 —— 它由调用方把偏移加在传进来的 slice 上
+//  （VistaFroxelSampleDistance 的形参本来就是 float），所以这里没有「默认关闭的抖动开关」。
+// ----------------------------------------------------------------------------
+float4 VistaFroxelInject(uint2 pixel, float slice)
+{
+    float2 uv     = ((float2)pixel + 0.5) * rcp(max(_VistaFroxelSize.xy, 1.0));
+    float3 rayDir = VistaApFroxelRayDirection(uv);
+
+    float dMeters = VistaFroxelSampleDistance(slice);
+    float tKm     = dMeters * _VistaGround.w;   // 0.001，与 AP 同一个 CPU 下发的缩放
+
+    // 大气空间的位置用 km（介质剖面按 r − bottomRadius 取），世界空间的位置用 m
+    // （阴影矩阵是世界空间的）。两者不能互推：km 那一支在 6360 km 量级上 ulp 0.49 m，
+    // 拿它反算世界位置会让阴影坐标按半米量化，症状是光柱边缘随相机移动跳格。
+    float3 posKm = _VistaViewPosKm.xyz            + tKm     * rayDir;
+    float3 posWS = _VistaFroxelCameraWS.xyz       + dMeters * rayDir;
+
+    VistaRaymarchSettings s = VistaDefaultRaymarchSettings();
+    s.applyPhase          = true;
+    s.useMultiScattering  = true;
+    // 与 AP 同理：远端的辐射由几何体提供，这里再加一次地面反弹就是重复计能量。
+    s.includeGroundBounce = false;
+    // 逐 froxel 只读 L_00 那一个系数（VistaSkyAmbientMean），不读满 9 个：
+    // AP 那边把 9 次读提到切片循环外是因为它一柱一次，这里是逐 froxel，
+    // 提不出去，所以要的就是只读一个系数的那个入口。
+    s.fogAmbientRadiance  = VistaSkyAmbientMean();
+    // includeFog 与本核无关：它只门住 VistaIntegrateScatteredLuminance 内部的取雾，
+    // 而我们自己取雾、自己调逐点函数。留在默认 false 上，避免读者以为它有作用。
+
+    VistaFogSample fog = VistaSampleFogAlongRay(tKm, rayDir.y);
+
+    VistaScatterSample smp = VistaEvaluateScatterSample(
+        posKm, rayDir, _VistaSunDirection.xyz, fog, s, VistaFroxelSunShadow(posWS));
+
+    // ---- 存什么 ----
+    //  rgb: 散射源项 σ_s·J，**预曝光**（× VISTA_EXPOSURE）。与 AP LUT 同一条约定，
+    //       理由同样是 fp16 的 65504 天花板：浓雾对着低太阳时源项到 3.7e5 cd/m²。
+    //  a:   灰度消光 σ_t (1/km)。
+    //
+    //  ---- 为什么消光存灰度而不是 RGB ----
+    //  一个 float4 就够，而分通道要 RGBA16F × 2（注入 + 历史 + 积分三张表全部翻倍）。
+    //  代价是彩色消光被平均掉，包络已经量过：
+    //    · 默认档 D = 61.374 m：Rayleigh τ_blue = 2.0e-3 vs 灰度 1.07e-3
+    //      ⇒ 透射率相差 0.096%，远在 1% 的 Weber 门之下；
+    //    · clamp 到 shadow distance 的极端档 D = 500 m：τ_blue = 16.6e-3 vs 灰度 8.75e-3
+    //      ⇒ 0.78%，仍在门内（这是「各通道对灰度均值」的差，不是蓝红之间的差 1.4%）；
+    //    · 雾自己的 σ_t 由 densityTint 决定，中性色时**精确**为 0 误差。
+    //  也就是说这个近似的失效点在 D 远大于 500 m 时，而 D 的上限本身被
+    //  级联阴影距离压着（超出就没有光柱可注入了）。远处的彩色消光由 AP LUT 负责，
+    //  它存的是分通道透射率。
+    //
+    //  注意：这里的 σ_t **含大气**（Rayleigh + Mie + 臭氧），不只有雾。
+    //  D = 500 m 时蓝光的大气 τ 是 16.6e-3 = 1.66%，已经越过 1% 的门 ——
+    //  近层体只算雾、把大气整段留给 AP 是不成立的。
+    float greyExtinction = dot(smp.extinction, (1.0 / 3.0).xxx);
+    return float4(smp.scattered * VISTA_EXPOSURE, greyExtinction);
+}
+
+// 注入表是逐 froxel 独立的（没有沿深度的累积），所以走满 3D 派发而不是
+// 「一线程一柱、循环切片」。默认档 240×135×64 = 207 万个 froxel，
+// 3D 派发给出 207 万个线程，而按柱只有 3.24 万个 —— 后者在 28 个 SM 上
+// 隐藏不住 StructuredBuffer 与阴影贴图的访存延迟。
+// #21 的积分是累积量，那个必须按柱，两者的派发形状本来就不同。
+[numthreads(8, 8, 1)]
+void FroxelInjection(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_VistaFroxelSize.xyz))
+        return;
+
+    _VistaFroxelInjectionRW[id] = VistaFroxelInject(id.xy, (float)id.z);
+}
+
+// ----------------------------------------------------------------------------
+//  覆盖性判据核
+//
+//  它要回答的不是「阴影值对不对」（那要一份第二实现），而是三个**执行性**问题：
+//    ① 这条路径跑过吗                     —— 槽 RAN 位 + 探针计数
+//    ② 编译期状态是我以为的那个吗         —— 关键字位（含两个必须为 0 的）
+//    ③ 阴影查询真的读到东西了、且不是恒 1 —— min/max + 「有多少个点被遮」
+//  ③ 依赖场景里近层体内确实有投影物，所以判据必须把「阴影图本身是不是空的」
+//  分开读（槽 SHADOWMAP_MIN）：那是「阴影图没内容」与「阴影图有内容但我们查出来恒 1」
+//  两种失败的唯一区分手段 —— 第一个可疑对象被修掉、读数却没变时，要能回头重新归因。
+//
+//  探针网格是固定的 32×32×16，不随体积分辨率变：判据的读数要能跨档位比较，
+//  而跟着分辨率变的采样数会让「换档后 min 变了」分不清是阴影变了还是采样点变了。
+// ----------------------------------------------------------------------------
+#define VISTA_PROBE_DIM_XY 32
+#define VISTA_PROBE_DIM_Z  16
+
+#define VISTA_PROBE_SHADOW_MIN     0u
+#define VISTA_PROBE_SHADOW_MAX     1u
+#define VISTA_PROBE_FLAGS          2u
+#define VISTA_PROBE_COUNT          3u
+#define VISTA_PROBE_SHADOWED_COUNT 4u
+#define VISTA_PROBE_CAM_DRIFT_MM   5u
+#define VISTA_PROBE_NONFINITE      6u
+#define VISTA_PROBE_INJECT_MAX     7u
+#define VISTA_PROBE_SHADOWMAP_MIN  8u
+#define VISTA_PROBE_SHADOWMAP_MAX  9u
+#define VISTA_PROBE_SHADOW_STRENGTH 10u
+#define VISTA_PROBE_SM_WIDTH       11u
+#define VISTA_PROBE_SM_HEIGHT      12u
+#define VISTA_PROBE_URP_SIZE_Z     13u
+
+// 位 4「跑过」是必需的：只靠位 0~3 的话，一个从未派发的核留下的全零
+// 与「级联关 + 阴影图未绑 + 屏幕空间关 + 软阴影关」这个**完全合法**的组合
+// 在报表上长得一模一样。
+#define VISTA_PROBE_FLAG_CASCADE     1u
+#define VISTA_PROBE_FLAG_SHADOWMAP   2u
+#define VISTA_PROBE_FLAG_SCREEN      4u
+#define VISTA_PROBE_FLAG_SOFT        8u
+#define VISTA_PROBE_FLAG_RAN         16u
+
+// 定点编码的公共上限。uint 到 4.29e9，留一位数的余量防溢出回绕 ——
+// 回绕的症状是「最大值变成一个很小的数」，那会把一次失败伪装成通过。
+#define VISTA_PROBE_FIXED_MAX 4.0e9
+
+uint VistaProbeFixed(float v, float scale)
+{
+    return (uint)clamp(v * scale, 0.0, VISTA_PROBE_FIXED_MAX);
+}
+
+[numthreads(8, 8, 1)]
+void FroxelShadowProbe(uint3 id : SV_DispatchThreadID)
+{
+    // 关键字与「跑过」标记：放在任何 return 之前。
+    if (all(id == 0u))
+    {
+        uint flags = VISTA_PROBE_FLAG_RAN;
+        #ifdef _MAIN_LIGHT_SHADOWS_CASCADE
+            flags |= VISTA_PROBE_FLAG_CASCADE;
+        #endif
+        #ifdef _MAIN_LIGHT_SHADOWS_SCREEN
+            flags |= VISTA_PROBE_FLAG_SCREEN;      // 必须为 0，见头部的 pragma 说明
+        #endif
+        #if defined(_SHADOWS_SOFT) || defined(_SHADOWS_SOFT_LOW) || defined(_SHADOWS_SOFT_MEDIUM) || defined(_SHADOWS_SOFT_HIGH)
+            flags |= VISTA_PROBE_FLAG_SOFT;        // 必须为 0
+        #endif
+        if (_VistaFroxelCameraWS.w >= 0.5)
+            flags |= VISTA_PROBE_FLAG_SHADOWMAP;
+
+        InterlockedOr(_VistaFroxelShadowProbeRW[VISTA_PROBE_FLAGS], flags);
+
+        // 相机位置漂移：这个核对 URP 的 _WorldSpaceCameraPos 的隐藏依赖，
+        // 见 VistaFroxelSunShadow 的注释。读数不为 0 就说明淡出因子算错了。
+        InterlockedMax(_VistaFroxelShadowProbeRW[VISTA_PROBE_CAM_DRIFT_MM],
+            VistaProbeFixed(length(_WorldSpaceCameraPos - _VistaFroxelCameraWS.xyz), 1000.0));
+
+        // 主光的阴影强度。SampleShadowmap 的返回是 lerp(1, s, strength)，
+        // 所以「全被遮」的地板是 1 − strength，不是 0 —— 不记它的话，
+        // 判据里那个 min 读数是个无法归因的数（本项目实测 0.2 ⇒ strength 0.8）。
+        //
+        // 它同时补上了「一个点都没被遮」的第三种成因：strength == 0 时
+        // SampleShadowmap 恒返回 1，而那与「矩阵错了」在报表上长得一样。
+        InterlockedMax(_VistaFroxelShadowProbeRW[VISTA_PROBE_SHADOW_STRENGTH],
+            VistaProbeFixed(GetMainLightShadowParams().x, 1.0e6));
+
+        // URP 那个 _MainLightShadowmapSize.z（atlas 宽）的归因读数。
+        // 它**不是**一个可靠的全局：MainLightShadowCasterPass.cs:334 把整段
+        // SetGlobalVector 包在 if (shadowData.supportsSoftShadows) 里，
+        // 硬阴影档下这一帧根本不下发，读到的是**别人留下的脏值** ——
+        // 本项目实测 1，来自同文件 :34 的 s_EmptyShadowmapSize = (1,1,1,1)
+        //（某个走过 empty-shadowmap 路径的相机设的）。1×1 是一个看起来完全合法的
+        // 尺寸，拿它算坐标全塌到 (0,0) 且不报错，所以要把这个读数印出来。
+        InterlockedMax(_VistaFroxelShadowProbeRW[VISTA_PROBE_URP_SIZE_Z],
+            VistaProbeFixed(_MainLightShadowmapSize.z, 1.0));
+
+    }
+
+    if (id.x >= VISTA_PROBE_DIM_XY || id.y >= VISTA_PROBE_DIM_XY || id.z >= VISTA_PROBE_DIM_Z)
+        return;
+
+    uint3 size = (uint3)_VistaFroxelSize.xyz;
+    if (any(size == 0u))
+        return;
+
+    // 阴影图自己有没有内容：与体积无关的一路读数，用于把
+    //「阴影图是空的」与「阴影图有内容但查出来恒 1」分开归因。
+    // 32×32 个 texel，整个 atlas（含全部级联）都被这个网格覆盖到。
+    // 只让 id.z == 0 那一层做，否则同样 1024 个 texel 会被读 16 遍。
+    //
+    // ---- 尺寸自己问纹理要，**不读 _MainLightShadowmapSize** ----
+    // 那个全局在 URP 里只在软阴影档下发：MainLightShadowCasterPass.cs:334
+    // 把 _ShadowOffset0/1 与 _ShadowmapSize 三行一起包在
+    // if (shadowData.supportsSoftShadows) 里。硬阴影档下这一帧根本不下发，
+    // 读到的是别人留下的脏值 —— 实测 1（s_EmptyShadowmapSize = (1,1,1,1)，同文件 :34）
+    // ⇒ smCoord 恒为 (0,0) ⇒ atlas 读回来是一个常数。
+    // 第一版就是那么写的，本判据因此红了一次，而红的理由不是场景没有投影物
+    //（同一趟里 1034 个点被遮）。URP 自己不受影响：那个尺寸只被 tent 软阴影的
+    // offset 用到，1 tap 的硬阴影路径根本不读它。
+    //
+    // ---- 判的是「atlas 是不是一个常数」，不是「min 等于某个清空值」 ----
+    // 清空值取决于 UNITY_REVERSED_Z：D3D11/Vulkan/Metal 上 URP 的阴影矩阵带
+    // reversed-Z 翻转，清空态是 **0.0** 而不是 1.0。按「清空态是 1.0」写出来的门
+    // 会在 atlas 全空时读到 min = 0 并宣布「有内容」—— 一个**假通过**，
+    // 而且它坏在本判据唯一的职责上。「空 atlas 是一个常数」不依赖任何约定。
+    if (_VistaFroxelCameraWS.w >= 0.5 && id.z == 0u)
+    {
+        uint smW, smH;
+        _MainLightShadowmapTexture.GetDimensions(smW, smH);
+
+        // 尺寸也记进探针：GetDimensions 万一返回 0，症状仍然是「atlas 是常数」，
+        // 与「场景里没投影物」撞车。把它变成一个能失败的打印数字。
+        InterlockedMax(_VistaFroxelShadowProbeRW[VISTA_PROBE_SM_WIDTH],  smW);
+        InterlockedMax(_VistaFroxelShadowProbeRW[VISTA_PROBE_SM_HEIGHT], smH);
+
+        if (smW > 0u && smH > 0u)
+        {
+            // 整数算格心（(2i+1)/(2N)），避免 float 舍入把两个相邻探针撞到同一个 texel。
+            int2 smCoord = int2(
+                (int)((id.x * 2u + 1u) * smW / (2u * VISTA_PROBE_DIM_XY)),
+                (int)((id.y * 2u + 1u) * smH / (2u * VISTA_PROBE_DIM_XY)));
+            float smDepth = LOAD_TEXTURE2D(_MainLightShadowmapTexture, smCoord).r;
+            InterlockedMin(_VistaFroxelShadowProbeRW[VISTA_PROBE_SHADOWMAP_MIN],
+                VistaProbeFixed(smDepth, 1.0e6));
+            InterlockedMax(_VistaFroxelShadowProbeRW[VISTA_PROBE_SHADOWMAP_MAX],
+                VistaProbeFixed(smDepth, 1.0e6));
+        }
+    }
+
+    // 探针网格 -> froxel 索引。取每格中心，避免只采到边界那一列。
+    uint3 fid = uint3(
+        (uint)((id.x + 0.5) * size.x / VISTA_PROBE_DIM_XY),
+        (uint)((id.y + 0.5) * size.y / VISTA_PROBE_DIM_XY),
+        (uint)((id.z + 0.5) * size.z / VISTA_PROBE_DIM_Z));
+    fid = min(fid, size - 1u);
+
+    // 阴影走**被测函数自己**这一份实现，不重写。
+    float2 uv      = ((float2)fid.xy + 0.5) * rcp(max(_VistaFroxelSize.xy, 1.0));
+    float3 rayDir  = VistaApFroxelRayDirection(uv);
+    float  dMeters = VistaFroxelSampleDistance((float)fid.z);
+    float  shadow  = VistaFroxelSunShadow(_VistaFroxelCameraWS.xyz + dMeters * rayDir);
+
+    InterlockedMin(_VistaFroxelShadowProbeRW[VISTA_PROBE_SHADOW_MIN],
+        VistaProbeFixed(shadow, 1.0e6));
+    InterlockedMax(_VistaFroxelShadowProbeRW[VISTA_PROBE_SHADOW_MAX],
+        VistaProbeFixed(shadow, 1.0e6));
+    InterlockedAdd(_VistaFroxelShadowProbeRW[VISTA_PROBE_COUNT], 1u);
+    if (shadow < 0.999)
+        InterlockedAdd(_VistaFroxelShadowProbeRW[VISTA_PROBE_SHADOWED_COUNT], 1u);
+
+    // 注入表的内容体检。读 UAV 而不是 SRV：要看的就是**实际写进去的东西**，
+    // 而且 fp16 的量级余量（65504 天花板）只有从纹理里读回来才算量过。
+    float4 injected = _VistaFroxelInjectionRW[fid];
+    if (!all(isfinite(injected)))
+        InterlockedAdd(_VistaFroxelShadowProbeRW[VISTA_PROBE_NONFINITE], 1u);
+    else
+        InterlockedMax(_VistaFroxelShadowProbeRW[VISTA_PROBE_INJECT_MAX],
+            VistaProbeFixed(max(max(injected.r, injected.g), injected.b), 1.0e3));
 }

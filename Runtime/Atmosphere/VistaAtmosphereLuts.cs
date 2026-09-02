@@ -305,6 +305,9 @@ namespace Vista
         /// <summary>froxel 分布判据输出（#19）。只在 <c>EnsureSliceReportBuffer</c> 之后非 null。</summary>
         public GraphicsBuffer froxelSliceReportBuffer => m_FroxelVolume?.sliceReportBuffer;
 
+        /// <summary>froxel 阴影覆盖性探针输出（#20）。只在 <c>EnsureShadowProbeBuffer</c> 之后非 null。</summary>
+        public GraphicsBuffer froxelShadowProbeBuffer => m_FroxelVolume?.shadowProbeBuffer;
+
         public int skyViewWidth  => m_SkyViewWidth;
         public int skyViewHeight => m_SkyViewHeight;
 
@@ -1061,6 +1064,62 @@ namespace Vista
             d.Dispatch(m_LutCS, m_KernelApIdx,
                 VistaComputeUtils.DivRoundUp(settings.width, 8),
                 VistaComputeUtils.DivRoundUp(settings.height, 8), 1);
+        }
+
+        /// <summary>
+        /// #20 近层 froxel 注入。绑定放在本类而不是 <see cref="VistaFroxelVolume"/> 里，
+        /// 是为了让「哪个核绑哪些输入」全部集中在一个文件 —— 逐核绑定漏一项的症状
+        /// 通常不是报错，而是读到上一个绑定者留下的资源。
+        ///
+        /// 与 <see cref="RenderAerialPerspectiveLut{T}"/> 一样自己推一遍逐视图常量：
+        /// 本 pass 与 Sky-View / AP 之间没有声明过的依赖，不能假定谁先跑。
+        /// </summary>
+        /// <param name="desc">这一帧的分配口径。仅用来算 dispatch 维度 ——
+        /// 分布常量本身由 <c>VistaFroxelVolume.Prepare</c> 在记录期推成全局。</param>
+        /// <param name="cameraWS">相机世界坐标。**不复用 URP 的 <c>_WorldSpaceCameraPos</c>**，
+        /// 理由见 <c>VistaShaderIDs._VistaFroxelCameraWS</c>。</param>
+        /// <param name="shadowmapBound">主光阴影贴图这一帧有没有内容。false 时核内阴影恒 1，
+        /// 也就是「有雾、没有光柱」而不是「一片漆黑」。</param>
+        public void RenderFroxelInjection<T>(
+            T d, in VistaAtmosphereViewData view, VistaFogSettings fog,
+            in VistaFroxelVolumeDesc desc, Vector3 cameraWS, bool shadowmapBound)
+            where T : struct, IVistaLutDispatcher
+        {
+            if (m_FroxelVolume == null) return;
+
+            // 视锥四角单独推（BindFrustumRays），**不带** AP 的切片分布常量 ——
+            // 理由见 VistaAtmosphereViewData.BindFrustumRays 的头注：四角两条路径推的是
+            // 逐位相同的值，重复下发无害；而 _VistaApParams/Size/Flags 决定 AP 表自己的
+            // 深度映射，跟着雾体一起推就变成「改雾体分辨率会动 AP 的分布」。
+            view.Bind(d, m_SkyViewWidth, m_SkyViewHeight);
+            view.BindFrustumRays(d);
+            view.BindFog(d, fog);
+
+            m_FroxelVolume.DispatchInjection(d, desc, cameraWS, shadowmapBound);
+        }
+
+        /// <summary>
+        /// #20 覆盖性探针。**必须紧跟在 <see cref="RenderFroxelInjection{T}"/> 之后的
+        /// 一趟独立 dispatch 里**：它读的是注入表实际写进去的内容。
+        ///
+        /// 不重推 <c>_VistaFroxelCameraWS</c>：那个值由注入那一趟下发，
+        /// 探针要读的就是**注入实际用过的那一份**。在这里重推等于让判据自带一份布景，
+        /// 于是「注入拿到的相机位置是错的」这条失效会被探针自己抹平。
+        ///
+        /// 签名里没有 <c>desc</c>：探针网格固定 32×32×16，与体积分辨率无关 ——
+        /// 这样「换档后 min 变了」不会分不清是阴影变了还是采样点变了。
+        /// </summary>
+        public void RenderFroxelShadowProbe<T>(
+            T d, in VistaAtmosphereViewData view)
+            where T : struct, IVistaLutDispatcher
+        {
+            if (m_FroxelVolume == null) return;
+
+            // 射线重建要视锥四角；探针不取雾（它不算能量，只查阴影 + 读回注入表）。
+            view.Bind(d, m_SkyViewWidth, m_SkyViewHeight);
+            view.BindFrustumRays(d);
+
+            m_FroxelVolume.DispatchShadowProbe(d);
         }
 
         /// <summary>

@@ -48,6 +48,21 @@ namespace Vista
                + "近处会看到切片台阶。")]
         [Min(1f)] public float farDistanceMeters = 64f;
 
+        [Header("开发中（#20）")]
+        [Tooltip("逐 froxel 的光照注入。\n\n"
+               + "开了也**看不到任何画面变化** —— 它只把 (σ_s·J, σ_t) 写进一张 3D 表，"
+               + "而消费那张表的深度积分是 #21、时间重投影是 #22。\n\n"
+               + "为什么摆一个「打开也没用」的开关，而不是等 #21 一起做完：\n"
+               + "注入这一步引入了整条链路上唯一一处**跨模块依赖** —— 逐 froxel 采样 URP 的"
+               + "级联阴影贴图（本项目第一个 include Shadows.hlsl 的 compute shader）。"
+               + "那处依赖的失效形态是「关键字漏设 ⇒ 整个场景没有光柱、且不报错」，"
+               + "必须先有一条能失败的判据把它钉住，再往上堆积分。\n\n"
+               + "关着的时候 Window/Vista/Log Volumetric Fog State 会点名这个开关，"
+               + "所以它不是一段「永远不会被发现写错的代码」。\n"
+               + "美术不需要动它：VistaFogSettings.Mode 里**没有** Froxel 档，"
+               + "在积分落地之前也不会有。")]
+        public bool enableInjection = false;
+
         // --------------------------------------------------------------------
         //  切片分布：纯指数
         //

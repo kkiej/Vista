@@ -204,6 +204,34 @@ namespace Vista
         }
 
         /// <summary>
+        /// 只推视锥四角。
+        ///
+        /// 从 <see cref="BindAerialPerspective{T}"/> 里拆出来是因为出现了第二个消费者：
+        /// 近层 froxel 体（#20）也用 <c>VistaApFroxelRayDirection</c> 求视线方向 ——
+        /// 那是同一个相机的同一个视锥，再写一份插值等于给「两处视锥推导漂移」留门，
+        /// 而那种漂移的症状是「近雾与远雾在画面边缘对不上」，会被误判成分层接缝。
+        ///
+        /// 但 froxel 体**不该**顺手下发 AP 的切片分布（_VistaApParams / Size / Flags）：
+        /// 那三个决定 AP 表自己的深度映射，跟着雾体一起推就变成「改雾体的分辨率
+        /// 会动 AP 的分布」。RenderGraph 还可能重排两个 pass，届时谁最后推谁生效。
+        ///
+        /// 四角本身没有这个问题：两条路径推的是**逐位相同的值**（同一个 view 对象），
+        /// 所以重复下发与重排都无害。
+        /// </summary>
+        public void BindFrustumRays<T>(T cmd)
+            where T : struct, IVistaLutDispatcher
+        {
+            cmd.SetGlobalVector(VistaShaderIDs._VistaApRayBL,
+                new Vector4(rayBottomLeft.x, rayBottomLeft.y, rayBottomLeft.z, 0f));
+            cmd.SetGlobalVector(VistaShaderIDs._VistaApRayBR,
+                new Vector4(rayBottomRight.x, rayBottomRight.y, rayBottomRight.z, 0f));
+            cmd.SetGlobalVector(VistaShaderIDs._VistaApRayTL,
+                new Vector4(rayTopLeft.x, rayTopLeft.y, rayTopLeft.z, 0f));
+            cmd.SetGlobalVector(VistaShaderIDs._VistaApRayTR,
+                new Vector4(rayTopRight.x, rayTopRight.y, rayTopRight.z, 0f));
+        }
+
+        /// <summary>
         /// 推送 AP froxel 相关的逐视图常量。与 <see cref="Bind{T}"/> 分开是因为
         /// 视锥四角只有 AP 需要，而 Sky-View 那条链路（含反射探针的六个面）不需要，
         /// 合在一起会让"哪些相机必须调 SetFrustumRays"变得含糊。
@@ -214,14 +242,7 @@ namespace Vista
             cmd.SetGlobalVector(VistaShaderIDs._VistaApParams, settings.packedParams);
             cmd.SetGlobalVector(VistaShaderIDs._VistaApSize, settings.packedSize);
             cmd.SetGlobalVector(VistaShaderIDs._VistaApFlags, settings.packedFlags);
-            cmd.SetGlobalVector(VistaShaderIDs._VistaApRayBL,
-                new Vector4(rayBottomLeft.x, rayBottomLeft.y, rayBottomLeft.z, 0f));
-            cmd.SetGlobalVector(VistaShaderIDs._VistaApRayBR,
-                new Vector4(rayBottomRight.x, rayBottomRight.y, rayBottomRight.z, 0f));
-            cmd.SetGlobalVector(VistaShaderIDs._VistaApRayTL,
-                new Vector4(rayTopLeft.x, rayTopLeft.y, rayTopLeft.z, 0f));
-            cmd.SetGlobalVector(VistaShaderIDs._VistaApRayTR,
-                new Vector4(rayTopRight.x, rayTopRight.y, rayTopRight.z, 0f));
+            BindFrustumRays(cmd);
         }
 
         /// <summary>

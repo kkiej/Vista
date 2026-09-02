@@ -36,10 +36,14 @@ namespace Vista
         SkyReflectionArray,
 
         // ---- 近层体积雾的 froxel 体（#19 起）----
-        // 这四个槽位目前**只在立即模式下可解析**：graph 侧的 Resolve 故意落到 default
-        // （无效 handle），与 SkyAmbientShReference 同一个形状。RenderGraph 的接线在 #20 ——
-        // 那时才有真正要写进去的内容。现在就在 graph 侧兜底会让「pass 没排入但槽位能解析」
-        // 变成一条能编译能跑的错误路径。
+        // #19 时这四个槽位只在立即模式下可解析；#20 接上了 RenderGraph 那一侧
+        // （注入 pass 有真正要写进去的内容了）。两侧现在都能解析，但**都依赖
+        // 对应的 pass 事先声明过资源**：graph 侧拿到的是 pass import 进来的 handle，
+        // 没 import 就是 default（无效），绑定处直接炸 —— 这正是 default 不兜底的意义。
+        //
+        // 历史帧（#22）与积分表（#21）的**写入路径至今未被任何判据覆盖**：
+        // 资源建出来了、槽位能解析了，但没有核往里写。这一条记在 CHANGELOG 的待办里，
+        // 不在这里靠注释假装它是完整的。
         /// <summary>注入表的 UAV view（写）。</summary>
         FroxelInjection,
         /// <summary>
@@ -74,6 +78,15 @@ namespace Vista
         SkyFogError,
         /// <summary>仅 Editor 自检使用（froxel 体逐片的分布报告）。运行时路径不分配它。</summary>
         FroxelSliceReport,
+        /// <summary>
+        /// 仅 Editor 自检使用（#20 的阴影覆盖性探针）。
+        ///
+        /// 与其余「仅 Editor」槽位不同，这一个**必须能在 graph 侧解析** ——
+        /// 阴影贴图与注入表的内容只在真正渲染的一帧里存在，立即模式下没有相机、
+        /// 也没有 MainLightShadowCasterPass 跑过。所以它由 pass 按需 import 进图，
+        /// 没请求探针时留在 default（null），dispatch 由 C# 侧的门挡掉。
+        /// </summary>
+        FroxelShadowProbe,
     }
 
     /// <summary>
@@ -175,6 +188,7 @@ namespace Vista
             VistaLutBufferSlot.SkyViewBanding        => m_Luts.skyViewBandingBuffer,
             VistaLutBufferSlot.SkyFogError           => m_Luts.skyFogErrorBuffer,
             VistaLutBufferSlot.FroxelSliceReport     => m_Luts.froxelSliceReportBuffer,
+            VistaLutBufferSlot.FroxelShadowProbe     => m_Luts.froxelShadowProbeBuffer,
             _                                        => null,
         };
     }
@@ -190,7 +204,11 @@ namespace Vista
         readonly TextureHandle m_ApTransmittance;
         readonly TextureHandle m_SkyReflection;
         readonly TextureHandle m_SkyReflectionArray;
+        readonly TextureHandle m_FroxelInjection;
+        readonly TextureHandle m_FroxelInjectionHistory;
+        readonly TextureHandle m_FroxelIntegral;
         readonly BufferHandle m_SkyAmbientSh;
+        readonly BufferHandle m_FroxelShadowProbe;
 
         /// <summary>
         /// 用 <see cref="VistaLutHandles"/> 打包而不是继续加位置参数：这个构造在每个
@@ -208,7 +226,11 @@ namespace Vista
             m_ApTransmittance = handles.apTransmittance;
             m_SkyReflection = handles.skyReflection;
             m_SkyReflectionArray = handles.skyReflectionArray;
+            m_FroxelInjection = handles.froxelInjection;
+            m_FroxelInjectionHistory = handles.froxelInjectionHistory;
+            m_FroxelIntegral = handles.froxelIntegral;
             m_SkyAmbientSh = handles.skyAmbientSh;
+            m_FroxelShadowProbe = handles.froxelShadowProbe;
         }
 
         public void SetTexture(ComputeShader cs, int kernelIndex, int nameID, VistaLutSlot slot)
@@ -239,6 +261,14 @@ namespace Vista
             VistaLutSlot.ApTransmittance    => m_ApTransmittance,
             VistaLutSlot.SkyReflection      => m_SkyReflection,
             VistaLutSlot.SkyReflectionArray => m_SkyReflectionArray,
+            // 注入表的两个 view 解析到**同一个** handle：graph 侧一个资源只有一个 handle，
+            // UAV / SRV 的区别由 pass 声明时的 AccessFlags 决定，不是由 handle 决定。
+            // 两个槽位仍然分开的意义在调用方那边（不能在一趟 dispatch 里同时绑两种 view），
+            // 见 VistaLutSlot.FroxelInjectionRead 的注释。
+            VistaLutSlot.FroxelInjection        => m_FroxelInjection,
+            VistaLutSlot.FroxelInjectionRead    => m_FroxelInjection,
+            VistaLutSlot.FroxelInjectionHistory => m_FroxelInjectionHistory,
+            VistaLutSlot.FroxelIntegral         => m_FroxelIntegral,
             _                               => default,
         };
 
@@ -248,8 +278,13 @@ namespace Vista
         // 画面上表现为环境光突然变成某个法线的辐照度，与"投影写错了"完全无法区分。
         BufferHandle Resolve(VistaLutBufferSlot slot) => slot switch
         {
-            VistaLutBufferSlot.SkyAmbientSh => m_SkyAmbientSh,
-            _                               => default,
+            VistaLutBufferSlot.SkyAmbientSh      => m_SkyAmbientSh,
+            // 唯一一个「仅 Editor 自检」却必须在 graph 侧可解析的槽位：
+            // 阴影贴图与注入表的内容只在真正渲染的一帧里存在。没请求探针时
+            // pass 不 import 它，这里拿到的就是 default（null），
+            // 而 dispatch 本身也被 C# 侧的门挡掉 —— 两道都在。
+            VistaLutBufferSlot.FroxelShadowProbe => m_FroxelShadowProbe,
+            _                                    => default,
         };
     }
 
@@ -268,5 +303,14 @@ namespace Vista
         public TextureHandle skyReflection;
         public TextureHandle skyReflectionArray;
         public BufferHandle skyAmbientSh;
+
+        // ---- 近层体积雾（#20 起）----
+        // 注入表**只有一个** handle：UAV 与 SRV 的区别在 graph 里由 pass 声明的
+        // AccessFlags 决定，不由 handle 决定。所以这里没有 froxelInjectionRead。
+        public TextureHandle froxelInjection;
+        public TextureHandle froxelInjectionHistory;
+        public TextureHandle froxelIntegral;
+        /// <summary>阴影覆盖性探针（仅在 Editor 请求探针的那一帧被 import）。</summary>
+        public BufferHandle froxelShadowProbe;
     }
 }

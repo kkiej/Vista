@@ -314,8 +314,30 @@ float3 VistaFogSourceRadiance(
 //  **不在这里取**，因为雾的高度必须从 t 推、不能从 p 反算（fp32 在 6360 km 上的
 //  ulp 是 0.49 m，理由见 FogMedium.hlsl）。让调用方传进来同时也让 #24 的局部雾体
 //  可以在传入前往这个结构体里叠密度，不需要再改一次签名。
+//
+//  sunShadow: 阴影贴图给出的主光可见度，1 = 全亮，0 = 全遮（#20 起）。
+//
+//  ---- 为什么是参数，而不是在这里查阴影贴图 ----
+//  这个函数有三个消费者，其中两个**没有**阴影坐标可用：SkyView LUT 的 march 是
+//  球对称参数化的（没有世界位置），MS LUT 更是静态表。在这里查就得让那两条路径
+//  也去 include URP 的 Shadows.hlsl 并绑一张贴图，而它们根本没有相机。
+//
+//  ---- 为什么只乘直射项 ----
+//  下面 earthShadow 的位置就是它该在的位置：它只乘 phaseTimesScattering 与
+//  VistaFogSourceRadiance 的直射项，**不乘** multiScattered、也不乘雾的天光环境项。
+//  级联阴影扮演的是同一个物理角色（「这一点看不见太阳」），所以折进去的方式就是
+//  earthShadow * sunShadow，一个字都不用改。
+//  乘到多次散射上的症状是阴影里的雾变成纯黑（真实的阴影区靠 MS 与天光维持亮度），
+//  那正是 Hillaire / HDRP / UE5 都只让体积阴影衰减单次散射的理由。
+//
+//  ---- 为什么不放进 VistaRaymarchSettings ----
+//  那个结构体是**逐射线**的；阴影是**逐样本**的。放进去就得在循环里改结构体字段，
+//  而它同时被别的字段共享，一次误写会污染整条射线的相位/多次散射开关。
+//  也不放进 VistaFogSample：那样阴影只会作用到雾上，Rayleigh / Mie 两个组分
+//  仍然是全亮的 —— 症状是「光柱只在浓雾里有，晴空的树影完全不投到空气上」。
 VistaScatterSample VistaEvaluateScatterSample(
-    float3 p, float3 rayDir, float3 sunDir, VistaFogSample fog, VistaRaymarchSettings s)
+    float3 p, float3 rayDir, float3 sunDir, VistaFogSample fog, VistaRaymarchSettings s,
+    float sunShadow)
 {
     float  r  = length(p);
     float3 up = p / r;
@@ -324,7 +346,10 @@ VistaScatterSample VistaEvaluateScatterSample(
 
     float  muSun = dot(sunDir, up);
     float3 transmittanceToSun = VistaSampleTransmittanceToSun(r, muSun);
-    float  earthShadow = VistaEarthShadow(p, sunDir);
+    // 星球阴影与级联阴影是同一个物理角色（「这一点看不见太阳」），一次乘完。
+    // 合并在这里而不是分别乘到下面两处：分开写就有两个地方可能漏掉一项，
+    // 而漏掉的症状（阴影里的空气偏亮）在两项之间无法区分。
+    float  earthShadow = VistaEarthShadow(p, sunDir) * sunShadow;
 
     // 只剩大气两个组分。雾的相位/自遮蔽/环境项统一在 VistaFogSourceRadiance 里，
     // 见下面那一次累加。晴空时这里与 #18b 之前**逐位相同**（原来加的是 0.0，加 0 精确）。
@@ -579,8 +604,12 @@ VistaScatteringResult VistaIntegrateScatteredLuminance(
         if (s.includeFog)
             fog = VistaSampleFogAlongRay(t, rayDir.y);
 
+        // sunShadow = 1：这个积分器服务 SkyView / MS / 判据参考解三条路径，
+        // 它们都是球对称参数化的，没有世界位置可以去查阴影贴图。
+        // 显式写 1.0 而不是给形参一个默认值：默认值会让「忘了传阴影」
+        // 悄悄编译过去，而那恰好是「整个场景没有光柱、且不报错」的成因。
         VistaScatterSample smp =
-            VistaEvaluateScatterSample(p, rayDir, sunDir, fog, s);
+            VistaEvaluateScatterSample(p, rayDir, sunDir, fog, s, 1.0);
 
         float3 sampleOpticalDepth   = smp.extinction * dt;
         float3 sampleTransmittance  = exp(-sampleOpticalDepth);

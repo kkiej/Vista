@@ -27,14 +27,30 @@ namespace Vista
         // 语义写在 VistaFroxelVolumeSelfTest 里（唯一消费者）。
         public const int k_ReportFloat4PerSlice = 2;
 
+        /// <summary>
+        /// 阴影覆盖性探针的槽位数（#20）。必须与 <c>VolumetricFog.compute</c> 里
+        /// <c>VISTA_PROBE_*</c> 那组下标的最大值 + 1 一致 —— 少一个的症状是
+        /// 最后一个槽位的 Interlocked 写越界，而 D3D11 上越界 UAV 写是**静默丢弃**，
+        /// 判据会读到一个恒为初值的格子并把它当成「这一路没执行」。
+        /// </summary>
+        public const int k_ShadowProbeSlots = 14;
+
+        // 探针里两个走 InterlockedMin 的槽位（SHADOW_MIN = 0, SHADOWMAP_MIN = 8）。
+        // 下标写在这里而不是只写在 shader 里：重置函数必须把它们填成 uint.MaxValue，
+        // 而填错的症状是 min 恒为 0 —— 那会把「一个点都没被遮」伪装成「全被遮」。
+        static readonly int[] k_ShadowProbeMinSlots = { 0, 8 };
+
         readonly ComputeShader m_Cs;
         readonly int m_KernelPlaceholderIdx = -1;
         readonly int m_KernelSliceVerifyIdx = -1;
+        readonly int m_KernelInjectionIdx = -1;
+        readonly int m_KernelShadowProbeIdx = -1;
 
         RTHandle m_Injection;
         RTHandle m_InjectionHistory;
         RTHandle m_Integral;
         GraphicsBuffer m_SliceReport;
+        GraphicsBuffer m_ShadowProbe;
 
         // 可空而不是直接存 struct：null 表示「还没分配过」。
         // 存 struct 的话就得靠一个哨兵值（比如 depth == 0）表达同一件事，
@@ -53,15 +69,26 @@ namespace Vista
                 m_KernelPlaceholderIdx = m_Cs.FindKernel("FroxelPlaceholder");
             if (m_Cs.HasKernel("FroxelSliceVerify"))
                 m_KernelSliceVerifyIdx = m_Cs.FindKernel("FroxelSliceVerify");
+            if (m_Cs.HasKernel("FroxelInjection"))
+                m_KernelInjectionIdx = m_Cs.FindKernel("FroxelInjection");
+            if (m_Cs.HasKernel("FroxelShadowProbe"))
+                m_KernelShadowProbeIdx = m_Cs.FindKernel("FroxelShadowProbe");
         }
 
         /// <summary>
-        /// 两个核都在。分开判「资源在不在」（<see cref="isAllocated"/>）与「核在不在」，
+        /// 四个核都在。分开判「资源在不在」（<see cref="isAllocated"/>）与「核在不在」，
         /// 理由与 <c>VistaAtmosphereLuts</c> 那四个独立的 valid 属性相同：
         /// 前者是每帧可变的状态，后者在构造之后就是常量，混成一个属性
         /// 会让「shader 编译坏了」与「这一帧还没分配」在日志上长得一样。
+        ///
+        /// 要求**四个都在**而不是按核分成四个属性：它们在同一个 .compute 文件里，
+        /// 一个编译失败就是四个都没有。真正会出现的「部分缺失」只有一种 ——
+        /// #pragma kernel 那行写错了名字 —— 那时按整体判会让整条近层雾路径退出，
+        /// 比让三个核继续跑、第四个安静地什么都不做要好归因。
         /// </summary>
-        public bool isValid => m_Cs != null && m_KernelPlaceholderIdx >= 0 && m_KernelSliceVerifyIdx >= 0;
+        public bool isValid => m_Cs != null
+            && m_KernelPlaceholderIdx >= 0 && m_KernelSliceVerifyIdx >= 0
+            && m_KernelInjectionIdx >= 0 && m_KernelShadowProbeIdx >= 0;
 
         public bool isAllocated => m_Injection != null && m_InjectionHistory != null && m_Integral != null;
 
@@ -69,9 +96,24 @@ namespace Vista
         public RTHandle injectionHistory => m_InjectionHistory;
         public RTHandle integral => m_Integral;
         public GraphicsBuffer sliceReportBuffer => m_SliceReport;
+        public GraphicsBuffer shadowProbeBuffer => m_ShadowProbe;
 
         /// <summary>这一帧实际分配下来的口径。没分配过时为 null。</summary>
         public VistaFroxelVolumeDesc? allocatedDesc => m_Allocated;
+
+#if UNITY_EDITOR
+        /// <summary>
+        /// 请求在下一帧的真实渲染里跑一次覆盖性探针（<c>Window/Vista/Log Volumetric Fog State</c>）。
+        /// 由 <see cref="VistaAtmospherePass"/> 消费后自动清零。
+        ///
+        /// 为什么探针**必须**跑在真实帧里，而不像 #19 的切片判据那样用立即模式自己驱动：
+        /// 它要测的就是 URP 那边的编译期关键字状态（<c>_MAIN_LIGHT_SHADOWS_CASCADE</c>）
+        /// 与阴影贴图的绑定 —— 这两样只在渲染循环内存在。立即模式下跑出来的读数会是
+        /// 「关键字全 0、阴影图未绑」，而那是个**完全合法**的组合，判据会全绿 ——
+        /// 正是「布景不走被测代码路径的自检，其数字不变是空判据」。
+        /// </summary>
+        public bool probeRequested;
+#endif
 
         /// <summary>
         /// 按需分配三张表，并把分布常量下发成全局。
@@ -172,6 +214,122 @@ namespace Vista
                 VistaComputeUtils.DivRoundUp(desc.depth, 64), 1, 1);
         }
 
+        /// <summary>
+        /// 按需分配阴影覆盖性探针 buffer（<see cref="k_ShadowProbeSlots"/> 个 uint）。
+        ///
+        /// 与切片报告分开一个方法而不是合并：两者的容量来源不同（一个跟切片数，
+        /// 一个是编译期常量），合并之后「换分辨率」会连带重建探针，
+        /// 而探针的固定网格本来就与分辨率无关 —— 那会让「跨档位比较读数」这件事
+        /// 依赖一个看不出来的重建时机。
+        /// </summary>
+        public void EnsureShadowProbeBuffer()
+        {
+            if (m_ShadowProbe != null && m_ShadowProbe.count == k_ShadowProbeSlots) return;
+
+            m_ShadowProbe?.Dispose();
+            m_ShadowProbe = new GraphicsBuffer(
+                GraphicsBuffer.Target.Structured, k_ShadowProbeSlots, sizeof(uint))
+            {
+                name = "VistaFroxelShadowProbe",
+            };
+        }
+
+        /// <summary>
+        /// 把探针 buffer 重置到「一次都没写过」的初值。
+        ///
+        /// 走 <c>SetData</c> 而不是在 shader 里让 (0,0,0) 号线程清零：清零线程与
+        /// 其余线程之间没有同步点，同一趟 dispatch 里「清零」与「Interlocked 累加」
+        /// 的先后是未定义的 —— 症状是计数偶发地少一截，而那种偶发在 NV 上几乎不出现，
+        /// 会一路活到别的硬件上。
+        ///
+        /// 两个 min 槽位填 <c>uint.MaxValue</c>，其余填 0。填错的后果不是报错：
+        /// min 槽位填 0 会让 InterlockedMin 永远不动，判据读到 0 并据此宣布
+        /// 「有点被完全遮住」—— 一个凭空出现的通过。
+        /// </summary>
+        public void ResetShadowProbeBuffer()
+        {
+            if (m_ShadowProbe == null) return;
+
+            var init = new uint[k_ShadowProbeSlots];
+            foreach (int slot in k_ShadowProbeMinSlots)
+                init[slot] = uint.MaxValue;
+            m_ShadowProbe.SetData(init);
+        }
+
+        /// <summary>
+        /// #20 的注入派发：逐 froxel 求 (σ_s·J 预曝光, 灰度 σ_t)。
+        ///
+        /// <paramref name="cameraWS"/> / <paramref name="shadowmapBound"/> 打包进
+        /// <c>_VistaFroxelCameraWS</c> 就在这里下发，而不是在 <see cref="Prepare"/> 里：
+        /// 这两个值只有注入核用，放在唯一的消费者旁边，才能保证**不走这条路的路径**
+        /// （占位核、切片判据、反射探针）看到的是零态 —— 即相机在原点、阴影恒为 1。
+        /// 放进 Prepare 会让自检路径拿到一个上一帧主相机的位置，
+        /// 而那正是 <c>_WorldSpaceCameraPos</c> 被绕开的理由。
+        ///
+        /// 派发形状是满 3D（一个线程一个 froxel），理由见 shader 里 FroxelInjection 的注释：
+        /// 注入是逐 froxel 独立的，按柱只有 3.24 万个线程，在 28 个 SM 上隐藏不住
+        /// 阴影贴图的访存延迟。#21 的积分是累积量，那个必须按柱。
+        /// </summary>
+        public void DispatchInjection<T>(in T dispatcher, in VistaFroxelVolumeDesc desc,
+                                        Vector3 cameraWS, bool shadowmapBound)
+            where T : IVistaLutDispatcher
+        {
+            if (!isValid || !isAllocated) return;
+
+            dispatcher.SetGlobalVector(VistaShaderIDs._VistaFroxelCameraWS,
+                new Vector4(cameraWS.x, cameraWS.y, cameraWS.z, shadowmapBound ? 1f : 0f));
+
+            // 两张静态大气表与 SH buffer **逐核显式绑**，不吃 Sky-View pass 用
+            // SetGlobalTextureAfterPass 发布的那份全局。理由与
+            // VistaAtmosphereLuts.RenderAerialPerspectiveLut 里那段完全相同：
+            // 那是 Task #7 的旧账 —— 依赖「Sky-View 一定先跑」的那一版里，
+            // 改相机高度与太阳角度**一个读数都不动**，而且不报错。
+            // 反射探针会用自己的 view 重绑一遍，更不能假设谁先谁后。
+            //
+            // SH 无条件绑（不看它是否可用）：绑上等于「没有环境项」的零态，
+            // 不绑会每帧刷一条 Property _VistaSkyAmbientSh is not set。
+            // 让「关掉」等于「零」，而不是等于「未定义」。
+            dispatcher.SetTexture(m_Cs, m_KernelInjectionIdx,
+                VistaShaderIDs._VistaTransmittanceLut, VistaLutSlot.Transmittance);
+            dispatcher.SetTexture(m_Cs, m_KernelInjectionIdx,
+                VistaShaderIDs._VistaMultiScatteringLut, VistaLutSlot.MultiScattering);
+            dispatcher.SetBuffer(m_Cs, m_KernelInjectionIdx,
+                VistaShaderIDs._VistaSkyAmbientSh, VistaLutBufferSlot.SkyAmbientSh);
+
+            dispatcher.SetTexture(m_Cs, m_KernelInjectionIdx,
+                VistaShaderIDs._VistaFroxelInjectionRW, VistaLutSlot.FroxelInjection);
+            dispatcher.Dispatch(m_Cs, m_KernelInjectionIdx,
+                VistaComputeUtils.DivRoundUp(desc.width, 8),
+                VistaComputeUtils.DivRoundUp(desc.height, 8),
+                desc.depth);
+        }
+
+        /// <summary>
+        /// #20 的覆盖性判据派发。**必须排在注入之后的一趟独立 dispatch 里**：
+        /// 它读的是注入表实际写进去的内容，同一趟里读会拿到未定义的值。
+        ///
+        /// 探针网格固定 32×32×16（见 shader 里的 VISTA_PROBE_DIM_*），
+        /// 所以 group 数是编译期常量，不跟 <paramref name="desc"/> 走 ——
+        /// desc 仍然要传是因为核内要把探针格心映射回 froxel 索引，
+        /// 而那个映射用的是下发过的 <c>_VistaFroxelSize</c>；
+        /// 这里不传它只是为了让「探针网格与体积分辨率无关」在签名上就看得出来。
+        ///
+        /// 注入表按 UAV 绑（而不是 SRV）：要看的就是实际写进去的东西，
+        /// 而且 fp16 的量级余量只有从纹理里读回来才算量过。
+        /// </summary>
+        public void DispatchShadowProbe<T>(in T dispatcher)
+            where T : IVistaLutDispatcher
+        {
+            if (!isValid || !isAllocated || m_ShadowProbe == null) return;
+
+            dispatcher.SetTexture(m_Cs, m_KernelShadowProbeIdx,
+                VistaShaderIDs._VistaFroxelInjectionRW, VistaLutSlot.FroxelInjection);
+            dispatcher.SetBuffer(m_Cs, m_KernelShadowProbeIdx,
+                VistaShaderIDs._VistaFroxelShadowProbeRW, VistaLutBufferSlot.FroxelShadowProbe);
+            // 32×32×16 / numthreads(8,8,1)
+            dispatcher.Dispatch(m_Cs, m_KernelShadowProbeIdx, 4, 4, 16);
+        }
+
         void Allocate(in VistaFroxelVolumeDesc desc)
         {
             m_Injection = AllocVolume(desc, "VistaFroxelInjection");
@@ -223,6 +381,8 @@ namespace Vista
             // 泄漏检测日志，只会安静地涨显存（Editor 里反复域重载时尤其明显）。
             m_SliceReport?.Dispose();
             m_SliceReport = null;
+            m_ShadowProbe?.Dispose();
+            m_ShadowProbe = null;
         }
     }
 }

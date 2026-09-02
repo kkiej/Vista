@@ -56,6 +56,9 @@ CBUFFER_START(VistaFroxelCB)
     float4 _VistaFroxelRange;
     // xyz: 尺寸 (w, h, N), w: 1/N
     float4 _VistaFroxelSize;
+    // xyz: 相机世界位置 (m)，w: 阴影贴图是否已绑定（1 = 是，0 = 否 ⇒ 阴影恒为 1）。
+    // 为什么不复用 _VistaViewPosKm 或 URP 的 _WorldSpaceCameraPos，见 VistaShaderIDs 的注释。
+    float4 _VistaFroxelCameraWS;
 CBUFFER_END
 
 #define VISTA_FROXEL_NEAR_M      _VistaFroxelRange.x
