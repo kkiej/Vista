@@ -488,12 +488,25 @@ void VistaApplyFogToSky(
 //  截断误差 < x³/24 ≈ 4e-14，比相消误差小七个数量级；且展开式整个不做除法，
 //  σ 兜底到 1e-9 的大气顶附近也不再放大误差。
 //  逐通道选择：RGB 三个方向的 σ 差 6 倍，同一步长可能一个通道相消一个不相消。
+//
+//  ---- 分母的 max() 是 NaN 闸，不是精度调参 ----
+//  σ **恰好为 0** 是一个完全合法的状态：雾关掉 + 大气那三项都在自己的
+//  截断之外（或者更现实的一条 —— 一张从未被写过、清成 0 的注入表）。那时
+//  exact = (source - source·1)/0 = 0/0 = NaN，而 lerp(NaN, series, 1) 仍然是
+//  NaN（IEEE 下 NaN·0 = NaN），也就是**取了 series 支也救不回来**。
+//  #21 的 froxel 积分把这条路暴露了出来：σ_t = 0 的一整柱会写出 NaN，
+//  再顺着三线性插值蔓延到全屏。
+//
+//  常数只需满足一件事：小到「一旦 max() 真的生效，x 必然 ≤ 1e-4，也就是
+//  这个 exact 值一定会被 lerp 丢掉」。1e-30 对任何 dt ≤ 1e26 km 都成立，
+//  所以它不是一个调出来的阈值 —— 它对**当前返回非 NaN 的每一个输入
+//  都逐位不改变结果**，只把 NaN 那一格填成一个会被丢弃的有限数。
 // ----------------------------------------------------------------------------
 float3 VistaSegmentIntegral(float3 source, float3 extinction, float dt)
 {
     float3 x = extinction * dt;
 
-    float3 exact  = (source - source * exp(-x)) / extinction;
+    float3 exact  = (source - source * exp(-x)) / max(extinction, 1e-30);
     float3 series = source * dt * (1.0 - x * 0.5 + x * x * (1.0 / 6.0));
 
     float3 useSeries = step(x, 1e-4);   // x <= 1e-4 时取 1

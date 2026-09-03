@@ -25,9 +25,11 @@ namespace Vista.Editor
     ///
     /// ---- fp16 与 fp32 分开读 ----
     /// 判据②走**纹理往返**：占位核把切片几何写进注入表，判据核再把它当 SRV 读回来。
-    /// 它的地板是 fp16 的相对 ulp 2⁻¹¹ ≈ 4.9e-4，所以门只能开到 1e-3。
+    /// 它的地板是 fp16 的相对 ulp —— 而且是**整个** ulp 2⁻¹⁰ ≈ 9.8e-4 而不是半个，
+    /// 因为计算着色器写类型化 UAV 这条路径实测是截断（证据见 k_TextureGate）。
+    /// 所以门只能开到 2e-3。
     /// 判据①③④⑤走**解析**（核内 fp32），地板 ~1e-7，门开在 1e-6。
-    /// 混在一起的后果是所有门都被抬到 1e-3，而纹素中心那条恒等式（要求 ~1e-6）
+    /// 混在一起的后果是所有门都被抬到 2e-3，而纹素中心那条恒等式（要求 ~1e-6）
     /// 就会在任何偏移量下都照样通过 —— 那时判据在报表上全绿，约定却是错的。
     /// </summary>
     public static class VistaFroxelVolumeSelfTest
@@ -46,14 +48,26 @@ namespace Vista.Editor
         const float k_AnalyticGate = 1e-6f;
 
         /// <summary>
-        /// 纹理往返的门。fp16 半 ulp = 2⁻¹¹ ≈ 4.88e-4，取 2 倍留一点余量。
-        /// 它足以抓到「差一片」：相邻片相差一个 ρ，最小的档（N=128、r=100）ρ = 1.0366，
-        /// 也就是 3.7%，是这道门的 37 倍。
+        /// 纹理往返的门：<see cref="k_Fp16Floor"/> 的 2.05 倍。
+        ///
+        /// 地板是**整个** ulp 2⁻¹⁰ = 9.77e-4，不是半个：这张体的写入是计算着色器的
+        /// 类型化 UAV，而那条路径实测是**截断**（向零取整）而不是就近取整 —— 证据与
+        /// 原始读数记在 <see cref="VistaSelfTestNumerics.k_Fp16RelTrunc"/>，
+        /// 由 #21 的 ⓪ 格量出来（12 对读数全部落在请求值下方的网格点，其中 3 对
+        /// 两种取整模式结论不同，GPU 三次都取了截断）。
+        ///
+        /// 第一版按「半 ulp 4.88e-4 的 2 倍」写成 1e-3，按真实地板算只有 1.02 倍余量 ——
+        /// 一道压在自己地板上的门，症状是随机假失败。改到 2e-3 之后仍然抓得到
+        /// 「差一片」：相邻片相差一个 ρ，最小的档（N=128、r=100）ρ = 1.0366，
+        /// 也就是 3.7%，是这道门的 18 倍。
         /// </summary>
-        const float k_TextureGate = 1e-3f;
+        const float k_TextureGate = 2e-3f;
 
-        /// <summary>fp16 半 ulp，报表里作为地板对照打出来。</summary>
-        const float k_Fp16HalfUlp = 4.8828125e-4f;
+        /// <summary>
+        /// fp16 存储的相对地板。走截断那一条，理由见 <see cref="k_TextureGate"/>。
+        /// 报表里作为地板对照打出来。
+        /// </summary>
+        const float k_Fp16Floor = VistaSelfTestNumerics.k_Fp16RelTrunc;
 
         /// <summary>
         /// 求值点恒等式的门。它比 <see cref="k_AnalyticGate"/> 松一个量级，理由是
@@ -172,7 +186,7 @@ namespace Vista.Editor
                 }
 
                 sb.Append("　 GPU ").Append(SystemInfo.graphicsDeviceName)
-                  .Append("　fp16 半 ulp = ").Append(Sci(k_Fp16HalfUlp))
+                  .Append("　fp16 地板（截断）= ").Append(Sci(k_Fp16Floor))
                   .Append("　解析门 ").Append(Sci(k_AnalyticGate))
                   .Append("　纹理门 ").Append(Sci(k_TextureGate)).AppendLine();
 
@@ -302,8 +316,12 @@ namespace Vista.Editor
 
             // 历史表的**内容**路径到 #22 之前没有任何东西写它 —— 这一格是空的，
             // 必须在报表上点名：它今天的证据力在「本该是空的」这件事上，不在读数上。
+            //
+            // 积分表已经不在这一条里了：#21 落地之后，写入路径由
+            // Validate Froxel Integration 的六档逐片读数覆盖，画面侧由
+            // Debug View 的四个档位覆盖。这里只留分配口径。
             sb.AppendLine("　 ⓘ 历史表只判分配口径；写入路径在 #22（时间重投影）之前**未被覆盖**。"
-                        + "积分表同理，写入在 #21。");
+                        + "积分表的写入已由 Validate Froxel Integration 覆盖。");
             return ok;
         }
 
@@ -389,7 +407,7 @@ namespace Vista.Editor
             sb.Append("　 ").Append(Mark(ok))
               .Append("纹理往返：最坏相对误差 ").Append(Sci(worstRel))
               .Append("（门 ").Append(Sci(k_TextureGate))
-              .Append("，fp16 半 ulp ").Append(Sci(k_Fp16HalfUlp)).Append("）");
+              .Append("，= 地板 ×").Append((k_TextureGate / k_Fp16Floor).ToString("0.00")).Append("）");
             if (worstSlice >= 0)
                 sb.Append("　@ 片 ").Append(worstSlice).Append(" 的 ").Append(worstField);
             if (zeroSeen)

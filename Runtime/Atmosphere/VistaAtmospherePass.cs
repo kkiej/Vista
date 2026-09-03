@@ -251,13 +251,31 @@ namespace Vista
             var skyAmbientSh    = m_Luts.skyAmbientShBuffer != null
                 ? renderGraph.ImportBuffer(m_Luts.skyAmbientShBuffer) : default;
 
-            // 近层体只导入**这一步真会写的那一张**。历史表（#22 时间重投影）与积分表（#21）
-            // 留成 default —— 它们在 VistaLutHandles 里有槽位，但本节没有任何 pass 绑它们。
-            // 刻意不"顺手一起导入"：一个被导入却没人 Use 的资源会让 RenderGraph 的
-            // 依赖图上多出两条不存在的边，也会让「这两条写入路径未被覆盖」这件事
-            // 在代码里看不出来。判据里对应有一条点名它们的 ⓘ。
+            // 近层体导入**这一节真会写的那两张**：注入（#20）与积分（#21）。
+            // 历史表（#22 时间重投影）留成 default —— 它在 VistaLutHandles 里有槽位，
+            // 但本节没有任何 pass 绑它。刻意不「顺手一起导入」：一个被导入却没人 Use
+            // 的资源会让 RenderGraph 的依赖图上多出一条不存在的边，也会让
+            // 「这条写入路径未被覆盖」这件事在代码里看不出来。判据里有一条点名它的 ⓘ。
             var froxelInjection = froxelEnabled
                 ? renderGraph.ImportTexture(m_Luts.froxelVolume.injection) : default;
+            var froxelIntegral  = froxelEnabled
+                ? renderGraph.ImportTexture(m_Luts.froxelVolume.integral) : default;
+
+            // 把两个句柄交给帧内更晚的消费方（#21 的调试视图；#25 的合成）。
+            // 只在真的分配了体积时 Create —— 消费方于是用 Contains 判「这一帧有没有表」，
+            // 而不是拿一个无效句柄去猜。为什么走 ContextItem 而不是全局绑定，
+            // 见 VistaFroxelFrameData 的类注释（要的是图里那条真的边）。
+            //
+            // 时机：这里只是**记录期**往容器里放数据，本节后面才录注入/积分两趟 pass。
+            // 消费方是一个更晚事件的 ScriptableRenderPass，它的 RecordRenderGraph
+            // 在本方法返回之后才跑，所以它拿到的一定是已经录过写入的那两个句柄。
+            if (froxelEnabled)
+            {
+                var froxelData = frameData.Create<VistaFroxelFrameData>();
+                froxelData.injection = froxelInjection;
+                froxelData.integral  = froxelIntegral;
+                froxelData.desc      = froxelDesc;
+            }
 
             // CPU 侧出口的驱动。放在记录期最前面而不是 SH pass 的 execute 里：
             // 读回请求是 CPU 侧 API，与图无关；而且这样它拿到的必然是"上一帧已完成"的内容，
@@ -526,7 +544,9 @@ namespace Vista
 
                     // _VistaFroxelCameraWS 与 view/雾的 cbuffer 都是全局
                     builder.AllowGlobalStateModification(true);
-                    // 消费者（#21 的深度积分）还不存在，图会认为这张表没人读。
+                    // 唯一的消费者（#21 的积分 pass）走 UAV/SRV 混绑，图能看见那条边；
+                    // 但注入表本身是 import 进来的持久资源，图不知道它跨帧还有人用
+                    // （#22 的历史表、debug view）。保守起来不让它被剔。
                     builder.AllowPassCulling(false);
 
                     builder.SetRenderFunc((LutPassData d, ComputeGraphContext ctx) =>
@@ -534,6 +554,39 @@ namespace Vista
                             new VistaGraphLutDispatcher(ctx.cmd, Handles(d)),
                             d.view, d.fogSettings, d.froxelDesc,
                             d.froxelCameraWS, d.froxelShadowmapBound));
+                }
+
+                // 深度积分（#21）。**必须是独立的一趟 pass**：它把注入表当 SRV 读，
+                // 与注入挤在同一个 pass 里读到的是未定义值 —— 分开才能让 RenderGraph
+                // 在两者之间插 UAV barrier。这与探针那一趟是同一条理由。
+                //
+                // 顺序：注入 → 积分 → 探针。探针读的是**积分之后**的表，
+                // 排在积分之前会让「积分表有内容」这个读数变成上一帧的残留。
+                using (var builder = renderGraph.AddComputePass<LutPassData>(
+                           "Vista Froxel Integration", out var data))
+                {
+                    data.luts = m_Luts;
+                    data.froxelInjection = froxelInjection;
+                    data.froxelIntegral = froxelIntegral;
+                    data.froxelDesc = froxelDesc;
+
+                    // 注入表这里是 Read（SRV，_VistaFroxelInjectionRead）——
+                    // 与探针那一趟的 ReadWrite 刻意不同：积分核只读，
+                    // 声明成 ReadWrite 会让图少一次 UAV→SRV 的状态转换。
+                    builder.UseTexture(froxelInjection, AccessFlags.Read);
+                    builder.UseTexture(froxelIntegral, AccessFlags.Write);
+
+                    // 不推任何全局：积分核只吃 _VistaFroxelRange/Size（Prepare 在记录期推的）
+                    // 与 _VistaGround.w（PrepareLuts 推的）。所以这里**没有**
+                    // AllowGlobalStateModification —— 少一个开关等于让「这一趟不改全局」
+                    // 在代码里就能读出来。
+                    //
+                    // 消费者是 #25 的统一采样函数与 #21 的 debug view，都还不在图里。
+                    builder.AllowPassCulling(false);
+
+                    builder.SetRenderFunc((LutPassData d, ComputeGraphContext ctx) =>
+                        d.luts.RenderFroxelIntegration(
+                            new VistaGraphLutDispatcher(ctx.cmd, Handles(d)), d.froxelDesc));
                 }
 
 #if UNITY_EDITOR
@@ -565,6 +618,7 @@ namespace Vista
                         data.luts = m_Luts;
                         data.view = view;
                         data.froxelInjection = froxelInjection;
+                        data.froxelIntegral = froxelIntegral;
                         data.froxelShadowProbe = froxelShadowProbe;
                         data.froxelProbeRequested = true;
 
@@ -572,6 +626,11 @@ namespace Vista
                         // （_VistaFroxelInjectionRW），要看的就是 fp16 纹理里
                         // 实际存下来的量级。声明成 Read 会让图按 SRV 转换状态。
                         builder.UseTexture(froxelInjection, AccessFlags.ReadWrite);
+                        // 积分表同理（#21 的槽位 14~18）。这条声明还有第二个作用：
+                        // 它是「探针排在积分之后」在图上的唯一依据 ——
+                        // 少了它，探针读到的可以是上一帧的积分内容，
+                        // 而那个读数看起来完全正常。
+                        builder.UseTexture(froxelIntegral, AccessFlags.ReadWrite);
                         builder.UseBuffer(froxelShadowProbe, AccessFlags.ReadWrite);
                         if (shadowmapBound)
                             builder.UseTexture(mainShadows, AccessFlags.Read);

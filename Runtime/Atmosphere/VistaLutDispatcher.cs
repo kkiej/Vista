@@ -41,9 +41,11 @@ namespace Vista
         // 对应的 pass 事先声明过资源**：graph 侧拿到的是 pass import 进来的 handle，
         // 没 import 就是 default（无效），绑定处直接炸 —— 这正是 default 不兜底的意义。
         //
-        // 历史帧（#22）与积分表（#21）的**写入路径至今未被任何判据覆盖**：
-        // 资源建出来了、槽位能解析了，但没有核往里写。这一条记在 CHANGELOG 的待办里，
+        // 历史帧（#22）的**写入路径至今未被任何判据覆盖**：资源建出来了、
+        // 槽位能解析了，但没有核往里写。这一条记在 CHANGELOG 的待办里，
         // 不在这里靠注释假装它是完整的。
+        // 积分表的写入路径在 #21 落地，两侧都有判据（立即模式的合成介质判数值，
+        // 真实帧的探针槽 14~18 判 RenderGraph 那条路）。
         /// <summary>注入表的 UAV view（写）。</summary>
         FroxelInjection,
         /// <summary>
@@ -55,7 +57,11 @@ namespace Vista
         FroxelInjectionRead,
         /// <summary>注入表的历史帧。内容路径在 #22（时间重投影）之前**未被覆盖**。</summary>
         FroxelInjectionHistory,
-        /// <summary>沿视线累积的内散射 + 透射率。写入路径在 #21。</summary>
+        /// <summary>
+        /// 沿视线累积的内散射 rgb + <b>1 − 累积透射率</b>（不是 T 本身，
+        /// 与 HDRP/UE5 刻意相反，理由见 FroxelVolume.hlsl 的头注：
+        /// 这张表清空态全 0，存 T 会把「表没被写」升级成全黑）。写入在 #21。
+        /// </summary>
         FroxelIntegral,
     }
 
@@ -87,6 +93,8 @@ namespace Vista
         /// 没请求探针时留在 default（null），dispatch 由 C# 侧的门挡掉。
         /// </summary>
         FroxelShadowProbe,
+        /// <summary>仅 Editor 自检使用（#21 的逐片积分报告）。运行时路径不分配它。</summary>
+        FroxelIntegrationReport,
     }
 
     /// <summary>
@@ -189,6 +197,7 @@ namespace Vista
             VistaLutBufferSlot.SkyFogError           => m_Luts.skyFogErrorBuffer,
             VistaLutBufferSlot.FroxelSliceReport     => m_Luts.froxelSliceReportBuffer,
             VistaLutBufferSlot.FroxelShadowProbe     => m_Luts.froxelShadowProbeBuffer,
+            VistaLutBufferSlot.FroxelIntegrationReport => m_Luts.froxelIntegrationReportBuffer,
             _                                        => null,
         };
     }

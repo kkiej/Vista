@@ -1,7 +1,8 @@
 // ============================================================================
 //  近层体积雾（Step 3 档 A）
 //
-//  #19 交付「资源 + 分布 + 判据」，#20 交付逐 froxel 的光照注入。四个核：
+//  #19 交付「资源 + 分布 + 判据」，#20 交付逐 froxel 的光照注入，#21 交付深度积分。
+//  七个核：
 //    FroxelPlaceholder   把切片几何写进注入表 —— 它**不是**雾，是一份能被读回来对账的
 //                        已知内容。存在的理由是「RWTexture3D 绑定失败」这个坑：
 //                        RTHandle 的 2D 便捷重载会静默建成 Tex2D，症状只有 Editor.log
@@ -9,11 +10,15 @@
 //                        **非零且可预测**的内容，那条路径才算被覆盖过。
 //    FroxelSliceVerify   把注入表当 SRV 读回来 + 做解析侧的恒等式，写进报告 buffer。
 //    FroxelInjection     #20：逐 froxel 求 (σ_s·J, σ_t)，含级联阴影。
-//    FroxelShadowProbe   #20 的覆盖性判据：证明阴影查询这条路真的执行过、且不是恒 1。
+//    FroxelShadowProbe   #20/#21 的覆盖性判据：证明阴影查询与积分这两条路真的执行过。
+//    FroxelIntegration   #21：一线程一柱，沿深度累积 (内散射, 1 − 透射率)。
+//    FroxelSynthMedium   #21 判据的布景：把一个**均匀**的合成介质写满注入表。
+//    FroxelIntegralVerify #21 判据的读回：把积分表 (0,0) 那一列 + 逐片的覆盖性扫描
+//                        搬进报告 buffer。**核内不算任何误差**，参考解在 C# 侧。
 //
-//  深度积分是 #21，时间重投影是 #22。在那之前 VistaFogSettings.Mode 里**不会**出现
-//  Froxel 档 —— 一个选了什么都不发生（或者只产出一张没人读的表）的枚举值
-//  等于把哑档位摆给美术。#20 的注入因此挂在一个开发者开关上（默认关），
+//  时间重投影是 #22。在那之前 VistaFogSettings.Mode 里**不会**出现 Froxel 档 ——
+//  一个选了什么都不发生的枚举值等于把哑档位摆给美术。#20/#21 的这条链路因此挂在
+//  一个开发者开关上（默认关），画面上要看到它得开 Debug View；
 //  而那个开关关着的时候由 Window/Vista/Log Volumetric Fog State 点名。
 // ============================================================================
 
@@ -21,6 +26,9 @@
 #pragma kernel FroxelSliceVerify
 #pragma kernel FroxelInjection
 #pragma kernel FroxelShadowProbe
+#pragma kernel FroxelIntegration
+#pragma kernel FroxelSynthMedium
+#pragma kernel FroxelIntegralVerify
 
 // 与大气那批核同一条排除线：GLES 没有 RWTexture3D，编译只会产出一堆噪声。
 #pragma only_renderers d3d11 vulkan metal playstation xboxone xboxseries switch
@@ -65,6 +73,19 @@ RWStructuredBuffer<float4> _VistaFroxelSliceReportRW;
 // （VistaVolumetricFogState）—— 与上面那个报告 buffer 同一条约定：
 // 把语义写在消费端而不是这里，「读错字段」才会在判据的报表上直接显形。
 RWStructuredBuffer<uint> _VistaFroxelShadowProbeRW;
+
+// ---------------------------------------------------------------- #21 深度积分
+RW_TEXTURE3D(float4, _VistaFroxelIntegralRW);
+
+// #21 判据的报告 buffer。每片三个 float4，语义同样写在消费端
+// （VistaFroxelIntegrationSelfTest）。
+RWStructuredBuffer<float4> _VistaFroxelIntegrationReportRW;
+
+// #21 判据的合成介质。x: σ_t (1/km)，y: 源项基准 S（预曝光后的量级）。
+// 只有 FroxelSynthMedium 读它 —— 线上路径一个字节都不下发，
+// 所以它的零态（σ_t = 0, S = 0）就是「没有布景」。
+float4 _VistaFroxelSynthMedium;
+
 
 // ----------------------------------------------------------------------------
 //  占位：把切片几何写进注入表
@@ -281,6 +302,162 @@ void FroxelInjection(uint3 id : SV_DispatchThreadID)
     _VistaFroxelInjectionRW[id] = VistaFroxelInject(id.xy, (float)id.z);
 }
 
+// ============================================================================
+//  #21 深度积分
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+//  一线程一柱，沿深度做前缀积分
+//
+//  ---- 为什么必须按柱，而注入是满 3D ----
+//  积分是**相机原点的累积量**：第 i 片的结果依赖前 i−1 片。按 froxel 派发就得
+//  写成扫描（scan），而那要么跨线程组同步、要么把注入表读 N²/2 次。
+//  按柱是 O(N) 且完全无同步。派发规模够不够：138×74 = 10212 柱 / 64 = 180 个组
+//  ⇒ 28 个 SM 上 6.4 组/SM，比 #7 实测的 AP 派发地板（16 组 / 28 SM）高 11 倍，
+//  所以这一趟**不在**那条 floor-bound 线上。
+//
+//  ---- 单段积分复用 VistaSegmentIntegral，不在这里另写 ----
+//  ∫₀^dt S·e^{−σ·s} ds 已经有一份实现（AtmosphereScattering.hlsl:492），
+//  它处理了两件这里同样会踩到的事：x ≤ 1e-4 时 (1 − e^{−x}) 的灾难性相消
+//  （晴空最近那一段 x = 8.1e-6），以及 σ = 0 时的 NaN。
+//  「同一个量的第二份实现连 8 行的辅助函数也算」。
+//  代价是 σ_t 已经在注入时collapse成灰度，这里要广播成 float3 ⇒ 白做两次除法。
+//  一柱 64 段、一万柱，换掉一份重复实现，值。
+//
+//  ---- 被**刻意放弃**的那个近似 ----
+//  「中点矩形」写法（L += T_acc·e^{−x/2}·S·dt）省掉一次除法，相对偏差
+//  x/(2·sinh(x/2)) − 1 = −x²/24 + O(x⁴)。实测包络 x ≤ 0.289 ⇒ −0.35%，
+//  在 Weber 1% 之下 —— 也就是移动端档位可以直接切过去，这 0.35% 是**已经定过价**的。
+//  主线保留解析式的理由不是这 0.35%，而是把 x² 阶的项从误差预算里移走，
+//  好让「64 片够不够」只由插值误差回答（那条测量在 #27）。
+//
+//  ---- alpha 存 1 − T ----
+//  见 FroxelVolume.hlsl 的头注：清空态（表从未被写）于是等于「透传」而不是「全黑」。
+// ----------------------------------------------------------------------------
+[numthreads(8, 8, 1)]
+void FroxelIntegration(uint3 id : SV_DispatchThreadID)
+{
+    uint3 size = (uint3)_VistaFroxelSize.xyz;
+    if (any(id.xy >= size.xy))
+        return;
+
+    float3 lAcc = 0.0;
+    float  tAcc = 1.0;
+
+    for (uint slice = 0u; slice < size.z; ++slice)
+    {
+        // SRV 读。注入是上一趟 dispatch 写的，同一趟里读会拿到未定义值 ——
+        // 派发的先后由 RenderGraph 的 UAV barrier 保证（见 VistaAtmospherePass）。
+        float4 injected = LOAD_TEXTURE3D(_VistaFroxelInjectionRead, uint3(id.xy, slice));
+
+        // 米 → km。缩放来自 CPU 下发的那一个，不写字面量（见 VistaFroxelSegmentLengthKm）。
+        float dtKm = VistaFroxelSegmentLengthKm((float)slice, _VistaGround.w);
+
+        lAcc += tAcc * VistaSegmentIntegral(injected.rgb, injected.aaa, dtKm);
+        tAcc *= exp(-injected.a * dtKm);
+
+        _VistaFroxelIntegralRW[uint3(id.xy, slice)] = float4(lAcc, 1.0 - tAcc);
+    }
+}
+
+// ----------------------------------------------------------------------------
+//  判据的布景：一个**均匀**的合成介质
+//
+//  为什么判据要自己造布景，而不是拿真实的雾去对：真实的 σ_t 沿视线随高度变，
+//  闭式解就不存在了，那时「参考解」只能是另一个积分器 —— 也就是同一个量的第二份实现。
+//  均匀介质下 L(d) = (S/σ_t)·(1 − e^{−σ_t·d}) 是**初等闭式解**，
+//  判据的输入里因此一个被测对象的值都不含。
+//
+//  被测的积分核不分支于数据来源（它只读注入表），所以合成数据合法地覆盖它。
+//
+//  三个通道故意取 1 : 0.5 : 0.25。写成灰的话「rgb 被 swizzle」在报表上完全不可见，
+//  而那是一个只改颜色、不改量级的错误 —— 最容易活到发布。
+// ----------------------------------------------------------------------------
+[numthreads(8, 8, 1)]
+void FroxelSynthMedium(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id >= (uint3)_VistaFroxelSize.xyz))
+        return;
+
+    float s = _VistaFroxelSynthMedium.y;
+    _VistaFroxelInjectionRW[id] = float4(s, s * 0.5, s * 0.25, _VistaFroxelSynthMedium.x);
+}
+
+// ----------------------------------------------------------------------------
+//  判据的读回：把积分表搬进报告 buffer
+//
+//  **核内不算任何误差。** 参考解由 C# 侧用 double 算 —— 那边的
+//  VistaFroxelVolumeDesc.StoredDistance 已经被 #19 的判据交叉验证过，
+//  不是新的一份实现。这样判据的地板只剩 fp16 纹理往返的 4.88e-4，
+//  而不会被核内 fp32 的抵消误差抬起来（那正是 #19 里减法形式的教训）。
+//
+//  r2 是**逐片的覆盖性扫描**：合成介质是均匀的 ⇒ 同一片里每一列的内容必须相同，
+//  min 与 max 一旦分开就说明有一部分 froxel 没被写。只读 (0,0) 一列的话，
+//  「XY 的 group 数少算一半」在报表上完全看不出来 —— 而那恰好是 #19 里
+//  占位核铺满整个体积要防的同一个坑。
+//
+//  r3 是**归因行**，不是被判的量：把积分核实际用到的 dtKm 与它的来源
+//  _VistaGround.w 原样搬出来。这两个数存在的理由是一个具体的隐藏依赖 ——
+//  m→km 的缩放由 VistaAtmosphereParameters.Bind 上传，而它只在 PrepareLuts
+//  里被调用。立即模式的自检要是忘了调 PrepareLuts，_VistaGround.w 就是 0
+//  或者上一次渲染留下的脏值 ⇒ dtKm ≡ 0 ⇒ x ≡ 0 ⇒ 整张表全 0。
+//  那时 r0/r2 会红，但红的成因有三个（派发没跑 / 布景没写 / 缩放是 0）无法区分。
+//  把缩放印出来就只剩一个。
+//
+//  积分表走 UAV 读（不是 SRV）：与 #20 的探针同一条 —— 要看的就是 fp16 纹理里
+//  实际存下来的量级，而且这样不必为它再开一个 SRV 绑定点。
+// ----------------------------------------------------------------------------
+#define VISTA_INTEGRAL_SWEEP_XY 16u
+
+// 必须与 C# 侧的 VistaFroxelVolume.k_IntegrationReportFloat4PerSlice 一致。
+// 不一致的症状：D3D11 上越界 UAV 写被**静默丢弃**，尾部若干片读回恒为初值，
+// 报表上长得像「后半段没被积分」。
+#define VISTA_INTEGRAL_REPORT_STRIDE 4u
+
+[numthreads(64, 1, 1)]
+void FroxelIntegralVerify(uint3 id : SV_DispatchThreadID)
+{
+    uint  slice = id.x;
+    uint3 size  = (uint3)_VistaFroxelSize.xyz;
+    if (slice >= size.z)
+        return;
+
+    float4 integral = _VistaFroxelIntegralRW[uint3(0, 0, slice)];
+    float4 injected = LOAD_TEXTURE3D(_VistaFroxelInjectionRead, uint3(0, 0, slice));
+
+    uint  nonFinite = 0u;
+    // 哨兵取 ±1e30 而不是 0 / 1：0 是一个**合法**的 alpha（最近那一片几乎没积到雾），
+    // 拿它当初值会让「一列都没扫到」与「雾很淡」在报表上长得一样。
+    float aMin = 1e30, aMax = -1e30, lMax = -1e30;
+
+    for (uint sy = 0u; sy < VISTA_INTEGRAL_SWEEP_XY; ++sy)
+    {
+        for (uint sx = 0u; sx < VISTA_INTEGRAL_SWEEP_XY; ++sx)
+        {
+            uint3 c = uint3(sx * size.x / VISTA_INTEGRAL_SWEEP_XY,
+                            sy * size.y / VISTA_INTEGRAL_SWEEP_XY, slice);
+            float4 v = _VistaFroxelIntegralRW[c];
+            if (!all(isfinite(v)))
+            {
+                nonFinite += 1u;
+                continue;
+            }
+            aMin = min(aMin, v.a);
+            aMax = max(aMax, v.a);
+            lMax = max(lMax, max(max(v.r, v.g), v.b));
+        }
+    }
+
+    uint b = slice * VISTA_INTEGRAL_REPORT_STRIDE;
+    _VistaFroxelIntegrationReportRW[b + 0u] = integral;
+    _VistaFroxelIntegrationReportRW[b + 1u] = injected;
+    _VistaFroxelIntegrationReportRW[b + 2u] = float4((float)nonFinite, aMin, aMax, lMax);
+    // 与积分核**逐字同一个表达式**。写成 (segFar − segNear)·0.001 就成了第二份实现，
+    // 而那份实现恰好绕开了这一格要归因的那个依赖。
+    _VistaFroxelIntegrationReportRW[b + 3u] = float4(
+        VistaFroxelSegmentLengthKm((float)slice, _VistaGround.w), _VistaGround.w, 0.0, 0.0);
+}
+
 // ----------------------------------------------------------------------------
 //  覆盖性判据核
 //
@@ -312,6 +489,16 @@ void FroxelInjection(uint3 id : SV_DispatchThreadID)
 #define VISTA_PROBE_SM_WIDTH       11u
 #define VISTA_PROBE_SM_HEIGHT      12u
 #define VISTA_PROBE_URP_SIZE_Z     13u
+
+// ---- #21 追加：真实帧里的积分表读数 ----
+// 立即模式的自检（VistaFroxelIntegrationSelfTest）用合成介质判数值正确性，
+// 但它**不覆盖** RenderGraph 那条写入路径，也不覆盖真实雾的 x 包络。
+// 这五个槽位是那两件事唯一的覆盖手段。
+#define VISTA_PROBE_INTEGRAL_ALPHA_MAX 14u
+#define VISTA_PROBE_INTEGRAL_LUM_MAX   15u
+#define VISTA_PROBE_INTEGRAL_NONFINITE 16u
+#define VISTA_PROBE_SEG_X_MIN          17u
+#define VISTA_PROBE_SEG_X_MAX          18u
 
 // 位 4「跑过」是必需的：只靠位 0~3 的话，一个从未派发的核留下的全零
 // 与「级联关 + 阴影图未绑 + 屏幕空间关 + 软阴影关」这个**完全合法**的组合
@@ -458,4 +645,34 @@ void FroxelShadowProbe(uint3 id : SV_DispatchThreadID)
     else
         InterlockedMax(_VistaFroxelShadowProbeRW[VISTA_PROBE_INJECT_MAX],
             VistaProbeFixed(max(max(injected.r, injected.g), injected.b), 1.0e3));
+
+    // ---- #21：积分表的内容体检 + 真实雾的 x 包络 ----
+    // 这一段是「RenderGraph 那条积分写入路径真的执行过」的唯一证据 ——
+    // 立即模式自检用的是自己造的合成介质，它跑不到这条路上。
+    //
+    // alpha 的 max 而不是 min：这张表存 1 − T，清空态是 0，也就是
+    // **max == 0 才是「没被写」**。存 T 的话清空态与「无雾」同为 0，
+    // 这个格子就变成空判据了 —— 这是选 1 − T 顺带买到的一条可判性。
+    float4 integral = _VistaFroxelIntegralRW[fid];
+    if (!all(isfinite(integral)))
+        InterlockedAdd(_VistaFroxelShadowProbeRW[VISTA_PROBE_INTEGRAL_NONFINITE], 1u);
+    else
+    {
+        InterlockedMax(_VistaFroxelShadowProbeRW[VISTA_PROBE_INTEGRAL_ALPHA_MAX],
+            VistaProbeFixed(integral.a, 1.0e6));
+        InterlockedMax(_VistaFroxelShadowProbeRW[VISTA_PROBE_INTEGRAL_LUM_MAX],
+            VistaProbeFixed(max(max(integral.r, integral.g), integral.b), 1.0e3));
+    }
+
+    // x = σ_t·Δ 是 VistaSegmentIntegral 选分支的那个量，也是「中点矩形」近似
+    // 误差 x²/24 的自变量。推导出来的包络是 [8.1e-6, 0.289]（晴空最近一段 ~
+    // 能见度 50 m 的雾最远一段），但那是**算**出来的，不是量出来的。
+    // 定点缩放取 1e9：下端 8.1e-6 还剩 8100 个刻度，上端 0.289 也远在
+    // VISTA_PROBE_FIXED_MAX 之内 —— 一个 1e6 的缩放会把下端压到 8 个刻度上，
+    // 那时「包络下端」这个读数就落进自己尺子的地板里了。
+    float segX = injected.a * VistaFroxelSegmentLengthKm((float)fid.z, _VistaGround.w);
+    InterlockedMin(_VistaFroxelShadowProbeRW[VISTA_PROBE_SEG_X_MIN],
+        VistaProbeFixed(segX, 1.0e9));
+    InterlockedMax(_VistaFroxelShadowProbeRW[VISTA_PROBE_SEG_X_MAX],
+        VistaProbeFixed(segX, 1.0e9));
 }

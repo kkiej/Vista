@@ -59,7 +59,15 @@ namespace Vista.EditorTools
         const int k_SlotSmWidth       = 11;
         const int k_SlotSmHeight      = 12;
         const int k_SlotUrpSizeZ      = 13;
-        const int k_SlotTotal         = 14;
+        // ---- #21 追加：真实帧里的积分表读数 ----
+        // 这五格覆盖的是立即模式自检**覆盖不到**的两件事：RenderGraph 那条积分写入
+        // 路径、以及真实雾（而不是合成介质）下 x = σ_t·Δ 的包络。
+        const int k_SlotIntegralAlphaMax = 14;
+        const int k_SlotIntegralLumMax   = 15;
+        const int k_SlotIntegralNonFinite = 16;
+        const int k_SlotSegXMin       = 17;
+        const int k_SlotSegXMax       = 18;
+        const int k_SlotTotal         = 19;
 
         const uint k_FlagCascade   = 1u;
         const uint k_FlagShadowmap = 2u;
@@ -76,6 +84,15 @@ namespace Vista.EditorTools
         const float k_ShadowScale   = 1.0e6f;
         const float k_DriftScale    = 1.0e3f;   // 毫米
         const float k_InjectScale   = 1.0e3f;
+        const float k_IntegralAlphaScale = 1.0e6f;
+        const float k_IntegralLumScale   = 1.0e3f;
+        /// <summary>
+        /// x = σ_t·Δ 的定点缩放。与 shader 里那次 VistaProbeFixed(segX, 1.0e9) 对应。
+        /// 选 1e9 的理由写在 VolumetricFog.compute 那一行旁边：推导出来的包络下端是
+        /// 8.1e-6，1e6 的缩放会把它压到 8 个刻度上 —— 那时「包络下端」这个读数
+        /// 就落进自己尺子的地板里了。
+        /// </summary>
+        const float k_SegXScale     = 1.0e9f;
 
         /// <summary>fp16 的上限。注入表存预曝光辐亮度正是为了不撞这个数。</summary>
         const float k_Fp16Max = 65504f;
@@ -93,6 +110,27 @@ namespace Vista.EditorTools
         /// </summary>
         const float k_AtlasSpreadGate = 1.0e-3f;
 
+        /// <summary>
+        /// 推导出来的 x = σ_t·Δ 包络。下端 = 晴空最近一段，上端 = 能见度 50 m 的雾
+        /// 最远一段。这是**算**出来的配置区间，不是这一台布景的读数 ——
+        /// 所以下面那一格是「实测落在推导区间内」的包容性判据，它抓的是
+        /// 「x 的量级被某处改动整体挪走了」，抓不到一个数量级内的偏差。
+        /// 区间宽到 3.6e4 倍这件事必须在报表上说出来，否则一个宽门会被读成一道紧门。
+        /// </summary>
+        const float k_SegXDerivedMin = 8.1e-6f;
+        const float k_SegXDerivedMax = 0.289f;
+
+        /// <summary>
+        /// VistaSegmentIntegral 现在用的级数分支阈值（AtmosphereScattering.hlsl:492）。
+        /// </summary>
+        const float k_SeriesThresholdShipped = 1.0e-4f;
+
+        /// <summary>
+        /// 那个阈值的最优值 x* = (24·2⁻²³)¼ = 4.113e-2。#25 要把 shipped 换成它，
+        /// 而这一格的读数决定了那次替换的影响面 —— 见下面判据⑫的说明。
+        /// </summary>
+        const float k_SeriesThresholdOptimum = 4.113e-2f;
+
         [MenuItem("Window/Vista/Log Volumetric Fog State", priority = 142)]
         static void RunFromMenu()
         {
@@ -105,7 +143,7 @@ namespace Vista.EditorTools
 
         static void Run(StringBuilder sb)
         {
-            sb.AppendLine("=== Vista 体积雾状态（#20 注入覆盖性判据）===");
+            sb.AppendLine("=== Vista 体积雾状态（#20 注入 + #21 积分覆盖性判据）===");
 
             var cam = FindGameCamera();
             if (cam == null)
@@ -145,7 +183,7 @@ namespace Vista.EditorTools
             {
                 sb.AppendLine("ⓘ 注入是关着的，下面所有读数都不会产生 —— 本次判据**未覆盖任何东西**。");
                 sb.AppendLine("  要跑：在 UniversalRendererData 的 Vista Atmosphere 上勾选"
-                            + " Volumetric Fog ▸ 开发中（#20）▸ Enable Injection。");
+                            + " Volumetric Fog ▸ 开发中（#21）▸ Enable Injection。");
                 return;
             }
 
@@ -155,6 +193,25 @@ namespace Vista.EditorTools
                 sb.AppendLine("✘ froxelVolume 不可用：VolumetricFog.compute 缺失，或四个核里有编译不出来的"
                             + "（FroxelPlaceholder / FroxelSliceVerify / FroxelInjection / FroxelShadowProbe）。");
                 return;
+            }
+
+            // 调试视图的档位。打印**夹紧后**的切片下标，而且走
+            // VistaVolumetricFogSettings.ResolveDebugSlice —— 与渲染路径同一份实现。
+            // 各写一份的症状是日志说「看的是第 63 片」而画面上是第 127 片。
+            {
+                int depth = volume.allocatedDesc.HasValue ? volume.allocatedDesc.Value.depth : 0;
+                int slice = VistaVolumetricFogSettings.ResolveDebugSlice(settings.debugSlice, depth);
+                sb.Append($"调试视图 debugView = {settings.debugView}"
+                        + $"（gain {settings.debugGain:F2}, slice 请求 {settings.debugSlice} ⇒ 实际 {slice}");
+                if (slice != settings.debugSlice)
+                    sb.Append($"，已夹到 [0, {Mathf.Max(0, depth - 1)}]");
+                sb.AppendLine("）");
+                if (settings.debugView == FroxelDebugView.Off)
+                    sb.AppendLine("  ⓘ Off 档整趟 debug pass 不排入（失能态 = 零态），"
+                                + "所以它不会占一次深度拷贝。");
+                else
+                    sb.AppendLine("  ⚠ 非 Off 档会**整屏替换**最终画面。这是诊断视图，"
+                                + "不要留在出货配置里。");
             }
 
             // ---- 请求 + 渲一帧 ----
@@ -393,6 +450,188 @@ namespace Vista.EditorTools
                         + "辅助函数也算」。代价就是这条依赖，而这一格把它变成一个**能失败的数字**，"
                         + "而不是一句注释里的担忧。真出问题时这个数是米级的。");
 
+            // ---------------------------------------------------------------- 判据⑩ 探针核跑过没有
+            // 这一格是⑫「不是空判据」的唯一证明。
+            //
+            // 它证明的**只是探针核跑过**，不是积分核跑过 —— segX 是从注入表的 alpha
+            // 现算的，探针核跑了它就有值，与积分表写没写无关。把这两件事混成一格
+            // 的症状是：积分派发漏掉之后，⑩ 照样全绿，而它绿的理由是错的。
+            // 「积分表被写过」是独立的一格（⑪c）。
+            //
+            // 为什么用 segX 的 min 槽位当哨兵，而不是别的槽位：
+            // 它的初值是 uint.MaxValue（VistaFroxelVolume.k_ShadowProbeMinSlots 里那个 17），
+            // 对应 x = 4.29 —— 一个物理上不可能的段光学厚度，所以哨兵与被测量不会撞车。
+            // 换成 max 槽位就不行：那些初值是 0，而 0 是合法读数。
+            uint segXMinRaw = raw[k_SlotSegXMin];
+            bool probeRan = segXMinRaw != uint.MaxValue;
+            sb.AppendLine($"{Mark(probeRan)}判据⑩ 探针核执行性：SEG_X_MIN 槽位"
+                        + (probeRan ? $" = {segXMinRaw}（已被写过）" : " 仍是初值 uint.MaxValue"));
+            if (!probeRan)
+                sb.AppendLine("  ⚠ 下面判据⑪⑫的读数全部是初值，**不构成任何证据**。"
+                            + "头号嫌疑：探针写那一段被 probeRequested 的门挡掉了。");
+
+            // ---------------------------------------------------------------- 判据⑪ 积分表健康
+            uint integralNonFinite = raw[k_SlotIntegralNonFinite];
+            float alphaMax = raw[k_SlotIntegralAlphaMax] / k_IntegralAlphaScale;
+            float lumMax   = raw[k_SlotIntegralLumMax] / k_IntegralLumScale;
+
+            bool integralFiniteOk = probeRan && integralNonFinite == 0u;
+            sb.AppendLine($"{Mark(integralFiniteOk)}判据⑪a 积分表有限性：非有限 froxel"
+                        + $" {integralNonFinite} / {count}");
+            if (integralNonFinite != 0u)
+                sb.AppendLine("  ⚠ 头号嫌疑是 VistaSegmentIntegral 的 σ → 0 那一支："
+                            + "S·(1 − exp(−σ·dt))/max(σ,1e-30) 在两支都算、再用 lerp 选的写法下，"
+                            + "被丢弃的那一支产生的 NaN 会被 lerp 带回来。");
+
+            // alpha = 1 − T 是**定义上**落在 [0,1] 的量。这一格判的不是精度，是定义性不变量：
+            // > 1 只能来自「乘反了」「T 的递推漏乘」这类结构性错误，
+            // 而那种错误在画面上的症状是雾偏浓 —— 一个「物理上讲得通」的漂移，
+            // 也就是本项目记过的最容易被接受、因此最容易掩盖污染的那种形态。
+            bool alphaRangeOk = probeRan && alphaMax <= 1.0f;
+            sb.AppendLine($"{Mark(alphaRangeOk)}判据⑪b 积分 alpha 定义域：max(1 − T)"
+                        + $" = {Sci(alphaMax)}（定义上 ≤ 1，定点分辨率 {Sci(1f / k_IntegralAlphaScale)}）");
+
+            // 「积分表真的被写过」。存 1 − T 而不是 T 这条约定在这里第二次付钱：
+            // 清空态 alpha = 0，所以 max > 0 就是「有人写过」，不需要额外的哨兵槽位。
+            // 存 T 的话清空态是 0 = 全黑，而 0 同时也是「雾浓到不透明」的合法读数。
+            float alphaFloor = 1f / k_IntegralAlphaScale;
+            bool integralWritten = probeRan && alphaMax > alphaFloor;
+            sb.AppendLine($"{Mark(integralWritten)}判据⑪c 积分表被写过：max(1 − T) = {Sci(alphaMax)}"
+                        + $" > 定点地板 {Sci(alphaFloor)}");
+            sb.AppendLine("  ⓘ 这一格**只在布景有介质时能失败**：雾关掉之后只剩空气，"
+                        + "50 m 内的 1 − T 会落到定点地板附近，那时「没写」与「太淡」再次同形。"
+                        + "所以它的作用域必须写出来 —— 下面那条上界是它的归因输入。");
+
+            var fog = feature.fog;
+            if (fog != null && fog.enabled && volume.allocatedDesc.HasValue)
+            {
+                // 均匀介质上界：σ_t 是**地面**处的值（高度雾只会更淡），所以
+                // 1 − exp(−σ_t·d) 是 alpha 的一个真上界。σ_t 直接取 fog.extinctionPerKm，
+                // 不在这里重算 —— 「同一个量的第二份实现连 8 行的辅助函数也算」。
+                float sigmaT = fog.extinctionPerKm;
+                float dKm = volume.allocatedDesc.Value.handoffMeters * 1.0e-3f;
+                float alphaBound = 1f - Mathf.Exp(-sigmaT * dKm);
+                bool boundOk = !probeRan || alphaMax <= alphaBound * 1.02f;
+                sb.AppendLine($"{Mark(boundOk)}判据⑪d 均匀介质上界：σ_t(地面) = {Sci(sigmaT)} /km，"
+                            + $"d = {Sci(dKm)} km ⇒ 1 − exp(−σ_t·d) = {Sci(alphaBound)}，"
+                            + $"实测 {Sci(alphaMax)}（比值 {Sci(alphaMax / Mathf.Max(alphaBound, 1e-30f))}，"
+                            + "留 2% 定点/插值余量）");
+                sb.AppendLine($"  ⓘ 比值 {Sci(alphaMax / Mathf.Max(alphaBound, 1e-30f))} 的读法："
+                            + "> 1 是结构性错误（那就是上面这道门）；≈ 1 说明取到 max 的那条射线"
+                            + "几乎全程贴着地面密度走 —— 探针网格里有朝下看的方向，所以这是正常的；"
+                            + "而**相机远高于雾层时**比值仍然 ≈ 1 才是可疑的，那意味着"
+                            + "高度衰减没生效（scaleHeight 被下发成了 0 或 ∞）。"
+                            + "这一格判的是前一种，后一种要靠 #27 的跨布景对照。");
+            }
+            else
+            {
+                // 空判据的格子要在报表上点名。
+                sb.AppendLine("ⓘ 判据⑪d 未覆盖：雾是关着的（Fog ▸ Mode = Off 或 σ_t = 0），"
+                            + "没有可比的上界。此时判据⑪c 也失去了失败能力 —— 上面已经说明。");
+            }
+
+            sb.AppendLine($"  ⓘ 积分 rgb 的最大亮度分量 = {Sci(lumMax)}"
+                        + $"（预曝光后，定点读数 {raw[k_SlotIntegralLumMax]} 个刻度 ⇒ 相对分辨率 "
+                        + $"{Sci(1f / Mathf.Max(raw[k_SlotIntegralLumMax], 1u))}）。");
+
+            // ⑪e 把「积分 = Σ 源项 × 段长」这条恒等式的**量纲**变成一道能失败的门。
+            // ∫S·T dt ≤ max(S)·d，因为 T ≤ 1 —— 两个操作数都是同一个 buffer 里
+            // 已经读回来的数，段长用 handoff（表最后一片存的就是到 handoff 的累积）。
+            //
+            // 这道门要拒绝的最小错答案：段长搞错单位制。_VistaGround.w 那个坑
+            // （注入的 alpha 是 1/km、SegmentNear/Far 返回米）会让这个比值差 1000 倍。
+            // 前面那道宽门（⑫，×3.6e4）根本挡不住 1000 倍。
+            if (volume.allocatedDesc.HasValue)
+            {
+                float dKmFull = volume.allocatedDesc.Value.handoffMeters * 1.0e-3f;
+                float lumBound = injectMax * dKmFull;
+                float lumRatio = lumMax / Mathf.Max(lumBound, 1e-30f);
+                bool lumBoundOk = !probeRan || lumMax <= lumBound;
+                sb.AppendLine($"{Mark(lumBoundOk)}判据⑪e 积分-注入量纲一致：max(S) = {Sci(injectMax)}，"
+                            + $"d = {Sci(dKmFull)} km ⇒ 上界 max(S)·d = {Sci(lumBound)}，"
+                            + $"实测 {Sci(lumMax)}（比值 {Sci(lumRatio)}，因 T ≤ 1 必须 ≤ 1）");
+                sb.AppendLine($"  ⓘ 裕度 {Sci(1f - lumRatio)} 对上定点相对分辨率 "
+                            + $"{Sci(1f / Mathf.Max(raw[k_SlotIntegralLumMax], 1u))} —— "
+                            + "裕度必须大于分辨率，否则这一格是「一个正好压在门上的读数」。"
+                            + "它要拒绝的最小错答案是段长差 1000 倍（米/千米混用），"
+                            + "那个错答案会把比值推到 1e+3 或 1e-3，远在本门之外。");
+            }
+
+
+            // ---------------------------------------------------------------- 判据⑫ x = σ_t·Δ 包络
+            float segXMin = probeRan ? segXMinRaw / k_SegXScale : float.NaN;
+            float segXMax = raw[k_SlotSegXMax] / k_SegXScale;
+
+            bool envelopeOk = probeRan
+                           && segXMin >= k_SegXDerivedMin && segXMax <= k_SegXDerivedMax
+                           && segXMin <= segXMax;
+            sb.AppendLine($"{Mark(envelopeOk)}判据⑫ 段光学厚度包络：实测 x ∈ "
+                        + $"[{Sci(segXMin)}, {Sci(segXMax)}]，推导区间 "
+                        + $"[{Sci(k_SegXDerivedMin)}, {Sci(k_SegXDerivedMax)}]"
+                        + $"（区间宽 ×{Sci(k_SegXDerivedMax / k_SegXDerivedMin)} —— 这是一道**宽门**，"
+                        + "它抓的是量级整体挪位，抓不到一个数量级内的偏差）");
+            sb.AppendLine($"  ⓘ 定点分辨率 {Sci(1f / k_SegXScale)}，下端还剩 "
+                        + $"{(probeRan ? segXMinRaw.ToString() : "—")} 个刻度 ——"
+                        + "「地板与被测量同量级时尺子会自己伪造结论」这条在这里是量出来的，不是估的。");
+
+            // ⑫b 一道**紧**门。⑫ 那道推导区间宽 3.6e4 倍，挡不住一个 1000 倍的单位错；
+            // 这一道的裕度是个位数百分比。
+            //
+            // x = σ_t·Δ，两个因子各有一个能算准的上界：σ_t ≤ 地面密度（高度雾只会更淡），
+            // Δ ≤ 最长那一段。段长用 desc.SegmentFar/SegmentNear —— 这**不是**第二份实现：
+            // 那两个函数与 HLSL 的 VistaFroxelSegmentLengthKm 逐位一致这件事，
+            // 已经由 VistaFroxelVolumeSelfTest 的切片判据（#19）盯着了。这里复用它们，
+            // 等于把那一格的结论接到这一格上。
+            //
+            // 最长段不假设是最后一段，直接扫一遍：切片 0 是 [0, d_0]，它不服从后面那个
+            // 等比规律，「假设最后一段最长」是一条不需要的推导。
+            if (probeRan && fog != null && fog.enabled && volume.allocatedDesc.HasValue)
+            {
+                var d = volume.allocatedDesc.Value;
+                float longestMeters = 0f;
+                int longestSlice = -1;
+                for (int i = 0; i < d.depth; i++)
+                {
+                    float len = d.SegmentFar(i) - d.SegmentNear(i);
+                    if (len > longestMeters) { longestMeters = len; longestSlice = i; }
+                }
+
+                float xBound = fog.extinctionPerKm * longestMeters * 1.0e-3f;
+                float xRatio = segXMax / Mathf.Max(xBound, 1e-30f);
+                bool xBoundOk = segXMax <= xBound;
+                sb.AppendLine($"{Mark(xBoundOk)}判据⑫b 段光学厚度紧上界：σ_t(地面) {Sci(fog.extinctionPerKm)} /km"
+                            + $" × 最长段 {longestMeters:F3} m（切片 {longestSlice}）= {Sci(xBound)}，"
+                            + $"实测 x_max = {Sci(segXMax)}（比值 {Sci(xRatio)}，必须 ≤ 1）");
+                sb.AppendLine($"  ⓘ 裕度 {Sci(1f - xRatio)}。比值还是一条归因，但只是**上界**："
+                            + "它 ≥「取到 x_max 的那个 froxel 的 σ_t ÷ 地面 σ_t」，"
+                            + "取等的条件是 x_max 恰好落在最长那一段上 —— 而探针没有记录它落在哪一段，"
+                            + "所以这里不断言取等（断言一个自己没有保留的中间读数等于编造证据）。"
+                            + "读法：比值 > 1 ⇒ 段长或 σ_t 的单位制错了（米/千米差 1000 倍）；"
+                            + "比值 ≪ 1 而相机贴着地面 ⇒ 高度衰减被下发得太陡。");
+            }
+            else if (probeRan)
+            {
+                sb.AppendLine("ⓘ 判据⑫b 未覆盖：雾关着，σ_t(地面) = 0 会让紧上界退化成 0，"
+                            + "而空气的 σ_t 不由 VistaFogSettings 给 —— 那条上界要另外推。");
+            }
+
+            // 分支覆盖：这是 #25 那次阈值替换的影响面，必须在**换之前**量出来。
+            if (probeRan)
+            {
+                bool seriesCoveredNow = segXMin < k_SeriesThresholdShipped;
+                bool allSeriesAfter    = segXMax < k_SeriesThresholdOptimum;
+                sb.AppendLine($"  ⓘ 级数分支覆盖（VistaSegmentIntegral 的 x ≤ {Sci(k_SeriesThresholdShipped)} 那一支）："
+                            + (seriesCoveredNow
+                                ? "真实帧里**有**段落在级数支上。"
+                                : "真实帧里**没有**任何段落在级数支上 —— 那一支今天只由合成介质自检覆盖。"));
+                sb.AppendLine($"  ⓘ #25 要把阈值换成最优的 x* = {Sci(k_SeriesThresholdOptimum)}。"
+                            + (allSeriesAfter
+                                ? $"换完之后本布景**每一段**都会走级数支（x_max {Sci(segXMax)} < x*）—— "
+                                + "所以那次替换不是一个边角优化，它会整体改写这条积分路径，"
+                                + "AP 必须跟着重跑一遍判据。"
+                                : $"换完之后仍有段走 exp 支（x_max {Sci(segXMax)} ≥ x*），两支都有真实帧覆盖。"));
+            }
+
             // ---------------------------------------------------------------- 分配口径
             if (volume.allocatedDesc.HasValue)
             {
@@ -400,14 +639,19 @@ namespace Vista.EditorTools
                 sb.AppendLine($"分配口径：{d}");
                 sb.AppendLine($"  AP 的接手点应当是 handoff = {d.handoffMeters:F3} m，"
                             + $"不是 far = {d.farMeters:F1} m（差 {d.farMeters - d.handoffMeters:F3} m）。"
-                            + "但 #20 **刻意不动** AP 的 nearDistanceKm：光把 near 推到 handoff 是不够的，"
-                            + "AerialPerspectiveLut 的积分起点是 tPrev = 0.0，切片 0 照样会积 [0, near]，"
-                            + "所以起点也得一起改 —— 那属于 #21/#25。#19 待办里那句话要按这个改。");
+                            + "近层与 AP 现在都从 t = 0 开始积分，两层同开时近段的雾被算两遍。"
+                            + "光把 AP 的 nearDistanceKm 推到 handoff 是不够的："
+                            + "AerialPerspectiveLut 的积分起点是 tPrev = 0.0（AtmosphereLut.compute:375），"
+                            + "切片 0 照样会积 [0, near] —— 推远 near 只让第 0 片变长，双计一点没少。"
+                            + "起点也得一起移，而那会改变 AP LUT 的语义（相机→t 变成 handoff→t），"
+                            + "读端合成要跟着改，所以归 #25。CHANGELOG 的 #19 待办已按此更正。");
             }
 
-            sb.AppendLine("ⓘ 未覆盖：注入历史表（#22 时间重投影）与积分表（#21 深度积分）"
-                        + "这两条**写入**路径本节一次都没跑过。VistaAtmospherePass 里也刻意没有 ImportTexture "
-                        + "它们 —— 顺手导入会让「没人写」这件事在代码里看不出来。");
+            sb.AppendLine("ⓘ 未覆盖：注入**历史**表（#22 时间重投影）这一条写入路径本节一次都没跑过。"
+                        + "VistaAtmospherePass 里也刻意没有 ImportTexture 它 —— 顺手导入会让"
+                        + "「没人写」这件事在代码里看不出来。\n"
+                        + "  积分表已经不在这一条里了：它的 RenderGraph 写入路径由上面判据⑩⑪⑫覆盖，"
+                        + "画面侧由 Debug View 的四个档位覆盖。");
         }
 
         static Camera FindGameCamera()

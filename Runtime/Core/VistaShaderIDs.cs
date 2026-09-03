@@ -97,6 +97,16 @@ namespace Vista
         public static readonly int _VistaFroxelSliceReportRW      = Shader.PropertyToID("_VistaFroxelSliceReportRW");
         // 自检专用：阴影覆盖性探针（min/max 的定点编码 + 关键字状态）
         public static readonly int _VistaFroxelShadowProbeRW      = Shader.PropertyToID("_VistaFroxelShadowProbeRW");
+        // 自检专用：逐片的积分报告（原始读数，误差在 C# 侧算）
+        public static readonly int _VistaFroxelIntegrationReportRW = Shader.PropertyToID("_VistaFroxelIntegrationReportRW");
+        // 自检专用：积分判据的合成介质 (σ_t 1/km, 源项基准 S, 0, 0)。
+        // 线上路径**一个字节都不下发** —— 它的零态就是「没有布景」，
+        // 所以这条绑定点写错的症状是判据全零，而不是画面上多一层看不出来的雾。
+        public static readonly int _VistaFroxelSynthMedium        = Shader.PropertyToID("_VistaFroxelSynthMedium");
+        // 调试视图专用：x = gain，y = 单片档的切片下标（已夹紧），z = 档位，w 保留。
+        // 走 MaterialPropertyBlock 下发，不是全局 —— 那一趟 pass 因此不声明
+        // AllowGlobalStateModification，「它不改全局」在代码里读得出来。
+        public static readonly int _VistaFroxelDebugParams         = Shader.PropertyToID("_VistaFroxelDebugParams");
 
         // ---- Atmosphere: banding 签名（仅 Editor 自检）----
         // 走的是**运行时那个采样入口**，所以它读 _VistaSkyViewLut（SRV），

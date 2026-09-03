@@ -308,6 +308,9 @@ namespace Vista
         /// <summary>froxel 阴影覆盖性探针输出（#20）。只在 <c>EnsureShadowProbeBuffer</c> 之后非 null。</summary>
         public GraphicsBuffer froxelShadowProbeBuffer => m_FroxelVolume?.shadowProbeBuffer;
 
+        /// <summary>froxel 深度积分判据输出（#21）。只在 <c>EnsureIntegrationReportBuffer</c> 之后非 null。</summary>
+        public GraphicsBuffer froxelIntegrationReportBuffer => m_FroxelVolume?.integrationReportBuffer;
+
         public int skyViewWidth  => m_SkyViewWidth;
         public int skyViewHeight => m_SkyViewHeight;
 
@@ -1096,6 +1099,25 @@ namespace Vista
             view.BindFog(d, fog);
 
             m_FroxelVolume.DispatchInjection(d, desc, cameraWS, shadowmapBound);
+        }
+
+        /// <summary>
+        /// #21 近层 froxel 的深度积分。**必须是紧跟注入之后的一趟独立 dispatch** ——
+        /// 它把注入表当 SRV 读，同一趟里 UAV 与 SRV 指同一张纹理是 UB。
+        ///
+        /// 与 <see cref="RenderFroxelInjection{T}"/> 不同，这里**一个逐视图常量都不推**：
+        /// 积分核只读注入表 + 切片几何（<c>_VistaFroxelRange/Size</c>，由
+        /// <c>VistaFroxelVolume.Prepare</c> 在记录期推过）+ <c>_VistaGround.w</c> 的 km 缩放
+        /// （由 <c>PrepareLuts</c> 推过）。多推的每一个 uniform 都会让
+        /// 「这一趟到底依赖什么」在代码里变得看不出来 —— 而依赖越少，
+        /// #22 把它挪到重投影之后就越安全。
+        /// </summary>
+        public void RenderFroxelIntegration<T>(T d, in VistaFroxelVolumeDesc desc)
+            where T : struct, IVistaLutDispatcher
+        {
+            if (m_FroxelVolume == null) return;
+
+            m_FroxelVolume.DispatchIntegration(d, desc);
         }
 
         /// <summary>

@@ -82,6 +82,16 @@ namespace Vista
         /// </summary>
         public ComputeShader volumetricFogCS => m_VolumetricFogCS;
 
+        [SerializeField, ResourcePath("Shaders/Volumetrics/VistaFroxelDebug.shader")]
+        private Shader m_FroxelDebugShader;
+
+        /// <summary>
+        /// froxel 表的调试视图（#21）。为 null 时 <c>debugView</c> 的非 Off 档静默失效 ——
+        /// 这条是可以接受的：整个视图本身就是一个诊断工具，它缺席不影响任何出货路径。
+        /// 出货路径缺 shader 的那两条（天空、AP 合成）各自都写明了退化行为。
+        /// </summary>
+        public Shader froxelDebugShader => m_FroxelDebugShader;
+
         /// <summary>取当前管线下的 Vista 资源容器，不在 URP 下时返回 null。</summary>
         public static VistaRuntimeResources Get()
             => GraphicsSettings.GetRenderPipelineSettings<VistaRuntimeResources>();

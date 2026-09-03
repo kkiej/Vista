@@ -55,12 +55,14 @@ namespace Vista
         [SerializeField]
         [Tooltip("近层体积雾（froxel 体）的分辨率与深度范围。介质参数在上面的 Fog 里 —— "
                + "近层与 AP LUT 共用同一份介质定义。\n"
-               + "注意：本节的开关目前只产出一张 3D 注入表，画面上看不到变化（积分是 #21）。")]
+               + "注意：本节的开关产出注入表与积分表，但**最终画面还没有消费它们**"
+               + "（合成在 #25）。要看到这两张表，用本节的 Debug View 档位。")]
         VistaVolumetricFogSettings m_VolumetricFog = new VistaVolumetricFogSettings();
 
         VistaAtmosphereLuts m_Luts;
         VistaAtmospherePass m_Pass;
         VistaAerialPerspectiveCompositePass m_ApCompositePass;
+        VistaFroxelDebugPass m_FroxelDebugPass;
 
         /// <summary>
         /// 当前生效的大气模块。场景侧的组件（<see cref="VistaTimeOfDay"/>）靠它拿到
@@ -179,6 +181,13 @@ namespace Vista
             m_ApCompositePass?.Dispose();
             m_ApCompositePass = new VistaAerialPerspectiveCompositePass(
                 resources.aerialPerspectiveCompositeShader);
+
+            // froxel 表的调试视图（#21）。与合成 pass 同一条重建理由（持有生成材质）。
+            // shader 缺失时 isValid 为 false，非 Off 档静默失效 —— 这条降级在
+            // VistaRuntimeResources.froxelDebugShader 的注释里写明了为什么可以接受：
+            // 它是纯诊断工具，缺席不影响任何出货路径。
+            m_FroxelDebugPass?.Dispose();
+            m_FroxelDebugPass = new VistaFroxelDebugPass(resources.froxelDebugShader);
         }
 
         public override void AddRenderPasses(ScriptableRenderer renderer, ref RenderingData renderingData)
@@ -211,6 +220,24 @@ namespace Vista
             {
                 renderer.EnqueuePass(m_ApCompositePass);
             }
+
+            // froxel 调试视图（#21）。只在选了非 Off 档时排入 —— 它同样声明了
+            // ConfigureInput(Depth)，排入就要一次深度拷贝，Off 档不该付这个钱。
+            //
+            // 相机类型必须与 VistaAtmospherePass 里那个 froxelEnabled 的门**逐字一致**：
+            // 那边不为反射探针相机分配 froxel 体（探针不需要近层雾，而且它的分辨率
+            // 与主相机不同会导致每帧重分配三张 3D 表）。若这里不同步，反射探针相机
+            // 每帧都会走进「表不存在」那条警告分支，而主相机帧又把去重串清掉 ——
+            // 症状是每秒 60 条警告，且内容指向一个根本没配错的开关。
+            if (m_FroxelDebugPass != null && m_FroxelDebugPass.isValid
+                && m_VolumetricFog.debugView != FroxelDebugView.Off
+                && (cameraType == CameraType.Game || cameraType == CameraType.SceneView))
+            {
+                m_FroxelDebugPass.Setup(m_VolumetricFog.debugView,
+                                        m_VolumetricFog.debugSlice,
+                                        m_VolumetricFog.debugGain);
+                renderer.EnqueuePass(m_FroxelDebugPass);
+            }
         }
 
         protected override void Dispose(bool disposing)
@@ -231,6 +258,8 @@ namespace Vista
             m_Pass?.Teardown();
             m_ApCompositePass?.Dispose();
             m_ApCompositePass = null;
+            m_FroxelDebugPass?.Dispose();
+            m_FroxelDebugPass = null;
             m_Luts?.Dispose();
             m_Luts = null;
         }

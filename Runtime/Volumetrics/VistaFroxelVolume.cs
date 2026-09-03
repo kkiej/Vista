@@ -27,30 +27,43 @@ namespace Vista
         // 语义写在 VistaFroxelVolumeSelfTest 里（唯一消费者）。
         public const int k_ReportFloat4PerSlice = 2;
 
+        // #21 的积分判据报告：每片四个 float4。
+        // r0 = 积分表 (0,0,i) 读回来的 (L.rgb, 1−T)，r1 = 注入表同一格的 (S.rgb, σ_t)，
+        // r2 = (非有限计数, alphaMin, alphaMax, lumMax) 的逐片覆盖性扫描，
+        // r3 = (dtKm, _VistaGround.w, 0, 0) 的归因行 —— 见 shader 里 VISTA_INTEGRAL_REPORT_STRIDE。
+        // 这个数必须与那个 #define 一致：不一致时 D3D11 静默丢弃越界的 UAV 写。
+        // 语义写在 VistaFroxelIntegrationSelfTest 里（唯一消费者）。
+        public const int k_IntegrationReportFloat4PerSlice = 4;
+
         /// <summary>
-        /// 阴影覆盖性探针的槽位数（#20）。必须与 <c>VolumetricFog.compute</c> 里
+        /// 阴影覆盖性探针的槽位数（#20，#21 追加到 19）。必须与 <c>VolumetricFog.compute</c> 里
         /// <c>VISTA_PROBE_*</c> 那组下标的最大值 + 1 一致 —— 少一个的症状是
         /// 最后一个槽位的 Interlocked 写越界，而 D3D11 上越界 UAV 写是**静默丢弃**，
         /// 判据会读到一个恒为初值的格子并把它当成「这一路没执行」。
         /// </summary>
-        public const int k_ShadowProbeSlots = 14;
+        public const int k_ShadowProbeSlots = 19;
 
-        // 探针里两个走 InterlockedMin 的槽位（SHADOW_MIN = 0, SHADOWMAP_MIN = 8）。
+        // 探针里三个走 InterlockedMin 的槽位
+        // （SHADOW_MIN = 0, SHADOWMAP_MIN = 8, SEG_X_MIN = 17）。
         // 下标写在这里而不是只写在 shader 里：重置函数必须把它们填成 uint.MaxValue，
         // 而填错的症状是 min 恒为 0 —— 那会把「一个点都没被遮」伪装成「全被遮」。
-        static readonly int[] k_ShadowProbeMinSlots = { 0, 8 };
+        static readonly int[] k_ShadowProbeMinSlots = { 0, 8, 17 };
 
         readonly ComputeShader m_Cs;
         readonly int m_KernelPlaceholderIdx = -1;
         readonly int m_KernelSliceVerifyIdx = -1;
         readonly int m_KernelInjectionIdx = -1;
         readonly int m_KernelShadowProbeIdx = -1;
+        readonly int m_KernelIntegrationIdx = -1;
+        readonly int m_KernelSynthMediumIdx = -1;
+        readonly int m_KernelIntegralVerifyIdx = -1;
 
         RTHandle m_Injection;
         RTHandle m_InjectionHistory;
         RTHandle m_Integral;
         GraphicsBuffer m_SliceReport;
         GraphicsBuffer m_ShadowProbe;
+        GraphicsBuffer m_IntegrationReport;
 
         // 可空而不是直接存 struct：null 表示「还没分配过」。
         // 存 struct 的话就得靠一个哨兵值（比如 depth == 0）表达同一件事，
@@ -73,22 +86,35 @@ namespace Vista
                 m_KernelInjectionIdx = m_Cs.FindKernel("FroxelInjection");
             if (m_Cs.HasKernel("FroxelShadowProbe"))
                 m_KernelShadowProbeIdx = m_Cs.FindKernel("FroxelShadowProbe");
+            if (m_Cs.HasKernel("FroxelIntegration"))
+                m_KernelIntegrationIdx = m_Cs.FindKernel("FroxelIntegration");
+            if (m_Cs.HasKernel("FroxelSynthMedium"))
+                m_KernelSynthMediumIdx = m_Cs.FindKernel("FroxelSynthMedium");
+            if (m_Cs.HasKernel("FroxelIntegralVerify"))
+                m_KernelIntegralVerifyIdx = m_Cs.FindKernel("FroxelIntegralVerify");
         }
 
         /// <summary>
-        /// 四个核都在。分开判「资源在不在」（<see cref="isAllocated"/>）与「核在不在」，
+        /// 七个核都在。分开判「资源在不在」（<see cref="isAllocated"/>）与「核在不在」，
         /// 理由与 <c>VistaAtmosphereLuts</c> 那四个独立的 valid 属性相同：
         /// 前者是每帧可变的状态，后者在构造之后就是常量，混成一个属性
         /// 会让「shader 编译坏了」与「这一帧还没分配」在日志上长得一样。
         ///
-        /// 要求**四个都在**而不是按核分成四个属性：它们在同一个 .compute 文件里，
-        /// 一个编译失败就是四个都没有。真正会出现的「部分缺失」只有一种 ——
+        /// 要求**全部都在**而不是按核分成七个属性：它们在同一个 .compute 文件里，
+        /// 一个编译失败就是七个都没有。真正会出现的「部分缺失」只有一种 ——
         /// #pragma kernel 那行写错了名字 —— 那时按整体判会让整条近层雾路径退出，
-        /// 比让三个核继续跑、第四个安静地什么都不做要好归因。
+        /// 比让六个核继续跑、第七个安静地什么都不做要好归因。
+        ///
+        /// 两个自检核（SynthMedium / IntegralVerify）也算进来，尽管线上路径不派发它们：
+        /// 「一个默认关闭、又没有判据覆盖的开关，等于一段永远不会被发现写错的代码」——
+        /// 把它们纳入 isValid，核名写错就会在**第一次真实渲染**时报出来，
+        /// 而不是等到有人去点那个菜单项。
         /// </summary>
         public bool isValid => m_Cs != null
             && m_KernelPlaceholderIdx >= 0 && m_KernelSliceVerifyIdx >= 0
-            && m_KernelInjectionIdx >= 0 && m_KernelShadowProbeIdx >= 0;
+            && m_KernelInjectionIdx >= 0 && m_KernelShadowProbeIdx >= 0
+            && m_KernelIntegrationIdx >= 0 && m_KernelSynthMediumIdx >= 0
+            && m_KernelIntegralVerifyIdx >= 0;
 
         public bool isAllocated => m_Injection != null && m_InjectionHistory != null && m_Integral != null;
 
@@ -97,6 +123,7 @@ namespace Vista
         public RTHandle integral => m_Integral;
         public GraphicsBuffer sliceReportBuffer => m_SliceReport;
         public GraphicsBuffer shadowProbeBuffer => m_ShadowProbe;
+        public GraphicsBuffer integrationReportBuffer => m_IntegrationReport;
 
         /// <summary>这一帧实际分配下来的口径。没分配过时为 null。</summary>
         public VistaFroxelVolumeDesc? allocatedDesc => m_Allocated;
@@ -316,6 +343,7 @@ namespace Vista
         ///
         /// 注入表按 UAV 绑（而不是 SRV）：要看的就是实际写进去的东西，
         /// 而且 fp16 的量级余量只有从纹理里读回来才算量过。
+        /// 积分表（#21 追加的槽位 14~18）同理。
         /// </summary>
         public void DispatchShadowProbe<T>(in T dispatcher)
             where T : IVistaLutDispatcher
@@ -324,10 +352,111 @@ namespace Vista
 
             dispatcher.SetTexture(m_Cs, m_KernelShadowProbeIdx,
                 VistaShaderIDs._VistaFroxelInjectionRW, VistaLutSlot.FroxelInjection);
+            dispatcher.SetTexture(m_Cs, m_KernelShadowProbeIdx,
+                VistaShaderIDs._VistaFroxelIntegralRW, VistaLutSlot.FroxelIntegral);
             dispatcher.SetBuffer(m_Cs, m_KernelShadowProbeIdx,
                 VistaShaderIDs._VistaFroxelShadowProbeRW, VistaLutBufferSlot.FroxelShadowProbe);
             // 32×32×16 / numthreads(8,8,1)
             dispatcher.Dispatch(m_Cs, m_KernelShadowProbeIdx, 4, 4, 16);
+        }
+
+        /// <summary>
+        /// #21 的深度积分派发。**必须排在注入之后的一趟独立 dispatch 里** ——
+        /// 它把注入表当 SRV 读，同一趟里 UAV 与 SRV 指向同一张纹理是 UB。
+        ///
+        /// 派发形状是 <b>XY 满、Z 只有 1</b>：一个线程负责一整柱，核内串行扫 64 片。
+        /// 与注入那趟（满 3D）刻意不同，理由在 shader 里 FroxelIntegration 的注释：
+        /// 积分是相机原点的**累积**量，第 i 片依赖前 i−1 片，按 froxel 派发就得写成
+        /// 跨线程组的 scan。10212 柱 / 64 = 180 组，在 28 个 SM 上是 6.4 组/SM，
+        /// 比 #7 实测的 AP 派发地板（16 组）高 11 倍，所以按柱不落在那条 floor-bound 线上。
+        ///
+        /// 不下发 <c>_VistaFroxelCameraWS</c>：积分核不碰阴影、不碰相机位置，
+        /// 它只读注入表 + 切片几何。少绑一个等于让「这一趟不依赖相机」在代码里看得出来。
+        /// </summary>
+        public void DispatchIntegration<T>(in T dispatcher, in VistaFroxelVolumeDesc desc)
+            where T : IVistaLutDispatcher
+        {
+            if (!isValid || !isAllocated) return;
+
+            dispatcher.SetTexture(m_Cs, m_KernelIntegrationIdx,
+                VistaShaderIDs._VistaFroxelInjectionRead, VistaLutSlot.FroxelInjectionRead);
+            dispatcher.SetTexture(m_Cs, m_KernelIntegrationIdx,
+                VistaShaderIDs._VistaFroxelIntegralRW, VistaLutSlot.FroxelIntegral);
+            dispatcher.Dispatch(m_Cs, m_KernelIntegrationIdx,
+                VistaComputeUtils.DivRoundUp(desc.width, 8),
+                VistaComputeUtils.DivRoundUp(desc.height, 8),
+                1);
+        }
+
+        /// <summary>
+        /// 按需分配积分判据的报告 buffer（<paramref name="sliceCount"/> × 4 个 float4）。
+        /// 与 <see cref="EnsureSliceReportBuffer"/> 分开：两者的每片容量不同，
+        /// 合成一个 buffer 会让两套判据的下标互相牵连 ——
+        /// 而「容量常数与 shader 里的下标上限不一致」在 D3D11 上是静默丢弃。
+        /// </summary>
+        public void EnsureIntegrationReportBuffer(int sliceCount)
+        {
+            int count = Mathf.Max(1, sliceCount) * k_IntegrationReportFloat4PerSlice;
+            if (m_IntegrationReport != null && m_IntegrationReport.count == count) return;
+
+            m_IntegrationReport?.Dispose();
+            m_IntegrationReport = new GraphicsBuffer(
+                GraphicsBuffer.Target.Structured, count, sizeof(float) * 4)
+            {
+                name = "VistaFroxelIntegrationReport",
+            };
+        }
+
+        /// <summary>
+        /// #21 判据的布景派发：把一个**均匀**合成介质写满整张注入表。
+        ///
+        /// 只有 Editor 自检调这个。为什么判据要自己造布景而不是拿真实的雾去对：
+        /// 真实 σ_t 沿视线随高度变，闭式解不存在，那时「参考解」只能是另一个积分器 ——
+        /// 也就是同一个量的第二份实现。均匀介质下
+        /// L(d) = (S/σ_t)·(1 − e^{−σ_t·d}) 是初等闭式解，
+        /// 判据的输入里因此一个被测对象的值都不含。
+        ///
+        /// <paramref name="extinctionPerKm"/> 与 <paramref name="sourceBase"/> 走一个
+        /// 专用全局（<c>_VistaFroxelSynthMedium</c>），线上路径一个字节都不下发 ——
+        /// 它的零态（σ_t = 0, S = 0）就是「没有布景」，而不是一个看起来合法的默认雾。
+        /// </summary>
+        public void DispatchSynthMedium<T>(in T dispatcher, in VistaFroxelVolumeDesc desc,
+                                           float extinctionPerKm, float sourceBase)
+            where T : IVistaLutDispatcher
+        {
+            if (!isValid || !isAllocated) return;
+
+            dispatcher.SetGlobalVector(VistaShaderIDs._VistaFroxelSynthMedium,
+                new Vector4(extinctionPerKm, sourceBase, 0f, 0f));
+            dispatcher.SetTexture(m_Cs, m_KernelSynthMediumIdx,
+                VistaShaderIDs._VistaFroxelInjectionRW, VistaLutSlot.FroxelInjection);
+            dispatcher.Dispatch(m_Cs, m_KernelSynthMediumIdx,
+                VistaComputeUtils.DivRoundUp(desc.width, 8),
+                VistaComputeUtils.DivRoundUp(desc.height, 8),
+                desc.depth);
+        }
+
+        /// <summary>
+        /// #21 判据的读回派发：把积分表 + 注入表搬进报告 buffer，一个线程一片。
+        ///
+        /// 核内**不算任何误差** —— 参考解由 C# 侧用 double 算。
+        /// 这样判据的地板只剩 fp16 纹理往返的 4.88e-4，
+        /// 而不会被核内 fp32 的抵消误差抬起来。
+        /// </summary>
+        public void DispatchIntegralVerify<T>(in T dispatcher, in VistaFroxelVolumeDesc desc)
+            where T : IVistaLutDispatcher
+        {
+            if (!isValid || !isAllocated || m_IntegrationReport == null) return;
+
+            dispatcher.SetTexture(m_Cs, m_KernelIntegralVerifyIdx,
+                VistaShaderIDs._VistaFroxelInjectionRead, VistaLutSlot.FroxelInjectionRead);
+            dispatcher.SetTexture(m_Cs, m_KernelIntegralVerifyIdx,
+                VistaShaderIDs._VistaFroxelIntegralRW, VistaLutSlot.FroxelIntegral);
+            dispatcher.SetBuffer(m_Cs, m_KernelIntegralVerifyIdx,
+                VistaShaderIDs._VistaFroxelIntegrationReportRW,
+                VistaLutBufferSlot.FroxelIntegrationReport);
+            dispatcher.Dispatch(m_Cs, m_KernelIntegralVerifyIdx,
+                VistaComputeUtils.DivRoundUp(desc.depth, 64), 1, 1);
         }
 
         void Allocate(in VistaFroxelVolumeDesc desc)
@@ -348,7 +477,9 @@ namespace Vista
                 //   前三通道预曝光 —— 与 AP LUT 同一条约定（见 AerialPerspective.hlsl），
                 //   绝对单位的太阳照度 1.2e5 lux 乘上 2.542e-5 的曝光后是 O(1)，fp16 富余；
                 //   σ_t 的单位是 1/km，最浓的雾（能见度 50 m）是 78 /km，也在范围内。
-                // 积分表存的是 (累积内散射 预曝光, 累积透射率)，两者都 ≤ O(1)。
+                // 积分表存的是 (累积内散射 预曝光, **1 − 累积透射率**)，两者都 ≤ O(1)。
+                // alpha 存 1 − T 而不是 T 是刻意与 HDRP/UE5 相反的，理由见 FroxelVolume.hlsl
+                // 的头注：这张表清空态是全 0，存 T 会让「表没被写」升级成全黑。
                 format: GraphicsFormat.R16G16B16A16_SFloat,
                 slices: desc.depth,
                 // 三线性：读端逐像素按深度采样，深度方向必须插值 ——
@@ -383,6 +514,8 @@ namespace Vista
             m_SliceReport = null;
             m_ShadowProbe?.Dispose();
             m_ShadowProbe = null;
+            m_IntegrationReport?.Dispose();
+            m_IntegrationReport = null;
         }
     }
 }
