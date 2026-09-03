@@ -84,12 +84,48 @@ namespace Vista
         // cbuffer 同一条「关掉 = 零态」的约定。
         public static readonly int _VistaFroxelCameraWS           = Shader.PropertyToID("_VistaFroxelCameraWS");
 
+        // ---- Volumetrics: 时间重投影与抖动（#22，VistaFroxelReprojection 下发）----
+        // 整组的零态 = 失能：历史权重 0（纯本帧）、抖动幅度 0（恒在格心）、
+        // 上一帧范围全零（logRatio = 0 ⇒ 解码距离恒 0，不是 NaN）。
+        // 特别地，历史权重那一位的零态**必须**是「不用历史」——
+        // 反过来的话，一个没下发的帧会去混一张未初始化的 fp16 显存，而那里可能是 NaN。
+        //
+        // 上一帧的 viewProj。Unity 的 GL 风格 clip space（y 向上、w > 0 = 在相机前方），
+        // **不**过 GL.GetGPUProjectionMatrix —— 理由写在 VistaFroxelReprojection.Update 里：
+        // 这个 uv 是喂给 VistaApFroxelRayDirection 的（uv.y 自下而上），不是采屏幕纹理。
+        public static readonly int _VistaFroxelPrevViewProj       = Shader.PropertyToID("_VistaFroxelPrevViewProj");
+        // 上一帧的分片范围 (near, far, logRatio, 1/logRatio)，米。
+        // 必须是**上一帧那份**：近远距离不进纹理重分配的脏检查，所以历史表里的片
+        // 可能是另一套 near/far 下的距离。拿本帧的范围去查历史，症状是改阴影距离的
+        // 那一帧雾整体前后错一下 —— 一个「看起来物理上讲得通的漂移」。
+        public static readonly int _VistaFroxelPrevRange          = Shader.PropertyToID("_VistaFroxelPrevRange");
+        // xyz: 上一帧相机世界位置 (m)；w: **历史**的混合权重 ∈ [0,1]。
+        public static readonly int _VistaFroxelPrevCameraWS       = Shader.PropertyToID("_VistaFroxelPrevCameraWS");
+        // xyz: R3 塑性常数 Kronecker 序列的本帧相位 frac(frameIndex · α) ∈ [0,1)³。
+        public static readonly int _VistaFroxelJitterPhase        = Shader.PropertyToID("_VistaFroxelJitterPhase");
+        // x: 横向抖动幅度（单位 = 一格宽），y: 深度抖动幅度（单位 = 一片厚）。
+        public static readonly int _VistaFroxelJitter             = Shader.PropertyToID("_VistaFroxelJitter");
+        // x: 亮度死区下端，y: 1/(上端 − 下端)。宽度由 C# 保证 > 0（见 ResolveLuminanceReject）。
+        public static readonly int _VistaFroxelReprojParams       = Shader.PropertyToID("_VistaFroxelReprojParams");
+        // 自检专用：喂给探针核的合成上一帧相机位移 (xyz, 角色标志)。
+        // 线上路径一个字节都不下发 —— 零态 = 角色 0 = 探针整核早退。
+        //   1 = 在线读数（含抖动的亮度散布）  2 = 静止恒等性
+        //   3 = 位移驱动的四条拒绝分支        4 = 合成 hist 驱动的两条（NaN / 亮度）
+        // 角色编码写在这里而不是只写在 shader 里，是因为 C# 侧要按角色分七趟派发；
+        // 两边各写一份注释的话，「换了编码只改了一边」的症状是某一格计数恒为 0，
+        // 而 0 在那些格子里是**合法**读数。
+        public static readonly int _VistaFroxelReprojProbe        = Shader.PropertyToID("_VistaFroxelReprojProbe");
+
         // ---- Volumetrics: froxel 体的三张表 ----
-        // 注入表有两个绑定点：写用 RW（RWTexture3D），读用 Read（Texture3D）。
+        // 注入表有三个绑定点：本帧写用 RW（RWTexture3D），本帧读用 Read（Texture3D，
+        // 给积分与判据），历史帧读用 History（另一张资源的 SRV，给 #22a 的重投影）。
         // 同一张纹理同时绑 UAV 与 SRV 是 UB，与反射那张中转表是同一条教训。
+        //
+        // 历史帧**没有** RW 绑定点：谁都不写它 —— 双缓冲的交换只改写下标，
+        // 本帧写的永远是 _VistaFroxelInjectionRW 指向的那张。留一个没人用的 RW 绑定点
+        // 等于「一段永远不会被发现写错的代码」。
         public static readonly int _VistaFroxelInjectionRW        = Shader.PropertyToID("_VistaFroxelInjectionRW");
         public static readonly int _VistaFroxelInjectionRead      = Shader.PropertyToID("_VistaFroxelInjectionRead");
-        public static readonly int _VistaFroxelInjectionHistoryRW = Shader.PropertyToID("_VistaFroxelInjectionHistoryRW");
         public static readonly int _VistaFroxelInjectionHistory   = Shader.PropertyToID("_VistaFroxelInjectionHistory");
         public static readonly int _VistaFroxelIntegralRW         = Shader.PropertyToID("_VistaFroxelIntegralRW");
         public static readonly int _VistaFroxelIntegral           = Shader.PropertyToID("_VistaFroxelIntegral");

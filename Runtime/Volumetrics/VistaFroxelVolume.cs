@@ -6,7 +6,8 @@ using UnityEngine.Rendering;
 namespace Vista
 {
     /// <summary>
-    /// 近层体积雾的 froxel 体资源持有者：三张 3D 表 + 一个判据报告 buffer。
+    /// 近层体积雾的 froxel 体资源持有者：三张 3D 表（注入表双缓冲 + 积分表）
+    /// + 三个判据报告 buffer。
     ///
     /// 为什么单独一个类而不是继续塞进 <see cref="VistaAtmosphereLuts"/>：那边持有的七张表
     /// 全部是「大气」的，生命周期由 <c>VistaAtmosphereParameters</c> 的脏检查驱动；
@@ -16,9 +17,6 @@ namespace Vista
     ///
     /// 但它由 <see cref="VistaAtmosphereLuts"/> **持有**（作为字段），
     /// 这样 <see cref="VistaImmediateLutDispatcher"/> 解析槽位时仍然只有一个入口。
-    ///
-    /// #19 阶段这个类只被 Editor 自检驱动 —— RenderGraph pass 的接线在 #20，
-    /// 那时才会有真正要写进这三张表的内容。
     /// </summary>
     public sealed class VistaFroxelVolume : IDisposable
     {
@@ -36,17 +34,21 @@ namespace Vista
         public const int k_IntegrationReportFloat4PerSlice = 4;
 
         /// <summary>
-        /// 阴影覆盖性探针的槽位数（#20，#21 追加到 19）。必须与 <c>VolumetricFog.compute</c> 里
-        /// <c>VISTA_PROBE_*</c> 那组下标的最大值 + 1 一致 —— 少一个的症状是
-        /// 最后一个槽位的 Interlocked 写越界，而 D3D11 上越界 UAV 写是**静默丢弃**，
+        /// 阴影覆盖性探针的槽位数（#20 起 19，#22a 追加重投影的 14 格到 33）。必须与
+        /// <c>VolumetricFog.compute</c> 里 <c>VISTA_PROBE_*</c> 那组下标的最大值 + 1 一致 ——
+        /// 少一个的症状是最后一个槽位的 Interlocked 写越界，而 D3D11 上越界 UAV 写是**静默丢弃**，
         /// 判据会读到一个恒为初值的格子并把它当成「这一路没执行」。
         /// </summary>
-        public const int k_ShadowProbeSlots = 19;
+        public const int k_ShadowProbeSlots = 33;
 
         // 探针里三个走 InterlockedMin 的槽位
         // （SHADOW_MIN = 0, SHADOWMAP_MIN = 8, SEG_X_MIN = 17）。
         // 下标写在这里而不是只写在 shader 里：重置函数必须把它们填成 uint.MaxValue，
         // 而填错的症状是 min 恒为 0 —— 那会把「一个点都没被遮」伪装成「全被遮」。
+        //
+        // #22a 追加的 14 格（19~32）全部是 Add / Or / Max，没有新的 min 槽位 ——
+        // 于是这个数组不用动。这句话是**结论**而不是省事：如果哪天加了一格 min
+        // 却忘了登记，它的读数会恒为 0，而 0 在那些格子里是合法读数。
         static readonly int[] k_ShadowProbeMinSlots = { 0, 8, 17 };
 
         readonly ComputeShader m_Cs;
@@ -57,9 +59,29 @@ namespace Vista
         readonly int m_KernelIntegrationIdx = -1;
         readonly int m_KernelSynthMediumIdx = -1;
         readonly int m_KernelIntegralVerifyIdx = -1;
+        readonly int m_KernelReprojProbeIdx = -1;
 
-        RTHandle m_Injection;
-        RTHandle m_InjectionHistory;
+        // 注入表是**双缓冲**（#22）：本帧写一张、读另一张做时间重投影。
+        //
+        // 为什么是一个数组 + 写下标，而不是每帧交换 m_Injection / m_InjectionHistory 两个字段：
+        // 交换字段的话，同一个 RTHandle 的名字会在两帧之间来回改变归属 ——
+        // profiler 与 RenderDoc 里那两行会交替代表不同的角色，而「这一帧的注入表是哪张」
+        // 变成一个只能靠数帧数推断的事。数组 + 下标让名字（Injection[0]/[1]）恒定，
+        // 角色由下标表达，抓帧时对着 dispatch 参数就能读出来。
+        //
+        // 积分表**不**双缓冲：它是「从相机走到这里」的累积量，重投影它在物理上没有意义
+        // （理由写在 VistaVolumetricFogSettings.enableInjection 的 tooltip 里）。
+        readonly RTHandle[] m_InjectionBuffers = new RTHandle[2];
+        int m_WriteIndex;
+
+        // 上一次注入派发写的是哪个下标；-1 = 自上次重分配以来一次都没派发过。
+        //
+        // 为什么记「下标」而不是记「写过几帧」：历史表要有内容，条件是
+        // **上一次写正好落在现在的历史槽上**。用计数的话，「交换了两次却只派发了一次」
+        // （某一帧的 pass 被跳过）会被判成历史有效，读到的却是两帧前的表 ——
+        // 而那正是一个「看起来物理上讲得通的漂移」。记下标让这个条件成为恒等比较。
+        int m_LastWrittenIndex = -1;
+
         RTHandle m_Integral;
         GraphicsBuffer m_SliceReport;
         GraphicsBuffer m_ShadowProbe;
@@ -92,20 +114,23 @@ namespace Vista
                 m_KernelSynthMediumIdx = m_Cs.FindKernel("FroxelSynthMedium");
             if (m_Cs.HasKernel("FroxelIntegralVerify"))
                 m_KernelIntegralVerifyIdx = m_Cs.FindKernel("FroxelIntegralVerify");
+            if (m_Cs.HasKernel("FroxelReprojProbe"))
+                m_KernelReprojProbeIdx = m_Cs.FindKernel("FroxelReprojProbe");
         }
 
         /// <summary>
-        /// 七个核都在。分开判「资源在不在」（<see cref="isAllocated"/>）与「核在不在」，
+        /// 八个核都在。分开判「资源在不在」（<see cref="isAllocated"/>）与「核在不在」，
         /// 理由与 <c>VistaAtmosphereLuts</c> 那四个独立的 valid 属性相同：
         /// 前者是每帧可变的状态，后者在构造之后就是常量，混成一个属性
         /// 会让「shader 编译坏了」与「这一帧还没分配」在日志上长得一样。
         ///
-        /// 要求**全部都在**而不是按核分成七个属性：它们在同一个 .compute 文件里，
-        /// 一个编译失败就是七个都没有。真正会出现的「部分缺失」只有一种 ——
+        /// 要求**全部都在**而不是按核分成八个属性：它们在同一个 .compute 文件里，
+        /// 一个编译失败就是八个都没有。真正会出现的「部分缺失」只有一种 ——
         /// #pragma kernel 那行写错了名字 —— 那时按整体判会让整条近层雾路径退出，
-        /// 比让六个核继续跑、第七个安静地什么都不做要好归因。
+        /// 比让七个核继续跑、第八个安静地什么都不做要好归因。
         ///
-        /// 两个自检核（SynthMedium / IntegralVerify）也算进来，尽管线上路径不派发它们：
+        /// 三个自检核（SynthMedium / IntegralVerify / ReprojProbe）也算进来，
+        /// 尽管线上路径不派发它们：
         /// 「一个默认关闭、又没有判据覆盖的开关，等于一段永远不会被发现写错的代码」——
         /// 把它们纳入 isValid，核名写错就会在**第一次真实渲染**时报出来，
         /// 而不是等到有人去点那个菜单项。
@@ -114,12 +139,39 @@ namespace Vista
             && m_KernelPlaceholderIdx >= 0 && m_KernelSliceVerifyIdx >= 0
             && m_KernelInjectionIdx >= 0 && m_KernelShadowProbeIdx >= 0
             && m_KernelIntegrationIdx >= 0 && m_KernelSynthMediumIdx >= 0
-            && m_KernelIntegralVerifyIdx >= 0;
+            && m_KernelIntegralVerifyIdx >= 0 && m_KernelReprojProbeIdx >= 0;
 
-        public bool isAllocated => m_Injection != null && m_InjectionHistory != null && m_Integral != null;
+        public bool isAllocated => m_InjectionBuffers[0] != null && m_InjectionBuffers[1] != null
+            && m_Integral != null;
 
-        public RTHandle injection => m_Injection;
-        public RTHandle injectionHistory => m_InjectionHistory;
+        /// <summary>本帧要写的那张注入表。</summary>
+        public RTHandle injection => m_InjectionBuffers[m_WriteIndex];
+
+        /// <summary>上一帧写过的那张注入表（时间重投影的历史源）。</summary>
+        public RTHandle injectionHistory => m_InjectionBuffers[1 - m_WriteIndex];
+
+        /// <summary>
+        /// 历史表里是否有**上一帧写进去的**内容。false 时重投影必须走纯本帧
+        /// （混合权重 1），而不是去混一张未初始化的显存。
+        ///
+        /// 这里只回答「这张表被派发过没有」。历史内容与本帧是不是同一个相机、
+        /// 同一个矩阵，是 <see cref="VistaFroxelReprojection"/> 的职责 ——
+        /// 分开是因为前者由资源生命周期决定，后者由视图状态决定，
+        /// 合成一个 bool 会让「换了相机」与「刚重分配」在日志上长得一样。
+        /// </summary>
+        public bool historyContentValid => isAllocated && m_LastWrittenIndex == 1 - m_WriteIndex;
+
+        /// <summary>
+        /// 本帧写的是双缓冲里的哪一张（0/1）。判据的状态行印它，是为了让
+        /// 「交换了两次却只派发了一次」这类错配有一个能看的数 ——
+        /// 那种错配的症状是 <see cref="historyContentValid"/> 恒 false，
+        /// 而在画面上它只表现为「累积没生效」，与「历史权重被填成 0」无法区分。
+        /// </summary>
+        public int injectionWriteIndex => m_WriteIndex;
+
+        /// <summary>最后一次被注入核写过的那张的下标；−1 = 从未写过。</summary>
+        public int lastWrittenIndex => m_LastWrittenIndex;
+
         public RTHandle integral => m_Integral;
         public GraphicsBuffer sliceReportBuffer => m_SliceReport;
         public GraphicsBuffer shadowProbeBuffer => m_ShadowProbe;
@@ -180,6 +232,31 @@ namespace Vista
             }
 
             return true;
+        }
+
+        /// <summary>
+        /// 交换注入表的读写角色。**每帧在录制阶段调用一次**，且必须在录制注入 pass
+        /// 之前 —— 那一趟要把 <see cref="injection"/> 声明成写、<see cref="injectionHistory"/>
+        /// 声明成读，交换晚一步就等于自己读自己（同一张纹理同时绑 UAV 与 SRV 是 UB）。
+        ///
+        /// 为什么不放在 <see cref="Prepare"/> 里顺手做：Prepare 也被立即模式的自检调用，
+        /// 而自检里根本没有「上一帧」。让交换成为调用方的一行显式代码，
+        /// 「谁在推进时间」在渲染路径里就读得出来；藏进 Prepare 的后果是自检每跑一次
+        /// 就把写下标翻一次，两次连续运行读到的会是两张不同的表 ——
+        /// 那种不稳定在判据里表现为「隔次失败」。
+        /// </summary>
+        public void SwapInjectionBuffers()
+        {
+            m_WriteIndex = 1 - m_WriteIndex;
+        }
+
+        /// <summary>
+        /// 记一次「注入核确实派发到了这张表上」。由 <see cref="DispatchInjection"/> 自己调，
+        /// 外部不需要管 —— 单独提出来只是为了让计数的推进点在源码里可搜。
+        /// </summary>
+        void NoteInjectionDispatched()
+        {
+            m_LastWrittenIndex = m_WriteIndex;
         }
 
         /// <summary>
@@ -325,10 +402,24 @@ namespace Vista
 
             dispatcher.SetTexture(m_Cs, m_KernelInjectionIdx,
                 VistaShaderIDs._VistaFroxelInjectionRW, VistaLutSlot.FroxelInjection);
+
+            // 历史表（#22a）。**无条件绑**，不看 historyContentValid ——
+            // 「关掉 = 零态」在这里的形式是：混合权重为 0 时核里一次采样都不发
+            // （见 VistaFroxelFetchHistory 的早退），所以绑上一张内容无意义的表是安全的；
+            // 而不绑会每帧刷一条 Property _VistaFroxelInjectionHistory is not set，
+            // 并且让「首帧」与「绑错了」在日志上长得一样。
+            dispatcher.SetTexture(m_Cs, m_KernelInjectionIdx,
+                VistaShaderIDs._VistaFroxelInjectionHistory, VistaLutSlot.FroxelInjectionHistory);
+
             dispatcher.Dispatch(m_Cs, m_KernelInjectionIdx,
                 VistaComputeUtils.DivRoundUp(desc.width, 8),
                 VistaComputeUtils.DivRoundUp(desc.height, 8),
                 desc.depth);
+
+            // 记在**派发之后**：早退的那几条（!isValid / !isAllocated）不该推进它。
+            // 推进错的症状是下一帧把一张没写过的表当历史混进去，
+            // 而 fp16 的未初始化显存可能是 NaN —— 一进表就永久驻留。
+            NoteInjectionDispatched();
         }
 
         /// <summary>
@@ -459,11 +550,64 @@ namespace Vista
                 VistaComputeUtils.DivRoundUp(desc.depth, 64), 1, 1);
         }
 
+        /// <summary>
+        /// #22a 的重投影覆盖性探针。四个角色由 <paramref name="role"/> 选，
+        /// 各写进互不重叠的槽位区间（见 shader 里 <c>VISTA_PROBE_REPROJ_*</c>）。
+        ///
+        /// **角色 1 必须第一个派发**（由调用方保证）：角色 2~4 会覆盖
+        /// <c>VistaFroxelReprojCB</c> 里的上一帧矩阵/范围/相机位置，而角色 1 要量的
+        /// 正是注入核这一帧实际吃进去的那一份 ——
+        /// 「参考解要用被测核实际吃进去的那份输入」。
+        ///
+        /// 同一条理由下，这里**不重推** <c>_VistaFroxelCameraWS</c>（与
+        /// <see cref="DispatchShadowProbe"/> 一致）：格心位置必须与注入核算出来的逐位相同。
+        /// 在这里重推等于让判据自带一份布景，于是「注入拿到的相机位置是错的」
+        /// 这条失效会被探针自己抹平。
+        ///
+        /// 两张静态大气表 + SH 逐核显式绑：角色 1 要跑两次 <c>VistaFroxelInject</c>
+        /// 去量抖动的亮度散布，读数依赖它们。理由与 <see cref="DispatchInjection"/>
+        /// 里那段相同（Task #7 的旧账：依赖「Sky-View 一定先跑」的那一版里，
+        /// 改相机高度与太阳角度一个读数都不动，而且不报错）。
+        /// </summary>
+        public void DispatchReprojProbe<T>(in T dispatcher, Vector3 displacement, int role)
+            where T : IVistaLutDispatcher
+        {
+            if (!isValid || !isAllocated || m_ShadowProbe == null) return;
+
+            // 角色 0 在 shader 里会整核早退（那一条是第二道闸）。这里先挡住，
+            // 是为了让「调用方算错了角色编号」的症状是一次都不派发（计数为 0，判据红），
+            // 而不是一次什么都不做的派发（同样计数为 0，但多花一趟 dispatch）。
+            if (role <= 0) return;
+
+            dispatcher.SetGlobalVector(VistaShaderIDs._VistaFroxelReprojProbe,
+                new Vector4(displacement.x, displacement.y, displacement.z, role));
+
+            dispatcher.SetTexture(m_Cs, m_KernelReprojProbeIdx,
+                VistaShaderIDs._VistaTransmittanceLut, VistaLutSlot.Transmittance);
+            dispatcher.SetTexture(m_Cs, m_KernelReprojProbeIdx,
+                VistaShaderIDs._VistaMultiScatteringLut, VistaLutSlot.MultiScattering);
+            dispatcher.SetBuffer(m_Cs, m_KernelReprojProbeIdx,
+                VistaShaderIDs._VistaSkyAmbientSh, VistaLutBufferSlot.SkyAmbientSh);
+
+            dispatcher.SetTexture(m_Cs, m_KernelReprojProbeIdx,
+                VistaShaderIDs._VistaFroxelInjectionHistory, VistaLutSlot.FroxelInjectionHistory);
+            dispatcher.SetBuffer(m_Cs, m_KernelReprojProbeIdx,
+                VistaShaderIDs._VistaFroxelShadowProbeRW, VistaLutBufferSlot.FroxelShadowProbe);
+            // 32×32×16 / numthreads(8,8,1)
+            dispatcher.Dispatch(m_Cs, m_KernelReprojProbeIdx, 4, 4, 16);
+        }
+
         void Allocate(in VistaFroxelVolumeDesc desc)
         {
-            m_Injection = AllocVolume(desc, "VistaFroxelInjection");
-            m_InjectionHistory = AllocVolume(desc, "VistaFroxelInjectionHistory");
+            m_InjectionBuffers[0] = AllocVolume(desc, "VistaFroxelInjection[0]");
+            m_InjectionBuffers[1] = AllocVolume(desc, "VistaFroxelInjection[1]");
             m_Integral = AllocVolume(desc, "VistaFroxelIntegral");
+
+            // 新分配出来的是未初始化显存。写下标**不**归零：归零会让重分配
+            // 顺带改变「本帧写哪张」，而那件事与分配无关；真正必须归零的是
+            // 「上一次写在哪张」—— 否则重分配后的第一帧会把未初始化的显存当历史混进去，
+            // 症状是一帧花屏（fp16 的垃圾值可能是 NaN，会顺着 lerp 污染累积）。
+            m_LastWrittenIndex = -1;
         }
 
         static RTHandle AllocVolume(in VistaFroxelVolumeDesc desc, string name)
@@ -496,13 +640,14 @@ namespace Vista
 
         public void Release()
         {
-            m_Injection?.Release();
-            m_Injection = null;
-            m_InjectionHistory?.Release();
-            m_InjectionHistory = null;
+            m_InjectionBuffers[0]?.Release();
+            m_InjectionBuffers[0] = null;
+            m_InjectionBuffers[1]?.Release();
+            m_InjectionBuffers[1] = null;
             m_Integral?.Release();
             m_Integral = null;
             m_Allocated = null;
+            m_LastWrittenIndex = -1;
         }
 
         public void Dispose()

@@ -70,6 +70,23 @@ namespace Vista
             public bool froxelShadowmapBound;
             /// <summary>本帧要不要跑覆盖性探针（仅 Editor 自检请求时为 true）。</summary>
             public bool froxelProbeRequested;
+
+            // ---- 时间重投影与抖动（#22a）----
+            /// <summary>
+            /// 本帧下发给注入核的那一组重投影 uniform。零态 = 纯本帧、无抖动，
+            /// 所以这个字段永远有合法值，不需要一个「要不要下发」的布尔。
+            /// </summary>
+            public VistaFroxelReprojection.Data froxelReproj;
+            /// <summary>
+            /// 探针专用：把上一帧覆盖成本帧的那一份。只有 Editor 的探针 pass 读它。
+            /// </summary>
+            public VistaFroxelReprojection.Data froxelReprojIdentity;
+            /// <summary>
+            /// 探针专用：算合成位移要的相机朝向。存相机引用而不是预先算好三个位移，
+            /// 是为了让「位移是怎么定的」与它旁边那段推导待在同一处
+            /// （见 <c>RenderFroxelReprojProbe</c>）。
+            /// </summary>
+            public Camera froxelReprojCamera;
         }
 
         /// <summary>
@@ -111,6 +128,19 @@ namespace Vista
         /// 换了数字就该再报一次。
         /// </summary>
         string m_LastFroxelClampDiagnostic;
+
+        /// <summary>
+        /// 近层体的时间重投影状态（#22a）。pass 持有它而不是 <see cref="VistaFroxelVolume"/>：
+        /// 那个类被立即模式的自检直接调用（<c>Prepare</c> / 各 Dispatch），而「上一帧」
+        /// 这个概念只在有渲染循环时才存在。放在这里，「自检路径看到的是零态」
+        /// 由代码保证 —— 那正是 <c>_WorldSpaceCameraPos</c> 被绕开的同一条理由。
+        ///
+        /// 双缓冲的**交换**也在这里驱动（记录期一次），见 <see cref="RecordRenderGraph"/>。
+        /// </summary>
+        readonly VistaFroxelReprojection m_Reproj = new VistaFroxelReprojection();
+
+        /// <summary>供 Editor 自检读状态（失效原因、连续有效帧数、帧号）。</summary>
+        public VistaFroxelReprojection reprojection => m_Reproj;
 
         /// <summary>
         /// CPU 侧的环境光出口。pass 持有它而不是 feature：它的驱动时机就是记录期，
@@ -216,6 +246,34 @@ namespace Vista
                 froxelEnabled = m_Luts.froxelVolume.Prepare(froxelDesc, null);
             }
 
+            // ---------------------------------------------------------------- 双缓冲交换 + 重投影状态（#22a）
+            // 交换在**记录期、一帧一次**，而且必须在读 historyContentValid 之前：
+            // 交换之后 injection 指向本帧要写的那张、injectionHistory 指向上一帧写过的那张，
+            // 而 historyContentValid 判的是「上一帧写的那张真的被写过」。
+            //
+            // 为什么不放在 VistaFroxelVolume.Prepare 里：Prepare 也被立即模式的自检调用，
+            // 于是自检每跑一次就翻一次写下标 —— 症状是判据隔次失败。
+            // 「把交换藏进 Prepare」这条坑在 SwapInjectionBuffers 的注释里点过名。
+            var froxelReproj = VistaFroxelReprojection.Data.disabled;
+            var froxelReprojIdentity = VistaFroxelReprojection.Data.disabled;
+            if (froxelEnabled)
+            {
+                m_Luts.froxelVolume.SwapInjectionBuffers();
+
+                froxelReproj = m_Reproj.Update(
+                    cameraData.camera, froxelDesc,
+                    m_Luts.froxelVolume.historyContentValid,
+                    m_VolumetricFog,
+                    // unscaledDeltaTime 而不是 deltaTime：时间缩放（子弹时间）不该改雾的
+                    // 收敛速度 —— 那会让慢动作里的残影变长。
+                    Time.unscaledDeltaTime);
+
+#if UNITY_EDITOR
+                froxelReprojIdentity = VistaFroxelReprojection.MakeStaticIdentityData(
+                    cameraData.camera, froxelDesc, m_VolumetricFog);
+#endif
+            }
+
             var view = VistaAtmosphereViewData.Create(
                 m_Parameters,
                 cameraData.camera.transform.position,
@@ -251,13 +309,19 @@ namespace Vista
             var skyAmbientSh    = m_Luts.skyAmbientShBuffer != null
                 ? renderGraph.ImportBuffer(m_Luts.skyAmbientShBuffer) : default;
 
-            // 近层体导入**这一节真会写的那两张**：注入（#20）与积分（#21）。
-            // 历史表（#22 时间重投影）留成 default —— 它在 VistaLutHandles 里有槽位，
-            // 但本节没有任何 pass 绑它。刻意不「顺手一起导入」：一个被导入却没人 Use
-            // 的资源会让 RenderGraph 的依赖图上多出一条不存在的边，也会让
-            // 「这条写入路径未被覆盖」这件事在代码里看不出来。判据里有一条点名它的 ⓘ。
+            // 近层体的三张表。历史表（#22a）与本帧的注入表是**两张不同的资源**，
+            // 由 SwapInjectionBuffers 每帧对调 —— 所以这里是两次 ImportTexture，
+            // 而不是「同一个 RTHandle 导入两次」（那会在图里产生两条互不相识的
+            // 资源记录指向同一块显存，本项目在反射那张中转表上吃过这条）。
+            //
+            // 首帧 / 刚重分配时 injectionHistory 里的内容是无意义的，但**照样导入**：
+            // 「关掉 = 零态」在这里的形式是核内的历史权重为 0 ⇒ 一次采样都不发
+            // （见 VistaFroxelFetchHistory 的早退）。按 historyContentValid 条件导入的话，
+            // 「首帧」与「绑错了」在日志上会长得一样。
             var froxelInjection = froxelEnabled
                 ? renderGraph.ImportTexture(m_Luts.froxelVolume.injection) : default;
+            var froxelInjectionHistory = froxelEnabled
+                ? renderGraph.ImportTexture(m_Luts.froxelVolume.injectionHistory) : default;
             var froxelIntegral  = froxelEnabled
                 ? renderGraph.ImportTexture(m_Luts.froxelVolume.integral) : default;
 
@@ -523,13 +587,20 @@ namespace Vista
                     data.multiScattering = multiScattering;
                     data.skyAmbientSh = skyAmbientSh;
                     data.froxelInjection = froxelInjection;
+                    data.froxelInjectionHistory = froxelInjectionHistory;
                     data.froxelDesc = froxelDesc;
                     data.froxelCameraWS = froxelCameraWS;
                     data.froxelShadowmapBound = shadowmapBound;
+                    data.froxelReproj = froxelReproj;
 
                     builder.UseTexture(transmittance, AccessFlags.Read);
                     builder.UseTexture(multiScattering, AccessFlags.Read);
                     builder.UseTexture(froxelInjection, AccessFlags.Write);
+                    // 历史表是 Read（SRV）。这条声明是「本帧的写 → 下一帧的读」在图里
+                    // 唯一的依据：两张资源都是 import 进来的持久 RTHandle，
+                    // 少了它，D3D11 上照样能跑（隐式状态转换），Vulkan/Metal 上
+                    // 就是一次缺失的 UAV→SRV barrier —— 症状是历史里偶尔混进半张旧内容。
+                    builder.UseTexture(froxelInjectionHistory, AccessFlags.Read);
                     // 雾的天光环境项（VistaSkyAmbientMean）要读它。判空的理由同 AP pass。
                     if (skyAmbientSh.IsValid())
                         builder.UseBuffer(skyAmbientSh, AccessFlags.Read);
@@ -553,7 +624,7 @@ namespace Vista
                         d.luts.RenderFroxelInjection(
                             new VistaGraphLutDispatcher(ctx.cmd, Handles(d)),
                             d.view, d.fogSettings, d.froxelDesc,
-                            d.froxelCameraWS, d.froxelShadowmapBound));
+                            d.froxelCameraWS, d.froxelShadowmapBound, d.froxelReproj));
                 }
 
                 // 深度积分（#21）。**必须是独立的一趟 pass**：它把注入表当 SRV 读，
@@ -642,6 +713,58 @@ namespace Vista
                         builder.SetRenderFunc((LutPassData d, ComputeGraphContext ctx) =>
                             d.luts.RenderFroxelShadowProbe(
                                 new VistaGraphLutDispatcher(ctx.cmd, Handles(d)), d.view));
+                    }
+
+                    // 重投影的覆盖性探针（#22a）。**又是一趟独立的 pass**，
+                    // 而且必须排在阴影探针之后：那一趟会往同一个 buffer 的 0~18 号槽位写，
+                    // 本趟写 19~32。挤在一起没有正确性问题（槽位不重叠），
+                    // 但分开才能让「哪一趟没跑」在报表上按槽位区间显形。
+                    //
+                    // 与阴影探针的关键区别：本趟要读**历史表**，而它这一帧刚被注入那趟
+                    // 当过 SRV。声明成 Read 与那一趟一致，图不需要额外的状态转换。
+                    using (var builder = renderGraph.AddComputePass<LutPassData>(
+                               "Vista Froxel Reproj Probe", out var data))
+                    {
+                        data.luts = m_Luts;
+                        data.view = view;
+                        data.fogSettings = m_FogSettings;
+                        data.transmittance = transmittance;
+                        data.multiScattering = multiScattering;
+                        data.skyAmbientSh = skyAmbientSh;
+                        data.froxelInjection = froxelInjection;
+                        data.froxelInjectionHistory = froxelInjectionHistory;
+                        data.froxelShadowProbe = froxelShadowProbe;
+                        data.froxelDesc = froxelDesc;
+                        data.froxelReprojIdentity = froxelReprojIdentity;
+                        data.froxelReprojCamera = cameraData.camera;
+                        data.froxelProbeRequested = true;
+
+                        // 角色 1 会跑两次 VistaFroxelInject（量抖动自己的亮度散布），
+                        // 所以大气那两张表与天光 SH 都要声明。
+                        builder.UseTexture(transmittance, AccessFlags.Read);
+                        builder.UseTexture(multiScattering, AccessFlags.Read);
+                        if (skyAmbientSh.IsValid())
+                            builder.UseBuffer(skyAmbientSh, AccessFlags.Read);
+                        builder.UseTexture(froxelInjectionHistory, AccessFlags.Read);
+                        builder.UseBuffer(froxelShadowProbe, AccessFlags.ReadWrite);
+                        if (shadowmapBound)
+                            builder.UseTexture(mainShadows, AccessFlags.Read);
+
+                        // 探针核**不**碰本帧的注入表（它自己现算 VistaFroxelInject，
+                        // 不读回那张表）—— 所以这里刻意不声明 froxelInjection。
+                        // 顺手声明的代价不是性能，是可读性：那会让「本趟读了本帧的表」
+                        // 变成一件读代码读不出来的事，而角色 1 的全部意义在于
+                        // 它算的东西与注入核逐位同源、不是从表里读回来的。
+
+                        // 七趟 dispatch 里有六趟要覆盖 VistaFroxelReprojCB（全局）。
+                        builder.AllowGlobalStateModification(true);
+                        builder.AllowPassCulling(false);
+
+                        builder.SetRenderFunc((LutPassData d, ComputeGraphContext ctx) =>
+                            d.luts.RenderFroxelReprojProbe(
+                                new VistaGraphLutDispatcher(ctx.cmd, Handles(d)),
+                                d.view, d.fogSettings, d.froxelReprojCamera,
+                                d.froxelDesc, d.froxelReprojIdentity));
                     }
                 }
 #endif

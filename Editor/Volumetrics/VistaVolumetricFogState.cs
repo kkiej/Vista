@@ -67,7 +67,25 @@ namespace Vista.EditorTools
         const int k_SlotIntegralNonFinite = 16;
         const int k_SlotSegXMin       = 17;
         const int k_SlotSegXMax       = 18;
-        const int k_SlotTotal         = 19;
+        // ---- #22a 追加：时间重投影的读数 ----
+        // 前三格是「在线」读数（注入核这一帧实际吃进去的那份重投影），
+        // 中间两格是静止恒等性，六格 HIT_* 是失效分支的分类计数，
+        // COVER_COUNT 是守恒式的总数，JITTER_SPREAD 是亮度死区下端的标定输入。
+        const int k_SlotReprojOnlineCount = 19;
+        const int k_SlotReprojOnlineOk    = 20;
+        const int k_SlotReprojOnlineMask  = 21;
+        const int k_SlotReprojStaticCount = 22;
+        const int k_SlotReprojStaticErr   = 23;
+        const int k_SlotReprojStaticMask  = 24;
+        const int k_SlotReprojHitNoHist   = 25;
+        const int k_SlotReprojHitBehind   = 26;
+        const int k_SlotReprojHitOffScr   = 27;
+        const int k_SlotReprojHitRange    = 28;
+        const int k_SlotReprojHitLum      = 29;
+        const int k_SlotReprojHitNaN      = 30;
+        const int k_SlotReprojCoverCount  = 31;
+        const int k_SlotReprojJitterSpread = 32;
+        const int k_SlotTotal         = 33;
 
         const uint k_FlagCascade   = 1u;
         const uint k_FlagShadowmap = 2u;
@@ -131,6 +149,40 @@ namespace Vista.EditorTools
         /// </summary>
         const float k_SeriesThresholdOptimum = 4.113e-2f;
 
+        // ---- #22a：重投影两个定点缩放，与 shader 里的 VistaProbeFixed 调用一一对应 ----
+        const float k_ReprojStaticErrScale = 1.0e9f;
+        const float k_ReprojJitterScale    = 1.0e6f;
+
+        /// <summary>
+        /// 静止恒等性的地板 —— **实测基线，不是推导上界**。
+        ///
+        /// 原先这里写的是一个推导：「相机在原点 1 km 量级内时投影是几个 fp32 ulp（~1e-7），
+        /// log/exp 各再放一次，取 1e-6 做保守上界」。这条推导被第一次实测**证伪**了：
+        /// 本机（RTX 3060 / D3D11、布景 138×74×64）量到 6.962e-6，是那个「上界」的 7 倍。
+        /// 原因也清楚 —— 格心世界坐标到 64 m 量级、decode/encode 各带一次 pow/log
+        /// （超越函数不是半 ulp），放大之后落在 1e-6~1e-5 而不是 1e-7。
+        ///
+        /// 于是照「当推导给不出紧的上限时，诚实地把门标成实测基线」办：取与实测同量级的
+        /// 1e-5 当地板，门仍摆在它与「要拒绝的最小错答案」的几何中点。
+        /// 留着这段被证伪的推导是有用的 —— 它记着「这个量不该被当成 fp32 单次往返」。
+        /// </summary>
+        const float k_ReprojStaticFloorMeasured = 1.0e-5f;
+
+        /// <summary>
+        /// 亮度死区下端与抖动散布的关系。死区下端必须**高于**实测散布，否则抖动
+        /// 自己制造的亮度变化会被判成「场景变了」而降权 —— 那会亲手毁掉它本该
+        /// 保护的累积。这里不设额外余量系数：散布是 max 统计量，本身已经是上界。
+        /// </summary>
+        const string k_JitterDeadbandSymptom = "抖动打开后累积失效、画面比关抖动时更噪";
+
+        // ---- 与 FroxelVolume.hlsl 的 VISTA_REPROJ_* 逐一对应 ----
+        const uint k_ReprojNoHistory = 1u;
+        const uint k_ReprojBehind    = 2u;
+        const uint k_ReprojOffScreen = 4u;
+        const uint k_ReprojOutRange  = 8u;
+        const uint k_ReprojLuminance = 16u;
+        const uint k_ReprojNaN       = 32u;
+
         [MenuItem("Window/Vista/Log Volumetric Fog State", priority = 142)]
         static void RunFromMenu()
         {
@@ -143,7 +195,7 @@ namespace Vista.EditorTools
 
         static void Run(StringBuilder sb)
         {
-            sb.AppendLine("=== Vista 体积雾状态（#20 注入 + #21 积分覆盖性判据）===");
+            sb.AppendLine("=== Vista 体积雾状态（#20 注入 + #21 积分 + #22a 时间重投影 覆盖性判据）===");
 
             var cam = FindGameCamera();
             if (cam == null)
@@ -190,8 +242,9 @@ namespace Vista.EditorTools
             var volume = feature.froxelVolume;
             if (volume == null || !volume.isValid)
             {
-                sb.AppendLine("✘ froxelVolume 不可用：VolumetricFog.compute 缺失，或四个核里有编译不出来的"
-                            + "（FroxelPlaceholder / FroxelSliceVerify / FroxelInjection / FroxelShadowProbe）。");
+                sb.AppendLine("✘ froxelVolume 不可用：VolumetricFog.compute 缺失，或八个核里有编译不出来的"
+                            + "（FroxelPlaceholder / FroxelSliceVerify / FroxelInjection / FroxelShadowProbe / "
+                            + "FroxelIntegration / FroxelSynthMedium / FroxelIntegralVerify / FroxelReprojProbe）。");
                 return;
             }
 
@@ -632,6 +685,208 @@ namespace Vista.EditorTools
                                 : $"换完之后仍有段走 exp 支（x_max {Sci(segXMax)} ≥ x*），两支都有真实帧覆盖。"));
             }
 
+            // ================================================================ #22a 时间重投影
+            {
+                var reproj = feature.froxelReprojection;
+                int depth = volume.allocatedDesc.HasValue ? volume.allocatedDesc.Value.depth : 0;
+
+                settings.ResolveLuminanceReject(out float deadStart, out float deadFull);
+
+                sb.AppendLine("---- #22a 时间重投影 ----");
+                sb.AppendLine($"状态：jitterMode = {settings.jitterMode}"
+                            + $"（横向 {settings.lateralJitterAmount:F2} 格, 深度 {settings.depthJitterAmount:F2} 片）"
+                            + $"，τ = {settings.historyTimeConstant:F3} s"
+                            + $"，亮度死区 [{deadStart:F3}, {deadFull:F3}]"
+                            + $"（滑条 {settings.luminanceRejectStart:F3} / {settings.luminanceRejectFull:F3}）");
+                // 这三个数是**帧后**的读数，与判据⑭那条「帧内」的结论方向相反，
+                // 所以必须自己把这件事说出来：
+                //   historyContentValid ≡ isAllocated && lastWritten == 1 − writeIndex。
+                // 一帧的顺序是「交换 → 判历史 → 注入 → NoteInjectionDispatched」，
+                // 注入那一步把 lastWritten 推成 writeIndex，于是**帧后**这个式子必然为 false。
+                // 只印一个裸的 False，读者会以为它就是被测代码帧内吃进去的那一份，
+                // 症状是判据⑭全绿旁边站着一个看起来矛盾的 False。
+                //
+                // 顺手把它做成一格能失败的判据（⑭c）：帧后 lastWritten == writeIndex
+                // 恰好等价于「本帧的注入核真的派发到了当前写槽上」，
+                // 而它为假就是「交换了两次却只派发了一次」那个错配 ——
+                // 那个错配在画面上只表现为「累积没生效」，与「历史权重被填成 0」无法区分。
+                bool injectDispatched = volume.lastWrittenIndex == volume.injectionWriteIndex;
+                sb.AppendLine($"  双缓冲（**帧后**读数）：写下标 = {volume.injectionWriteIndex}, "
+                            + $"最后被写过的 = {volume.lastWrittenIndex}, "
+                            + $"historyContentValid = {volume.historyContentValid}");
+                if (settings.enableInjection)
+                {
+                    sb.AppendLine($"{Mark(injectDispatched)}判据⑭c 帧后写槽一致（注入核确实派发到了本帧的写槽上）："
+                                + $"lastWritten {volume.lastWrittenIndex} == writeIndex {volume.injectionWriteIndex}"
+                                + $" ⇒ 帧后 historyContentValid 必然为 **False**，实测 {volume.historyContentValid}。");
+                    sb.AppendLine("  ⓘ 这一格的绿是「帧后 False」，判据⑭的绿是「帧内 True」—— 两者不矛盾，"
+                                + "是同一个量在一帧的两端。这里若读到 True，说明本帧交换过但没派发注入，"
+                                + "症状是累积永远不生效。");
+                }
+                else
+                {
+                    sb.AppendLine("  空判据点名：enableInjection = false ⇒ 注入核这一帧没派发，"
+                                + "判据⑭c（帧后写槽一致）无法判 —— 不是绿，是没跑。");
+                }
+
+                if (reproj == null)
+                {
+                    sb.AppendLine("✘ feature.froxelReprojection 为 null：VistaAtmospherePass 还没被 new 出来。"
+                                + "下面判据⑬⑭⑮全部无法判 —— 不是「未覆盖」，是尺子缺了。");
+                }
+                else
+                {
+                    string reason = reproj.lastInvalidReason;
+                    bool historyLive = reason == null;
+                    sb.AppendLine($"  CPU 侧：frameIndex = {reproj.frameIndex}, "
+                                + $"prevCapturedAtFrame = {reproj.prevCapturedAtFrame}, "
+                                + $"framesSinceValid = {reproj.framesSinceValid}, "
+                                + $"失效原因 = {reason ?? "（无，历史在用）"}");
+
+                    // ---------------------------------------------------------- 判据⑬ 静止恒等性
+                    // 三个数并排印：地板上界、实测、要拒绝的最小错答案。
+                    // 门摆在「地板上界」与「最小错答案」的几何中点 ——
+                    // 那个最小错答案是重投影漏掉半个纹素（0.5/N），它静止时逐位正确、
+                    // 只有相机沿视线移动才露出拖影，所以判据必须自己把它挡住。
+                    float staticErr   = raw[k_SlotReprojStaticErr] / k_ReprojStaticErrScale;
+                    float halfTexel   = depth > 0 ? 0.5f / depth : 0f;
+                    float staticGate  = Mathf.Sqrt(k_ReprojStaticFloorMeasured
+                                                 * Mathf.Max(halfTexel, k_ReprojStaticFloorMeasured));
+                    uint  staticCount = raw[k_SlotReprojStaticCount];
+                    uint  staticMask  = raw[k_SlotReprojStaticMask];
+
+                    bool staticOk = staticCount == (uint)k_ProbeCountExpected
+                                 && staticMask == 0u
+                                 && staticErr <= staticGate;
+                    sb.AppendLine($"{Mark(staticOk)}判据⑬ 静止恒等性（prev 覆盖成 current ⇒ 格心必须投回自己那一格的纹素中心）："
+                                + $"max|Δuvw| = {Sci(staticErr)}，门 {Sci(staticGate)}，"
+                                + $"样本 {staticCount}/{k_ProbeCountExpected}，掩码 OR = 0x{staticMask:X}（必须 0）");
+                    sb.AppendLine($"  ⓘ 地板 {Sci(k_ReprojStaticFloorMeasured)}（**实测基线**，不是推导上界："
+                                + "原先按「fp32 投影 + log/exp 一次往返 ≈ 1e-6」推，被第一次实测证伪 —— "
+                                + "格心到 64 m 量级、decode/encode 各带一次超越函数，实际落在 1e-6~1e-5），"
+                                + $"要拒绝的最小错答案 {Sci(halfTexel)}（= 0.5/N，N = {depth}：重投影漏掉那半个纹素），"
+                                + "门取两者的几何中点。裕度 "
+                                + $"{Sci(staticGate - staticErr)}（带符号）；"
+                                + $"实测离地板 ×{(staticErr > 0f ? k_ReprojStaticFloorMeasured / staticErr : 0f):F2}"
+                                + $"，离最小错答案 ×{(staticErr > 0f ? halfTexel / staticErr : 0f):F0}。");
+                    sb.AppendLine("  ⓘ 这一格是**必要不充分**的：prev = current 时恒等成立，"
+                                + "不证明 prev ≠ current 时那份矩阵真是上一帧的 —— 补上另一半的是判据⑭。"
+                                + "xy 之所以是**精确恒等**而不是近似：视锥四角取在 z = 1 平面上且未归一化"
+                                + "（CalculateFrustumCorners(rect, 1f, ...)），而 viewProj 由 "
+                                + "VistaFroxelReprojection.ViewProjOf 单点构造、同源于 camera.projectionMatrix。"
+                                + "谁手工覆盖投影矩阵，这一格就会红 —— 那正是想要的红。");
+
+                    // ---------------------------------------------------------- 判据⑭ 上一帧的新鲜度
+                    // 「捕获写在算完 data 之后」这条因果没法直接读出来，但它有一个
+                    // 可失败的等价形式：若捕获挪到前面，Update 里那条
+                    // 「prevCapturedAtFrame != frameIndex − 1」的谓词就会命中，
+                    // 于是 lastInvalidReason 非 null、historyWeight 归零。
+                    // 所以在一个稳态帧上 reason == null 就是那条顺序的证据。
+                    long expectCaptured = (long)reproj.frameIndex;
+                    bool capturedOk = reproj.prevCapturedAtFrame == expectCaptured;
+                    bool freshOk = capturedOk && historyLive && reproj.framesSinceValid >= 1;
+                    sb.AppendLine($"{Mark(freshOk)}判据⑭ 上一帧视图的新鲜度："
+                                + $"prevCapturedAtFrame {reproj.prevCapturedAtFrame} == frameIndex {expectCaptured}"
+                                + $"（本帧末尾捕获过）{Mark(capturedOk)}，"
+                                + $"framesSinceValid = {reproj.framesSinceValid} ≥ 1，"
+                                + $"失效原因为空 = {historyLive}");
+                    if (!freshOk)
+                        sb.AppendLine($"  ⚠ 本帧历史不在用（原因：{reason ?? "捕获帧号对不上"}）。"
+                                    + "自检连渲了两帧，第二帧本该是稳态 —— 若原因是"
+                                    + "「历史表这一帧还没被写过」，说明双缓冲交换与注入派发的次数不匹配"
+                                    + "（交换了两次却只派发了一次），看上面那两个下标。");
+
+                    // ---------------------------------------------------------- 在线读数（CPU ↔ GPU 一致性）
+                    uint onlineCount = raw[k_SlotReprojOnlineCount];
+                    uint onlineOk    = raw[k_SlotReprojOnlineOk];
+                    uint onlineMask  = raw[k_SlotReprojOnlineMask];
+                    bool maskHasNoHist = (onlineMask & k_ReprojNoHistory) != 0u;
+
+                    // 双向：CPU 说历史在用 ⇒ GPU 不该有一个 NO_HISTORY，且至少有一格 OK；
+                    //       CPU 说历史不在用 ⇒ GPU 必须全是 NO_HISTORY。
+                    // 写成双向而不是单向，是为了让「jitterMode = Off」这种合法配置
+                    // 也走一条能失败的判据，而不是变成一格空判据。
+                    bool onlineConsistent = onlineCount == (uint)k_ProbeCountExpected
+                        && (historyLive ? (!maskHasNoHist && onlineOk > 0u)
+                                        : (maskHasNoHist && onlineOk == 0u));
+                    sb.AppendLine($"{Mark(onlineConsistent)}判据⑭b 在线读数与 CPU 状态一致："
+                                + $"样本 {onlineCount}/{k_ProbeCountExpected}，"
+                                + $"OK {onlineOk}，掩码 OR = 0x{onlineMask:X}"
+                                + $"（CPU 说历史{(historyLive ? "在用 ⇒ 掩码里不许有 NO_HISTORY 且 OK > 0" : "不在用 ⇒ 必须全是 NO_HISTORY")}）");
+                    sb.AppendLine("  ⓘ 这一格是那条「一个字节都没下发」的失效的唯一出口："
+                                + "探针角色 1 跑在任何 reproj.Bind **之前**，读到的就是注入核吃进去的那一份。"
+                                + "cbuffer 没下发时零态 = 历史权重 0 ⇒ 全是 NO_HISTORY，而 CPU 侧说历史在用 ⇒ 红。");
+
+                    // ---------------------------------------------------------- 判据⑮ 失效路径的覆盖 + 守恒
+                    uint hNoHist = raw[k_SlotReprojHitNoHist];
+                    uint hBehind = raw[k_SlotReprojHitBehind];
+                    uint hOffScr = raw[k_SlotReprojHitOffScr];
+                    uint hRange  = raw[k_SlotReprojHitRange];
+                    uint hLum    = raw[k_SlotReprojHitLum];
+                    uint hNaN    = raw[k_SlotReprojHitNaN];
+                    uint cover   = raw[k_SlotReprojCoverCount];
+
+                    int role3 = feature.froxelReprojProbeRole3Dispatches;
+                    int role4 = feature.froxelReprojProbeRole4Dispatches;
+                    long expect3 = (long)role3 * k_ProbeCountExpected;
+                    long expect4 = (long)role4 * k_ProbeCountExpected;
+                    long sum3 = (long)hNoHist + hBehind + hOffScr + hRange;
+
+                    bool eachHit = hNoHist > 0u && hBehind > 0u && hOffScr > 0u && hRange > 0u
+                                && hLum > 0u && hNaN > 0u;
+                    bool conserved = sum3 == expect3
+                                  && hNaN == (uint)expect4 && hLum == (uint)expect4
+                                  && cover == (uint)(expect3 + expect4);
+                    sb.AppendLine($"{Mark(eachHit && conserved)}判据⑮ 六条失效路径都被驱动过 + 计数守恒："
+                                + $"NO_HISTORY {hNoHist}, BEHIND {hBehind}, OFF_SCREEN {hOffScr}, "
+                                + $"OUT_OF_RANGE {hRange}, LUMINANCE {hLum}, NaN {hNaN}");
+                    sb.AppendLine($"  守恒式：四条位移分支之和 {sum3} == 角色 3 派发 {role3} × {k_ProbeCountExpected} = {expect3}"
+                                + $"；NaN 与 LUMINANCE 各 == 角色 4 派发 {role4} × {k_ProbeCountExpected} = {expect4}"
+                                + $"；COVER_COUNT {cover} == {expect3 + expect4}");
+                    sb.AppendLine("  ⓘ 守恒式比逐条 > 0 严格：掩码是互斥的（谓词第一条命中就 return），"
+                                + "所以「某个 froxel 意外返回 OK」或「掩码里带了两位」都会让和**小于**期望。"
+                                + "派发趟数由 VistaAtmosphereLuts 自己累加后转发上来，不是在本文件里手抄一个 4 ——"
+                                + "抄下来的常数在加第五个位移时不会跟着改，那一格会变成一个由「常数陈旧」造成的假失败。");
+                    sb.AppendLine("  ⓘ NaN 那一格证明的是「闸接对了」（谓词命中 ⇒ 掩码置位 ⇒ 早退），"
+                                + "**不是**「AnyIsNaN 在这台硬件上判得对」—— 后者是 URP 的位模式比较。"
+                                + "线上那条路径读不到 NaN 由构造保证（historyContentValid 挡着未写过的表）。");
+
+                    // ---------------------------------------------------------- 抖动散布 vs 死区下端
+                    float spread = raw[k_SlotReprojJitterSpread] / k_ReprojJitterScale;
+                    bool jitterOn = settings.jitterMode != JitterMode.Off;
+                    if (jitterOn)
+                    {
+                        bool deadbandOk = deadStart > spread;
+                        sb.AppendLine($"{Mark(deadbandOk)}判据⑮b 亮度死区下端高于抖动自己制造的散布："
+                                    + $"死区下端 {deadStart:F4} > 实测散布 {Sci(spread)}"
+                                    + $"（裕度 {Sci(deadStart - spread)}，带符号）");
+                        sb.AppendLine("  ⓘ 散布量的是**同一个 froxel 两次独立抖动抽样**的相对亮度差的 max，"
+                                    + "不是「历史与本帧之差」—— 后者混着相机运动与场景变化，"
+                                    + "而这个数是用来摆死区下端的，被污染的上界会把死区顶得过高。");
+                        // 可执行的输出：这一格真正告诉美术的是「下端不能拖到哪儿以下」。
+                        // 只印裕度的话，那个数字要读者自己反算才知道能调到哪里。
+                        sb.AppendLine($"  ⓘ 由此得出的可执行下限：本布景里 luminanceRejectStart 必须 > {Sci(spread)}"
+                                    + $"（当前 {settings.luminanceRejectStart:F3}，只有 ×{(spread > 0f ? deadStart / spread : 0f):F2} 的余量）——"
+                                    + "这个下限随布景走（雾越浓、明暗对比越大，散布越大），换布景要重量。");
+                        if (!deadbandOk)
+                            sb.AppendLine($"  ⚠ 症状：{k_JitterDeadbandSymptom}。"
+                                        + "死区下端拖到散布之下时，这条失效规则会把抖动噪声判成"
+                                        + "「场景变了」而降权 —— 亲手毁掉它本该保护的累积。");
+                        sb.AppendLine($"  ⓘ 定点分辨率 {Sci(1f / k_ReprojJitterScale)}，"
+                                    + $"实测占 {raw[k_SlotReprojJitterSpread]} 个刻度"
+                                    + (raw[k_SlotReprojJitterSpread] < 8u
+                                        ? " —— **落在尺子地板附近**，这个读数只能当上界用。"
+                                        : "。"));
+                    }
+                    else
+                    {
+                        sb.AppendLine("ⓘ 判据⑮b 空判据：jitterMode = Off ⇒ 抖动幅度 0 ⇒ 两次抽样逐位相同 ⇒ "
+                                    + $"散布恒为 0（实测 {Sci(spread)}），死区下端无论摆哪儿都 > 0。"
+                                    + "这一格今天没有区分力，点名它。");
+                    }
+                }
+            }
+
             // ---------------------------------------------------------------- 分配口径
             if (volume.allocatedDesc.HasValue)
             {
@@ -647,11 +902,24 @@ namespace Vista.EditorTools
                             + "读端合成要跟着改，所以归 #25。CHANGELOG 的 #19 待办已按此更正。");
             }
 
-            sb.AppendLine("ⓘ 未覆盖：注入**历史**表（#22 时间重投影）这一条写入路径本节一次都没跑过。"
-                        + "VistaAtmospherePass 里也刻意没有 ImportTexture 它 —— 顺手导入会让"
-                        + "「没人写」这件事在代码里看不出来。\n"
-                        + "  积分表已经不在这一条里了：它的 RenderGraph 写入路径由上面判据⑩⑪⑫覆盖，"
-                        + "画面侧由 Debug View 的四个档位覆盖。");
+            sb.AppendLine("ⓘ 注入**历史**表没有「写入路径」这回事：双缓冲的交换"
+                        + "（VistaFroxelVolume.SwapInjectionBuffers）只改写下标，本帧写的永远是"
+                        + "FroxelInjection 指向的那张，下一帧交换后它就成了历史。"
+                        + "所以要覆盖的是「读到的是不是上一帧那张」—— 判据⑬（静止恒等性）、"
+                        + "⑭b（在线掩码与 CPU 状态双向一致）、⑮（六条失效路径 + 计数守恒）盯的就是这一条。\n"
+                        + "  积分表的 RenderGraph 写入路径由判据⑩⑪⑫覆盖，画面侧由 Debug View 的四个档位覆盖。");
+            sb.AppendLine("ⓘ 未覆盖（推迟到 #27）：判据⑯ 收敛性 —— 「累积真的降了噪、且没有引入偏差」。"
+                        + "三条理由：①#27 本来就持有残影/收敛这一项，且带一个跨布景对照（本节没有对照，"
+                        + "而「一个跨布景稳定复现的差值只有在两个布景做同样工作时才是尺子噪声」）；"
+                        + "②今天唯一便宜的形式是 max-vs-max 的统计门，摆不紧，而"
+                        + "「一个把『未判达标』印成『达标』的判据比一条平门更危险」；"
+                        + "③无偏这一半已经有解析恒等式兜着 —— e 空间里振幅 1 的深度抖动，"
+                        + "其期望**正好**等于不抖时的采样点（几何均值 = e 空间中点），"
+                        + "而它要打败的噪声由上面判据⑮b 那个 JITTER_SPREAD 量出来了。\n"
+                        + "  代价点名：现在实现它要么加第九个核、要么让重投影探针那一趟去读注入表，"
+                        + "而后者会推翻那一趟「刻意不声明 froxelInjection」的理由。"
+                        + "失效症状（#27 要盯的那个）：「打开抖动之后雾稍微浓了一点」——"
+                        + "一个看起来像调好了的系统性偏差。");
         }
 
         static Camera FindGameCamera()

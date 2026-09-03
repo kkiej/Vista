@@ -126,6 +126,31 @@ namespace Vista
         /// 「表被重烘了但参数没变」，在 profiler 上表现为一个无法归因的尖峰。
         /// </summary>
         public VistaFroxelVolume froxelVolume => m_Luts?.froxelVolume;
+
+        /// <summary>
+        /// 仅 Editor 自检：近层体的时间重投影状态（#22a）。判据⑭要的三个整数
+        /// （帧号、上一帧的捕获帧号、连续有效帧数）与失效原因字符串都在它上面。
+        ///
+        /// 它挂在 pass 上而不是 <c>m_Luts</c> 上：「上一帧」这个概念只在有渲染循环时
+        /// 才存在，而 m_Luts 会被立即模式的自检直接 new 出来用。
+        /// </summary>
+        public VistaFroxelReprojection froxelReprojection => m_Pass?.reprojection;
+
+        /// <summary>
+        /// 仅 Editor 自检：重投影探针里「角色 3 / 角色 4 各派发了几趟」。
+        /// 判据⑮的守恒式要拿它乘 32×32×16 去对分支计数的总和。
+        ///
+        /// 转发而不是把 <c>m_Luts</c> 开出去（同 <see cref="froxelVolume"/> 的理由），
+        /// 也不在判据文件里手抄一个 4：抄下来的常数在加第五个位移时不会跟着改，
+        /// 那一格会变成一个由「常数陈旧」造成的假失败。
+        ///
+        /// 取不到 LUT 时返回 **−1** 而不是 0：0 会让守恒式在「探针一趟都没跑」时
+        /// 以 0 == 0 全绿。
+        /// </summary>
+        public int froxelReprojProbeRole3Dispatches => m_Luts != null ? m_Luts.reprojProbeRole3Dispatches : -1;
+
+        /// <summary>见 <see cref="froxelReprojProbeRole3Dispatches"/>。</summary>
+        public int froxelReprojProbeRole4Dispatches => m_Luts != null ? m_Luts.reprojProbeRole4Dispatches : -1;
 #endif
 
         /// <summary>

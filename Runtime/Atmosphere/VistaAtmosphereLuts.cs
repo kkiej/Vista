@@ -1083,9 +1083,12 @@ namespace Vista
         /// 理由见 <c>VistaShaderIDs._VistaFroxelCameraWS</c>。</param>
         /// <param name="shadowmapBound">主光阴影贴图这一帧有没有内容。false 时核内阴影恒 1，
         /// 也就是「有雾、没有光柱」而不是「一片漆黑」。</param>
+        /// <param name="reproj">#22a 的时间重投影与抖动状态。零态（<c>Data.disabled</c>）
+        /// 表示纯本帧、无抖动 —— 所以调用方永远有一份合法的值可传，不需要一个「要不要下发」的开关。</param>
         public void RenderFroxelInjection<T>(
             T d, in VistaAtmosphereViewData view, VistaFogSettings fog,
-            in VistaFroxelVolumeDesc desc, Vector3 cameraWS, bool shadowmapBound)
+            in VistaFroxelVolumeDesc desc, Vector3 cameraWS, bool shadowmapBound,
+            in VistaFroxelReprojection.Data reproj)
             where T : struct, IVistaLutDispatcher
         {
             if (m_FroxelVolume == null) return;
@@ -1097,6 +1100,11 @@ namespace Vista
             view.Bind(d, m_SkyViewWidth, m_SkyViewHeight);
             view.BindFrustumRays(d);
             view.BindFog(d, fog);
+
+            // 重投影常量在这里推、而不是在 VistaFroxelVolume.Prepare 里：Prepare 也被
+            // 立即模式的自检调用，而自检里没有「上一帧」。放在唯一的消费者旁边，
+            // 「不走这条路的路径看到的是零态」才是由代码保证的，不是靠记性。
+            reproj.Bind(d);
 
             m_FroxelVolume.DispatchInjection(d, desc, cameraWS, shadowmapBound);
         }
@@ -1142,6 +1150,100 @@ namespace Vista
             view.BindFrustumRays(d);
 
             m_FroxelVolume.DispatchShadowProbe(d);
+        }
+
+        /// <summary>
+        /// #22a 重投影的覆盖性探针。**必须紧跟在 <see cref="RenderFroxelInjection{T}"/> 之后**：
+        /// 角色 1 要量的是注入核这一帧**实际吃进去的那一份**重投影，所以它跑在
+        /// 任何覆盖之前，且本方法在它之前一个字节的 <c>VistaFroxelReprojCB</c> 都不推。
+        ///
+        /// 七趟 dispatch，顺序是硬要求（判据要在报表上点名这个顺序）：
+        ///   ① 角色 1：在线读数 —— 不覆盖 cbuffer
+        ///   ② 角色 3a：<c>Data.disabled</c> 驱 NO_HISTORY（顺带证明零态真的是「不用历史」）
+        ///   ③ 角色 2：prev 覆盖成 current，零位移 ⇒ 静止恒等性
+        ///   ④⑤⑥ 角色 3b/3c/3d：同一份 prev = current，靠**位移**驱 BEHIND / OFF_SCREEN /
+        ///        OUT_OF_RANGE。先让恒等成立、再加位移，于是「被拒绝」只能是位移造成的。
+        ///   ⑦ 角色 4：合成 hist 驱 NaN / 亮度两条（没有任何位移能驱动它们）
+        ///
+        /// 逐视图常量照 <see cref="RenderFroxelShadowProbe{T}"/> 的规矩自己推一遍
+        /// （射线重建要视锥四角），并且**要推雾** —— 角色 1 会跑两次
+        /// <c>VistaFroxelInject</c> 去量抖动自己制造的亮度散布。
+        /// 同样不重推 <c>_VistaFroxelCameraWS</c>：探针要读注入实际用过的那一份。
+        /// </summary>
+        /// <param name="identity">
+        /// <c>VistaFroxelReprojection.MakeStaticIdentityData(camera, desc, settings)</c> 的产物。
+        /// 由调用方传进来而不是在这里造：本类不持有 <c>VistaVolumetricFogSettings</c>，
+        /// 而「亮度死区必须照实带上」是角色 4 能不能失败的前提。
+        /// </param>
+        public void RenderFroxelReprojProbe<T>(
+            T d, in VistaAtmosphereViewData view, VistaFogSettings fog,
+            Camera camera, in VistaFroxelVolumeDesc desc,
+            in VistaFroxelReprojection.Data identity)
+            where T : struct, IVistaLutDispatcher
+        {
+            // 归零放在守卫**之前**：探针这一趟被跳过时读数就该是 0，而不是上一次的残留。
+            // 单靠这个数守恒式会在「一趟都没跑」时以 0 == 0 全绿，所以判据⑮
+            // 另外还逐条判 HIT_* > 0 —— 那六格才是「跑过」的证据。
+            m_ReprojProbeRole3 = 0;
+            m_ReprojProbeRole4 = 0;
+
+            if (m_FroxelVolume == null || camera == null) return;
+
+            view.Bind(d, m_SkyViewWidth, m_SkyViewHeight);
+            view.BindFrustumRays(d);
+            view.BindFog(d, fog);
+
+            // ① 在线读数。**第一趟**，且这之前没有任何 reproj.Bind。
+            DispatchReprojProbeCounted(d, Vector3.zero, 1);
+
+            // ② 零态 ⇒ NO_HISTORY。用真正的 Data.disabled 而不是「把权重填 0」的手搓值：
+            // 这一格顺带证明了线上那条「一个字节都没下发」的路径确实走 NO_HISTORY。
+            VistaFroxelReprojection.Data.disabled.Bind(d);
+            DispatchReprojProbeCounted(d, Vector3.zero, 3);
+
+            // ③~⑦ prev = current。
+            identity.Bind(d);
+            DispatchReprojProbeCounted(d, Vector3.zero, 2);
+
+            // 位移是「从格心里减掉」的（见探针核的调用点），所以要把点推到上一帧相机
+            // 后方就得**加**一个沿视线正方向的位移。三个倍数按「让更早的谓词不先命中」选：
+            //   · 2·far 沿视线 ⇒ 点落到相机后方 ⇒ BEHIND（体积最远 handoff < far，
+            //     所以 2·far 对每一片都够）
+            //   · 5·far 横向 ⇒ 前向分量**不变**（w 仍 > 0，不会先撞 BEHIND）、
+            //     横向 tan ≥ 4 ⇒ OFF_SCREEN
+            //   · −10·far 沿视线 ⇒ 点推到 10·far 之外，横向/纵深比缩到 0.06 以内
+            //     （uv 收向画面中心、不会先撞 OFF_SCREEN）⇒ OUT_OF_RANGE
+            Transform tr = camera.transform;
+            float far = desc.farMeters;
+            DispatchReprojProbeCounted(d, tr.forward * (2f * far), 3);
+            DispatchReprojProbeCounted(d, tr.right * (5f * far), 3);
+            DispatchReprojProbeCounted(d, tr.forward * (-10f * far), 3);
+
+            DispatchReprojProbeCounted(d, Vector3.zero, 4);
+        }
+
+        // 角色 3 / 角色 4 各派发了几趟。判据⑮的守恒式（NOHIST+BEHIND+OFFSCR+RANGE
+        // == role3 × 16384）要用它 —— 在判据文件里手抄一个 4，加第五个位移时
+        // 那一格会变成一个由「常数没跟着改」造成的假失败。
+        int m_ReprojProbeRole3;
+        int m_ReprojProbeRole4;
+
+        /// <summary>角色 3（失效分支分类）在上一次 <see cref="RenderFroxelReprojProbe{T}"/> 里派发了几趟。</summary>
+        public int reprojProbeRole3Dispatches => m_ReprojProbeRole3;
+
+        /// <summary>角色 4（合成 hist 驱 NaN / 亮度）派发了几趟。</summary>
+        public int reprojProbeRole4Dispatches => m_ReprojProbeRole4;
+
+        // 不写成 RenderFroxelReprojProbe 里的局部函数：那里的 identity/desc 是 in 形参，
+        // 局部函数捕获 in 形参是 CS8175。写成私有方法之后 d 按值传（与其余
+        // Dispatch* 一致，dispatcher 是 readonly struct，复制是零成本的）。
+        void DispatchReprojProbeCounted<T>(T d, Vector3 displacement, int role)
+            where T : struct, IVistaLutDispatcher
+        {
+            m_FroxelVolume.DispatchReprojProbe(d, displacement, role);
+
+            if (role == 3) m_ReprojProbeRole3++;
+            else if (role == 4) m_ReprojProbeRole4++;
         }
 
         /// <summary>

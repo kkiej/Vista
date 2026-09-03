@@ -34,6 +34,34 @@ namespace Vista
     }
 
     /// <summary>
+    /// froxel 采样点的抖动序列来源（#22）。
+    ///
+    /// #22a 里这个整数**不下发给 shader**，一个字节都不发：<see cref="Off"/> 的效果
+    /// 完全由「抖动幅度 0 + 历史权重 0」表达，也就是项目里那条「失能态 = 零态」——
+    /// 于是 HLSL 侧不需要任何 <c>VISTA_JITTER_*</c> 宏，也就不存在
+    /// <see cref="FroxelDebugView"/> 那种「真实的两份定义」。
+    /// #22b 加进第二个**在线**档位（蓝噪声纹理）时才需要下发它，那时才配宏。
+    ///
+    /// 这里只有两档，不预留一个空的蓝噪声档：
+    /// 「一个选了什么都不发生的枚举值等于把哑档位摆给美术」。
+    /// </summary>
+    public enum JitterMode
+    {
+        /// <summary>不抖动，也不做时间重投影。零态，也是 A/B 对照档。</summary>
+        Off = 0,
+
+        /// <summary>
+        /// 程序化：空间上一个 hash，时间上 R3 塑性常数的 Kronecker 序列。
+        ///
+        /// 为什么时间轴用低差异序列而不是每帧一个新随机数：随机数在 N 帧窗口内的
+        /// 覆盖是有洞的（生日碰撞），而累积窗口就是 N ≈ τ·fps 帧 ——
+        /// 洞的症状是残影里带一层低频斑。Kronecker 序列的差异度有下界，
+        /// 而且**永不循环**（对比：一张 z=64 的 3D 噪声纹理每 64 帧重复一次）。
+        /// </summary>
+        Procedural = 1,
+    }
+
+    /// <summary>
     /// 近层体积雾 froxel 体的配置。
     ///
     /// 本类只做两件事：把「屏幕比例 + 远边界」换成一份**分配口径**
@@ -78,7 +106,7 @@ namespace Vista
                + "近处会看到切片台阶。")]
         [Min(1f)] public float farDistanceMeters = 64f;
 
-        [Header("开发中（#21）")]
+        [Header("开发中（#21/#22）")]
         [Tooltip("逐 froxel 的光照注入 + 深度积分。\n\n"
                + "开了**最终画面仍然不变**，但两张表都已经在逐帧计算了：\n"
                + "注入表存 (σ_s·J, σ_t)（#20），积分表存 (累积内散射, 1 − T)（#21）。\n"
@@ -95,6 +123,49 @@ namespace Vista
                + "在 #25 的合成落地之前也不会有。")]
         public bool enableInjection = false;
 
+        [Header("时间重投影与抖动（#22）")]
+        [Tooltip("每帧把采样点在 froxel 内部错开，再用上一帧的注入表做时间累积。\n\n"
+               + "Off 是 A/B 对照档，不是「省性能档」—— 关掉之后每个 froxel 恒在同一个点"
+               + "取样，切片边界与阴影边界都会露出台阶，而开销只省下一次历史表采样。\n\n"
+               + "为什么抖动与重投影是**同一个**开关：抖动单独开 = 逐帧换采样点却不累积，"
+               + "画面上是纯噪声闪烁，比不抖动更差；重投影单独开 = 每帧混同一个采样点，"
+               + "混完还是那个点，只多花一次采样。两者只有一起才有意义。")]
+        public JitterMode jitterMode = JitterMode.Procedural;
+
+        [Tooltip("横向（屏幕 XY）抖动幅度，单位是一个 froxel 的宽度。1 = 在整格内均匀取样。\n\n"
+               + "横向与深度分开两个旋钮，是因为两者的格子尺寸差一个量级：60 m 处"
+               + "横向约 0.94 m，而深度方向那一片长 4.93 m —— 深度是横向的 5.2 倍。"
+               + "共用一个幅度会让「调到够遮住切片台阶」的同时把横向抖过头，"
+               + "症状是雾在物体边缘渗出去。")]
+        [Range(0f, 1f)] public float lateralJitterAmount = 1f;
+
+        [Tooltip("深度（切片方向）抖动幅度，单位是一片的厚度。1 = 在整片内均匀取样。\n\n"
+               + "这是本项目里更重要的那一个：切片台阶是近层雾最显眼的瑕疵，"
+               + "而深度格子比横向格子大 5.2 倍。")]
+        [Range(0f, 1f)] public float depthJitterAmount = 1f;
+
+        [Tooltip("历史累积的时间常数 τ（秒）。新样本的权重 = 1 − exp(−Δt/τ)。\n\n"
+               + "为什么是时间常数而不是 HDRP/UE5 那样直接填一个「历史权重 0.95」："
+               + "定权重的收敛速度绑死在帧率上 —— 30 fps 下要 20 帧（0.67 s）才收敛，"
+               + "144 fps 下只要 0.14 s，同一套参数在两台机器上是两个残影长度。\n\n"
+               + "默认 0.33 s 就是拿 HDRP 那个 0.95 在 60 fps 下反解出来的"
+               + "（1 − exp(−1/60/0.33) ≈ 0.05），所以默认档与业内基准是同一个观感，"
+               + "只是不再随帧率漂。")]
+        [Range(0.02f, 2f)] public float historyTimeConstant = 0.33f;
+
+        [Tooltip("历史失效的亮度死区下端：相对亮度变化小于这个值时**完全不降权**。\n\n"
+               + "为什么必须有死区：抖动本身就是一种逐帧亮度变化。没有死区的话，"
+               + "这条规则会把抖动噪声当成「场景变了」而降权，亲手毁掉它本该保护的累积。\n"
+               + "所以这个下端要摆在**实测的抖动引起的亮度散布**之上，不能凭感觉填 ——"
+               + "Window/Vista/Log Volumetric Fog State 里有一格专门量它并与这个值比较。")]
+        [Range(0f, 1f)] public float luminanceRejectStart = 0.25f;
+
+        [Tooltip("历史失效的亮度死区上端：相对亮度变化到达这个值时权重降到 0（纯本帧）。\n\n"
+               + "两端之间线性过渡。不做硬阈值是因为硬阈值会在阈值附近让相邻 froxel"
+               + "一半累积一半不累积，症状是运动物体边缘出现一条抖动的亮边。")]
+        [Range(0f, 1f)] public float luminanceRejectFull = 0.9f;
+
+        [Header("调试视图")]
         [Tooltip("把 froxel 表直接画到屏幕上（整屏替换，不叠加）。\n\n"
                + "Off 之外的档位都会**盖掉整个画面** —— 这是故意的：叠加会让"
                + "「表是空的」与「表很淡」在同一个像素上混起来，而这个视图存在的"
@@ -129,6 +200,24 @@ namespace Vista
         /// </summary>
         public static int ResolveDebugSlice(int requested, int depth)
             => Mathf.Clamp(requested, 0, Mathf.Max(0, depth - 1));
+
+        /// <summary>
+        /// 亮度死区的两端，保证 <paramref name="full"/> 严格大于 <paramref name="start"/>。
+        ///
+        /// 为什么要夹：两个独立 Range 滑条可以被拖成 full ≤ start，那时过渡区宽度为 0，
+        /// 规则退化成硬阈值 —— 而硬阈值正是上面 tooltip 里说明**不要**的那种形状。
+        /// 让它在这里变成不可表达，比在 shader 里除以一个可能为 0 的宽度要好。
+        /// 抽成静态函数的理由与 <see cref="ResolveDebugSlice"/> 相同：渲染路径与状态日志
+        /// 必须共用同一份规则，否则日志会说「死区 0.25~0.9」而 GPU 上是别的数。
+        /// </summary>
+        public void ResolveLuminanceReject(out float start, out float full)
+        {
+            start = Mathf.Clamp01(luminanceRejectStart);
+            full  = Mathf.Max(Mathf.Clamp01(luminanceRejectFull), start + k_MinRejectWidth);
+        }
+
+        /// <summary>死区过渡区的最小宽度。见 <see cref="ResolveLuminanceReject"/>。</summary>
+        public const float k_MinRejectWidth = 1e-3f;
 
         // --------------------------------------------------------------------
         //  切片分布：纯指数

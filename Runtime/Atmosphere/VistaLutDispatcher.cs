@@ -1,4 +1,4 @@
-using UnityEngine;
+﻿using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.RenderGraphModule;
 
@@ -41,9 +41,11 @@ namespace Vista
         // 对应的 pass 事先声明过资源**：graph 侧拿到的是 pass import 进来的 handle，
         // 没 import 就是 default（无效），绑定处直接炸 —— 这正是 default 不兜底的意义。
         //
-        // 历史帧（#22）的**写入路径至今未被任何判据覆盖**：资源建出来了、
-        // 槽位能解析了，但没有核往里写。这一条记在 CHANGELOG 的待办里，
-        // 不在这里靠注释假装它是完整的。
+        // 历史帧（#22a）：它**没有写入路径** —— 谁都不往「历史」这张资源里写。
+        // 双缓冲的交换（VistaFroxelVolume.SwapInjectionBuffers）只改写下标，
+        // 本帧写的永远是 FroxelInjection 指向的那张，下一帧交换后它就成了历史。
+        // 所以要覆盖的不是「写」，而是「读到的是不是上一帧那张」——
+        // 判据⑬（静止恒等性）与⑮（失效路径计数）盯的就是这一条。
         // 积分表的写入路径在 #21 落地，两侧都有判据（立即模式的合成介质判数值，
         // 真实帧的探针槽 14~18 判 RenderGraph 那条路）。
         /// <summary>注入表的 UAV view（写）。</summary>
@@ -55,7 +57,10 @@ namespace Vista
         /// 「在一趟 dispatch 里既绑 RW 又绑 Read」就变成一件看不出来的事。
         /// </summary>
         FroxelInjectionRead,
-        /// <summary>注入表的历史帧。内容路径在 #22（时间重投影）之前**未被覆盖**。</summary>
+        /// <summary>
+        /// 注入表的历史帧（另一张资源的 SRV）。#22a 起由注入核与重投影探针核读，
+        /// 只读、无 RW 绑定点 —— 留一个没人写的 RW 绑定点等于一段永远不会被发现写错的代码。
+        /// </summary>
         FroxelInjectionHistory,
         /// <summary>
         /// 沿视线累积的内散射 rgb + <b>1 − 累积透射率</b>（不是 T 本身，
@@ -138,6 +143,16 @@ namespace Vista
         void SetBuffer(ComputeShader cs, int kernelIndex, int nameID, VistaLutBufferSlot slot);
 
         void SetGlobalVector(int nameID, Vector4 value);
+
+        /// <summary>
+        /// 唯一的消费者是 #22 的时间重投影（上一帧的 viewProj）。
+        ///
+        /// 为什么是矩阵而不是拆成四个 Vector4 自己在 shader 里凑：把一个 4×4 拆成
+        /// 四行下发，等于让「行主序还是列主序」成为一个只能靠画面对不对来验的约定 ——
+        /// 而错了的症状是重投影偏一点点，正好长得像「历史权重高了」。
+        /// </summary>
+        void SetGlobalMatrix(int nameID, Matrix4x4 value);
+
         void Dispatch(ComputeShader cs, int kernelIndex, int groupsX, int groupsY, int groupsZ);
     }
 
@@ -164,6 +179,9 @@ namespace Vista
 
         public void SetGlobalVector(int nameID, Vector4 value)
             => m_Cmd.SetGlobalVector(nameID, value);
+
+        public void SetGlobalMatrix(int nameID, Matrix4x4 value)
+            => m_Cmd.SetGlobalMatrix(nameID, value);
 
         public void Dispatch(ComputeShader cs, int kernelIndex, int groupsX, int groupsY, int groupsZ)
             => m_Cmd.DispatchCompute(cs, kernelIndex, groupsX, groupsY, groupsZ);
@@ -257,6 +275,9 @@ namespace Vista
 
         public void SetGlobalVector(int nameID, Vector4 value)
             => m_Cmd.SetGlobalVector(nameID, value);
+
+        public void SetGlobalMatrix(int nameID, Matrix4x4 value)
+            => m_Cmd.SetGlobalMatrix(nameID, value);
 
         public void Dispatch(ComputeShader cs, int kernelIndex, int groupsX, int groupsY, int groupsZ)
             => m_Cmd.DispatchCompute(cs, kernelIndex, groupsX, groupsY, groupsZ);

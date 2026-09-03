@@ -1,8 +1,9 @@
 // ============================================================================
 //  近层体积雾（Step 3 档 A）
 //
-//  #19 交付「资源 + 分布 + 判据」，#20 交付逐 froxel 的光照注入，#21 交付深度积分。
-//  七个核：
+//  #19 交付「资源 + 分布 + 判据」，#20 交付逐 froxel 的光照注入，#21 交付深度积分，
+//  #22a 交付抖动 + 时间重投影。
+//  八个核：
 //    FroxelPlaceholder   把切片几何写进注入表 —— 它**不是**雾，是一份能被读回来对账的
 //                        已知内容。存在的理由是「RWTexture3D 绑定失败」这个坑：
 //                        RTHandle 的 2D 便捷重载会静默建成 Tex2D，症状只有 Editor.log
@@ -15,11 +16,15 @@
 //    FroxelSynthMedium   #21 判据的布景：把一个**均匀**的合成介质写满注入表。
 //    FroxelIntegralVerify #21 判据的读回：把积分表 (0,0) 那一列 + 逐片的覆盖性扫描
 //                        搬进报告 buffer。**核内不算任何误差**，参考解在 C# 侧。
+//    FroxelReprojProbe   #22a 判据的探针：把重投影谓词的每一条拒绝分支的命中次数、
+//                        静止恒等性的残差、以及抖动引起的相对亮度散布搬进探针 buffer。
+//                        它调的是**线上那一份**共享函数（VistaFroxelReprojectUvw），
+//                        靠调用点给 positionWS 减一个合成位移把拒绝分支驱进去。
 //
-//  时间重投影是 #22。在那之前 VistaFogSettings.Mode 里**不会**出现 Froxel 档 ——
-//  一个选了什么都不发生的枚举值等于把哑档位摆给美术。#20/#21 的这条链路因此挂在
-//  一个开发者开关上（默认关），画面上要看到它得开 Debug View；
-//  而那个开关关着的时候由 Window/Vista/Log Volumetric Fog State 点名。
+//  #22a 之后 VistaFogSettings.Mode 里**仍然没有** Froxel 档 ——
+//  一个选了什么都不发生的枚举值等于把哑档位摆给美术，而把积分结果贴到画面上是 #25。
+//  #20~#22 的这条链路因此挂在一个开发者开关上（默认关），画面上要看到它得开
+//  Debug View；而那个开关关着的时候由 Window/Vista/Log Volumetric Fog State 点名。
 // ============================================================================
 
 #pragma kernel FroxelPlaceholder
@@ -29,6 +34,7 @@
 #pragma kernel FroxelIntegration
 #pragma kernel FroxelSynthMedium
 #pragma kernel FroxelIntegralVerify
+#pragma kernel FroxelReprojProbe
 
 // 与大气那批核同一条排除线：GLES 没有 RWTexture3D，编译只会产出一堆噪声。
 #pragma only_renderers d3d11 vulkan metal playstation xboxone xboxseries switch
@@ -63,6 +69,33 @@ RW_TEXTURE3D(float4, _VistaFroxelInjectionRW);
 // 同一张资源的 SRV view。绑定点必须与 UAV 分开：同一张纹理同时绑 UAV 与 SRV 是 UB，
 // 这与反射那张中转表的教训是同一条（见 VistaLutSlot.SkyReflectionArray）。
 TEXTURE3D(_VistaFroxelInjectionRead);
+
+// ---------------------------------------------------------------- #22a 时间重投影
+// 上一帧的注入表（**另一张**资源，不是上面那张的另一个 view）。双缓冲由
+// VistaFroxelVolume 的写下标管，本核只读。
+//
+// 用 SAMPLE（三线性）而不是 LOAD：重投影出来的坐标一般不落在纹素中心上，
+// 取最近邻的症状是相机匀速移动时雾在切片边界上「咯噔」一下 ——
+// 一个看起来像「切片不够密」的失效。滤波模式由 RTHandle 分配时的 Bilinear 决定。
+TEXTURE3D(_VistaFroxelInjectionHistory);
+
+// 自检专用：喂给探针核的合成上一帧相机位移 (xyz, 角色标志)。
+// 线上路径**一个字节都不下发** —— 零态 = 不位移。
+//   w = 0: 无效（探针不该在这个状态下被派发，C# 侧的门挡着）
+//   w = 1: 在线读数（xyz 必须为 0，量的是注入核实际吃进去的那份重投影）
+//          外带一格「抖动自己制造的相对亮度散布」，用来给亮度死区的下端摆底。
+//   w = 2: 静止恒等性（CPU 已把 prev 覆盖成 current，xyz 为 0）
+//   w = 3: 失效覆盖之一 —— **位移**驱动的四条（NO_HISTORY / BEHIND / OFF_SCREEN /
+//          OUT_OF_RANGE）。哪一条由 CPU 选的位移决定，shader 只按实际返回的掩码记。
+//   w = 4: 失效覆盖之二 —— **合成 hist** 驱动的两条（NAN / LUMINANCE）。
+//          没有任何相机位移能驱动它们，所以只能喂合成值；走的仍是线上那一份
+//          VistaFroxelBlendHistory。
+//
+// 位移做在**调用点**（传 centreWS − probe.xyz）而不是给共享函数加一个形参：
+// 加形参的话线上路径也得传一个 0，于是一个残留的脏全局能影响到线上；
+// 做在调用点则它只能影响探针。代数上两者等价 —— 把上一帧相机平移 δ
+// 等于在矩阵乘法与距离两处同时做 x → x − δ。
+float4 _VistaFroxelReprojProbe;
 
 // 每片两个 float4。布局见 VistaFroxelVolumeSelfTest 里的说明 ——
 // 那边是唯一的消费者，把语义写在消费端而不是这里，是为了让「读错字段」
@@ -227,15 +260,72 @@ float VistaFroxelSunShadow(float3 positionWS)
 }
 
 // ----------------------------------------------------------------------------
+//  像素中心 -> 屏幕 uv
+//
+//  提成函数是因为它有**三个**调用点（注入、阴影探针、重投影探针）。
+//  max(·, 1.0) 是零态下的除零兜底；三处各写一份的话，那个兜底会各自漂移，
+//  而漂移的症状是「某个探针在自检里读到 NaN，线上却正常」。
+//
+//  形参是 float2 而不是 uint2：横向抖动是连续量，加在这里。
+// ----------------------------------------------------------------------------
+float2 VistaFroxelPixelToUv(float2 pixelCenter)
+{
+    return pixelCenter * rcp(max(_VistaFroxelSize.xy, 1.0));
+}
+
+// ----------------------------------------------------------------------------
+//  froxel 的格心世界位置（米）—— 重投影的**标称位置**
+//
+//  未抖动：xy 取像素中心，z 取 VistaFroxelReprojectDistance（e 上的片心，
+//  不是 VistaFroxelSampleDistance —— 两者只有第 0 片差 0.144 m，理由见那两个函数的注释）。
+//
+//  为什么不让 VistaFroxelInject 顺带 out 一个 posWS 省掉这次重算：
+//  它算出来的是**抖动后**的位置，拿去反查历史等于给历史加一个每帧变化的偏移，
+//  症状是静止画面也在抖。重算的代价是一次 bilerp + 一次 normalize。
+// ----------------------------------------------------------------------------
+float3 VistaFroxelCentreWS(uint3 id)
+{
+    float3 rayDir = VistaApFroxelRayDirection(VistaFroxelPixelToUv((float2)id.xy + 0.5));
+    return _VistaFroxelCameraWS.xyz + VistaFroxelReprojectDistance((float)id.z) * rayDir;
+}
+
+// ----------------------------------------------------------------------------
 //  一个 froxel 的注入结果
 //
-//  提成函数是为了让 FroxelInjection 与将来 #22 的重投影版本共用同一段能量计算；
-//  抖动不在这里 —— 它由调用方把偏移加在传进来的 slice 上
-//  （VistaFroxelSampleDistance 的形参本来就是 float），所以这里没有「默认关闭的抖动开关」。
+//  提成函数是为了让注入核与探针核共用同一段能量计算。
+//
+//  ---- 抖动怎么进来（#22a）----
+//  两个形参都是**连续量**：pixelCenter 是像素中心（横向抖动加在这里），
+//  slice 是切片坐标（深度抖动加在这里）。调用方传
+//  ((float2)id.xy + 0.5 + jitter.xy, (float)id.z + jitter.z)。
+//
+//  这里原先的注释写着「横向抖动由调用方把偏移加在 slice 上」，那是错的：
+//  横向偏移改的是 VistaApFroxelRayDirection 的 uv，与距离无关，折不进 slice。
+//  形参类型因此从 uint2 改成 float2。
+//
+//  深度抖动加在 slice（**指数坐标**）上而不是加在米上，有两条恒等式级别的收益：
+//    ① 幅度 1 时抖动区间正好是这一段：slice ± 0.5 ⇒ decode((i∓0.5)/N)
+//       = [VistaFroxelSegmentNear(i), VistaFroxelSegmentFar(i)]，逐位相同。
+//       在米上抖就得自己挑区间，挑错的症状是相邻段的采样区间重叠或留缝。
+//    ② 抖动的**期望**落在未抖动的求值点上（几何均值 = e 上的中点），
+//       所以开抖动不会让雾整体变浓或变淡。在米上均匀抖的期望是**度量中点**，
+//       比几何均值晚 0.0105 个分段（见 VistaFroxelSampleDistance 的头注），
+//       症状是「打开抖动之后雾稍微浓了一点」—— 一个看起来像调好了的偏差。
+//
+//  已点名的代价：**第 0 片的深度抖动是惰性的**。slice = 0 + jitter.z ∈ [−0.5, 0.5)
+//  全程走 VistaFroxelSampleDistance 的退化分支（slice < 0.5），恒返回 0.5·d_0。
+//  它不是偏差 —— 0.5·d_0 正是该段 [0, d_0] 上均匀采样的期望；丢掉的只是那一片的
+//  方差下降。该片长 0.31 m、位于 0.3 m 处，抖动本来要打散的阴影贴图阶梯
+//  在那里是亚纹素的。横向抖动照常生效。
+//
+//  横向抖动**不夹紧**到 [0, size]：边缘 froxel 的采样点会落到视锥外半格，
+//  而 VistaApFroxelRayDirection 在 uv 略微出界时是四角方向的线性外插，
+//  给出一条视锥外半格的合法射线 —— 那正好是那个 froxel 真正覆盖的范围。
+//  夹紧反而会把边缘那一列的期望往画面内侧拉，症状是画面四边一圈雾偏浓。
 // ----------------------------------------------------------------------------
-float4 VistaFroxelInject(uint2 pixel, float slice)
+float4 VistaFroxelInject(float2 pixelCenter, float slice)
 {
-    float2 uv     = ((float2)pixel + 0.5) * rcp(max(_VistaFroxelSize.xy, 1.0));
+    float2 uv     = VistaFroxelPixelToUv(pixelCenter);
     float3 rayDir = VistaApFroxelRayDirection(uv);
 
     float dMeters = VistaFroxelSampleDistance(slice);
@@ -288,18 +378,63 @@ float4 VistaFroxelInject(uint2 pixel, float slice)
     return float4(smp.scattered * VISTA_EXPOSURE, greyExtinction);
 }
 
+// ----------------------------------------------------------------------------
+//  取历史读数（#22a）
+//
+//  与 VistaFroxelBlendHistory 的分工：这里做**采样**（要纹理），那里做**混合**（纯函数）。
+//  切在这条缝上，探针才能喂一个合成的 hist 去驱动 NaN 闸与亮度死区。
+//
+//  三线性（SAMPLE_LOD）而不是 LOAD：重投影出来的坐标一般不落在纹素中心上。
+//  compute 里没有隐式导数，所以必须显式 LOD 0。
+//
+//  非 OK 时**跳过采样**。这不是为了省几个 froxel 的带宽，而是为了让失能态
+//  （历史权重 0：首帧 / 换相机 / 档位 Off）整整 207 万个 froxel 一次 3D 纹理读都不发 ——
+//  那个条件在整趟 dispatch 里是**统一**的（uniform），没有分支发散。
+// ----------------------------------------------------------------------------
+uint VistaFroxelFetchHistory(float3 centreWS, out float3 uvwPrev, out float4 hist)
+{
+    hist = (float4)0.0;
+
+    uint mask = VistaFroxelReprojectUvw(centreWS, uvwPrev);
+    if (mask == VISTA_REPROJ_OK)
+        hist = SAMPLE_TEXTURE3D_LOD(_VistaFroxelInjectionHistory,
+                                    sampler_LinearClamp, uvwPrev, 0.0);
+
+    return mask;
+}
+
 // 注入表是逐 froxel 独立的（没有沿深度的累积），所以走满 3D 派发而不是
 // 「一线程一柱、循环切片」。默认档 240×135×64 = 207 万个 froxel，
 // 3D 派发给出 207 万个线程，而按柱只有 3.24 万个 —— 后者在 28 个 SM 上
 // 隐藏不住 StructuredBuffer 与阴影贴图的访存延迟。
 // #21 的积分是累积量，那个必须按柱，两者的派发形状本来就不同。
+//
+// ---- #22a：重投影就在这一趟里，不另开 pass ----
+// 读历史（另一张资源的 SRV）+ 写本帧（UAV），同一趟 dispatch，
+// 没有额外的表往返，也没有多一次 2M 个 froxel 的读写。HDRP 同样是这么做的。
+// 顺序上的要求只有一条：历史那张表本帧还没被写过 —— 由 VistaFroxelVolume 的
+// 双缓冲写下标保证（swap 在录制阶段做，一帧一次）。
 [numthreads(8, 8, 1)]
 void FroxelInjection(uint3 id : SV_DispatchThreadID)
 {
     if (any(id >= (uint3)_VistaFroxelSize.xyz))
         return;
 
-    _VistaFroxelInjectionRW[id] = VistaFroxelInject(id.xy, (float)id.z);
+    // 本帧的抖动样本。幅度为 0 时恒返回 0（失能态 = 零态），所以这里没有分支。
+    float3 jitter  = VistaFroxelJitterOffset(id);
+    float4 current = VistaFroxelInject((float2)id.xy + 0.5 + jitter.xy,
+                                       (float)id.z + jitter.z);
+
+    // 重投影用**格心**（未抖动），理由见 VistaFroxelReprojectUvw 与 VistaFroxelCentreWS。
+    float3 uvwPrev;
+    float4 hist;
+    uint   mask = VistaFroxelFetchHistory(VistaFroxelCentreWS(id), uvwPrev, hist);
+
+    // outMask / weight 在线上路径用不到（渲染只要返回值）；它们存在是为了让探针
+    // 记读数时不必把权重再算一遍。
+    uint  outMask;
+    float weight;
+    _VistaFroxelInjectionRW[id] = VistaFroxelBlendHistory(current, hist, mask, outMask, weight);
 }
 
 // ============================================================================
@@ -500,6 +635,27 @@ void FroxelIntegralVerify(uint3 id : SV_DispatchThreadID)
 #define VISTA_PROBE_SEG_X_MIN          17u
 #define VISTA_PROBE_SEG_X_MAX          18u
 
+// ---- #22a 追加：重投影的覆盖性 ----
+// 四个角色写进**互不重叠**的槽位区间（角色 1: 19~21 + 32 / 角色 2: 22~24 /
+// 角色 3: 25~28 / 角色 4: 29~30；31 是角色 3+4 共用的线程计数），
+// 于是「几种角色的读数被混在一起」在报表上不可能发生。
+// 每个区间都带一个**线程计数** —— 「一个读数接近 0 的档位无法自证自己执行过」，
+// 而这里 0 恰好是 STATIC_ERR 与 MASK_OR 的合法读数（完美 / 全 OK）。
+#define VISTA_PROBE_REPROJ_ONLINE_COUNT   19u  // 角色 1：线程数
+#define VISTA_PROBE_REPROJ_ONLINE_OK      20u  // 角色 1：mask == OK 的线程数
+#define VISTA_PROBE_REPROJ_ONLINE_MASK_OR 21u  // 角色 1：所有掩码的 OR
+#define VISTA_PROBE_REPROJ_STATIC_COUNT   22u  // 角色 2：线程数
+#define VISTA_PROBE_REPROJ_STATIC_ERR     23u  // 角色 2：max|uvwPrev − VistaFroxelUvw|，×1e9
+#define VISTA_PROBE_REPROJ_STATIC_MASK_OR 24u  // 角色 2：掩码 OR（必须恒为 0 = OK）
+#define VISTA_PROBE_REPROJ_HIT_NOHIST     25u  // 角色 3
+#define VISTA_PROBE_REPROJ_HIT_BEHIND     26u  // 角色 3
+#define VISTA_PROBE_REPROJ_HIT_OFFSCR     27u  // 角色 3
+#define VISTA_PROBE_REPROJ_HIT_RANGE      28u  // 角色 3
+#define VISTA_PROBE_REPROJ_HIT_LUM        29u  // 角色 4
+#define VISTA_PROBE_REPROJ_HIT_NAN        30u  // 角色 4
+#define VISTA_PROBE_REPROJ_COVER_COUNT    31u  // 角色 3 + 4：线程数
+#define VISTA_PROBE_REPROJ_JITTER_SPREAD  32u  // 角色 1：抖动引起的相对亮度散布 max，×1e6
+
 // 位 4「跑过」是必需的：只靠位 0~3 的话，一个从未派发的核留下的全零
 // 与「级联关 + 阴影图未绑 + 屏幕空间关 + 软阴影关」这个**完全合法**的组合
 // 在报表上长得一模一样。
@@ -516,6 +672,18 @@ void FroxelIntegralVerify(uint3 id : SV_DispatchThreadID)
 uint VistaProbeFixed(float v, float scale)
 {
     return (uint)clamp(v * scale, 0.0, VISTA_PROBE_FIXED_MAX);
+}
+
+// 探针网格 -> froxel 索引。取每格中心，避免只采到边界那一列。
+// 两个探针核共用这一份：网格映射写两遍的话，「换档后读数变了」会分不清是
+// 被测量变了还是两个核采到了不同的 froxel。
+uint3 VistaProbeFroxelIndex(uint3 id, uint3 size)
+{
+    uint3 fid = uint3(
+        (uint)((id.x + 0.5) * size.x / VISTA_PROBE_DIM_XY),
+        (uint)((id.y + 0.5) * size.y / VISTA_PROBE_DIM_XY),
+        (uint)((id.z + 0.5) * size.z / VISTA_PROBE_DIM_Z));
+    return min(fid, size - 1u);
 }
 
 [numthreads(8, 8, 1)]
@@ -616,15 +784,11 @@ void FroxelShadowProbe(uint3 id : SV_DispatchThreadID)
         }
     }
 
-    // 探针网格 -> froxel 索引。取每格中心，避免只采到边界那一列。
-    uint3 fid = uint3(
-        (uint)((id.x + 0.5) * size.x / VISTA_PROBE_DIM_XY),
-        (uint)((id.y + 0.5) * size.y / VISTA_PROBE_DIM_XY),
-        (uint)((id.z + 0.5) * size.z / VISTA_PROBE_DIM_Z));
-    fid = min(fid, size - 1u);
+    // 探针网格 -> froxel 索引。与重投影探针共用同一份映射。
+    uint3 fid = VistaProbeFroxelIndex(id, size);
 
     // 阴影走**被测函数自己**这一份实现，不重写。
-    float2 uv      = ((float2)fid.xy + 0.5) * rcp(max(_VistaFroxelSize.xy, 1.0));
+    float2 uv      = VistaFroxelPixelToUv((float2)fid.xy + 0.5);
     float3 rayDir  = VistaApFroxelRayDirection(uv);
     float  dMeters = VistaFroxelSampleDistance((float)fid.z);
     float  shadow  = VistaFroxelSunShadow(_VistaFroxelCameraWS.xyz + dMeters * rayDir);
@@ -675,4 +839,173 @@ void FroxelShadowProbe(uint3 id : SV_DispatchThreadID)
         VistaProbeFixed(segX, 1.0e9));
     InterlockedMax(_VistaFroxelShadowProbeRW[VISTA_PROBE_SEG_X_MAX],
         VistaProbeFixed(segX, 1.0e9));
+}
+
+// ============================================================================
+//  #22a 重投影的覆盖性探针
+//
+//  它要回答四个问题，四个角色各答一个（角色由 _VistaFroxelReprojProbe.w 选，
+//  写进互不重叠的槽位区间）：
+//    ① 线上这一帧的重投影，实际命中了哪些分支、有多少格用上了历史（角色 1）
+//    ② 相机静止时，格心投回去是否**正好**落在自己那一格的纹素中心（角色 2）
+//    ③ 每一条拒绝分支真的能被驱进去吗（角色 3：位移驱动；角色 4：合成 hist）
+//    ④ 抖动自己制造了多大的逐帧亮度变化（角色 1 的额外一格）
+//
+//  ---- 派发顺序有一条硬要求 ----
+//  角色 1 必须**第一个**派发。角色 2~4 会覆盖 VistaFroxelReprojCB 里的上一帧矩阵/
+//  范围/相机位置，而角色 1 要量的正是注入核这一帧实际吃进去的那一份 ——
+//  「参考解要用被测核实际吃进去的那份输入」。顺序由 C# 侧保证并在报表上点名。
+//
+//  ---- 为什么角色 2 存在 ----
+//  静止恒等性本来可以「等相机不动的那一帧顺手量一下」，但那样一来相机一动
+//  这一格就是空判据。角色 2 让 CPU 把上一帧那套参数**覆盖成本帧的**，
+//  于是这条恒等式无条件成立、无条件可判。
+//
+//  它是**必要不充分**的：prev = current 时恒等成立，并不证明 prev ≠ current 时
+//  矩阵是上一帧那个。补上另一半的是判据⑭（CPU 侧的整数：矩阵是第 frameIndex−1 帧抓的）。
+// ============================================================================
+[numthreads(8, 8, 1)]
+void FroxelReprojProbe(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= VISTA_PROBE_DIM_XY || id.y >= VISTA_PROBE_DIM_XY || id.z >= VISTA_PROBE_DIM_Z)
+        return;
+
+    uint3 size = (uint3)_VistaFroxelSize.xyz;
+    if (any(size == 0u))
+        return;
+
+    // 角色 0 = 无效。C# 侧的门本来就不该派发它，这里再挡一次是为了让
+    // 「忘了下发 _VistaFroxelReprojProbe」的症状是**所有计数为 0**（判据直接红），
+    // 而不是所有读数都被记到角色 1 的槽位上（一次假通过）。
+    uint role = (uint)(_VistaFroxelReprojProbe.w + 0.5);
+    if (role == 0u)
+        return;
+
+    uint3 fid = VistaProbeFroxelIndex(id, size);
+
+    // 合成位移做在**调用点**（而不是给共享函数加一个形参），见资源声明处的说明：
+    // 这样一个残留的脏全局只能影响探针，影响不到线上路径。
+    float3 centreWS = VistaFroxelCentreWS(fid) - _VistaFroxelReprojProbe.xyz;
+
+    float3 uvwPrev;
+    float4 hist;
+    uint   mask = VistaFroxelFetchHistory(centreWS, uvwPrev, hist);
+
+    // ------------------------------------------------------------------ 角色 1
+    if (role == 1u)
+    {
+        InterlockedAdd(_VistaFroxelShadowProbeRW[VISTA_PROBE_REPROJ_ONLINE_COUNT], 1u);
+        InterlockedOr (_VistaFroxelShadowProbeRW[VISTA_PROBE_REPROJ_ONLINE_MASK_OR], mask);
+        if (mask == VISTA_REPROJ_OK)
+            InterlockedAdd(_VistaFroxelShadowProbeRW[VISTA_PROBE_REPROJ_ONLINE_OK], 1u);
+
+        // ---- 抖动引起的相对亮度散布 ----
+        //  这一格量的是「抖动自己制造了多大的逐帧亮度变化」，它是
+        //  luminanceRejectStart（死区下端）的**下界**：死区摆在它之下的话，
+        //  这条失效规则会把自己的抖动噪声当成「场景变了」而降权，
+        //  亲手毁掉它本该保护的累积。
+        //
+        //  **不**拿 hist 与 current 去比 —— 那个差里混着相机运动与场景变化，
+        //  量出来的是一个被污染的上界。这里改成两次**独立抖动抽样**的相对差：
+        //  逐帧的相位平移本来也是独立抽样，所以两者同分布。
+        //  第二次把 hash 的输入挪 977 片（一个奇数，与任何 2 的幂互素，
+        //  PCG3D 的雪崩会把它彻底打散）。
+        //
+        //  读数是 16384 个 froxel 上的 **max**，不是均值 —— 死区要挡的是尾部。
+        float3 jA = VistaFroxelJitterOffset(fid);
+        float3 jB = VistaFroxelJitterOffset(fid + uint3(0u, 0u, 977u));
+        float  lA = VistaFroxelLuminance(
+            VistaFroxelInject((float2)fid.xy + 0.5 + jA.xy, (float)fid.z + jA.z).rgb);
+        float  lB = VistaFroxelLuminance(
+            VistaFroxelInject((float2)fid.xy + 0.5 + jB.xy, (float)fid.z + jB.z).rgb);
+
+        // 分母与 VistaFroxelLuminanceWeight 里那一份逐字相同（max 两者 + 1e-6 兜底）——
+        // 这一格的读数要能直接与死区下端比大小，两处用不同的归一化就没法比。
+        float rel = saturate(abs(lA - lB) / max(max(lA, lB), 1e-6));
+        InterlockedMax(_VistaFroxelShadowProbeRW[VISTA_PROBE_REPROJ_JITTER_SPREAD],
+            VistaProbeFixed(rel, 1.0e6));
+        return;
+    }
+
+    // ------------------------------------------------------------------ 角色 2
+    if (role == 2u)
+    {
+        // CPU 已把上一帧那套矩阵/范围/相机位置覆盖成本帧的，于是格心投回去
+        // 必须**正好**落在自己那一格的纹素中心上。
+        //
+        // xy 这条为什么是精确的（而不是「近似」）：视锥四角是 z = 1 平面上的
+        // **未归一化**角点（VistaAtmosphereViewData.SetFrustumRays 用
+        // CalculateFrustumCorners(rect, 1f, ...)），所以四角的双线性插值给出的是
+        // 该平面上的精确点，其投影回来正好是 uv；normalize 只改长度不改方向，
+        // cam + t·dir 仍在同一条射线上。它依赖 _VistaFroxelPrevViewProj 由
+        // camera.projectionMatrix 构造（与 CalculateFrustumCorners 同源）——
+        // 换成手工覆盖的投影矩阵这一格会红，而那正是想要的红。
+        //
+        // z 这条：dPrev = ReprojectDistance(i) = decode(i/N)，encode 回去 = i/N，
+        // 加上那半个纹素 = (i+0.5)/N = VistaFroxelUvw(fid).z。残差只有
+        // log/exp 的 fp32 往返误差（与判据①同一个量级，~1e-7）。
+        float3 uvwNow = VistaFroxelUvw(fid);
+        float3 d      = abs(uvwPrev - uvwNow);
+        float  err    = max(max(d.x, d.y), d.z);
+
+        InterlockedAdd(_VistaFroxelShadowProbeRW[VISTA_PROBE_REPROJ_STATIC_COUNT], 1u);
+        InterlockedOr (_VistaFroxelShadowProbeRW[VISTA_PROBE_REPROJ_STATIC_MASK_OR], mask);
+        InterlockedMax(_VistaFroxelShadowProbeRW[VISTA_PROBE_REPROJ_STATIC_ERR],
+            VistaProbeFixed(err, 1.0e9));
+        return;
+    }
+
+    InterlockedAdd(_VistaFroxelShadowProbeRW[VISTA_PROBE_REPROJ_COVER_COUNT], 1u);
+
+    // ------------------------------------------------------------------ 角色 3
+    if (role == 3u)
+    {
+        // 位移驱动的四条拒绝分支。哪一条被驱进去由 CPU 选的位移决定，
+        // 这里只按**实际返回的**掩码计数 —— 反过来（CPU 说该命中哪一条、
+        // shader 照着记）就成了一个无法失败的判据。
+        //
+        // 用 else-if 链而不是逐位 &：掩码是**互斥**的（谓词第一条命中就 return），
+        // 而 & 会让「掩码里意外出现两位」这件事在报表上被静默吃掉。
+        if (mask == VISTA_REPROJ_NO_HISTORY)
+            InterlockedAdd(_VistaFroxelShadowProbeRW[VISTA_PROBE_REPROJ_HIT_NOHIST], 1u);
+        else if (mask == VISTA_REPROJ_BEHIND)
+            InterlockedAdd(_VistaFroxelShadowProbeRW[VISTA_PROBE_REPROJ_HIT_BEHIND], 1u);
+        else if (mask == VISTA_REPROJ_OFF_SCREEN)
+            InterlockedAdd(_VistaFroxelShadowProbeRW[VISTA_PROBE_REPROJ_HIT_OFFSCR], 1u);
+        else if (mask == VISTA_REPROJ_OUT_OF_RANGE)
+            InterlockedAdd(_VistaFroxelShadowProbeRW[VISTA_PROBE_REPROJ_HIT_RANGE], 1u);
+        return;
+    }
+
+    // ------------------------------------------------------------------ 角色 4
+    //  混合那两条守卫。没有任何相机位移能驱动它们（NaN 进不了线上的表，
+    //  亮度差取决于场景），所以这里喂**合成的 hist**，走的仍然是线上那一份
+    //  VistaFroxelBlendHistory。
+    //
+    //  这一格证明的是「闸接对了」（谓词命中 ⇒ 掩码被置上 ⇒ 早退），
+    //  **不是**「AnyIsNaN 在这台硬件上判得对」—— 后者是 URP 的位模式比较，
+    //  不是本项目的量。线上那条路径会不会真的读到 NaN 是另一格（角色 1 的掩码 OR），
+    //  而它由构造保证读不到（CPU 侧的 historyContentValid 挡着未写过的表）。
+    {
+        uint  m;
+        float w;
+
+        // NaN 从**uniform** 里构造，而不是写 asfloat(0x7FC00000u) 那种编译期常量：
+        // 常量会被折叠，于是这条闸在编译期就被判定完了，运行时一条指令都不执行。
+        // probe.xyz 在角色 4 下是 0，OR 上 0x7FC00000 得到 quiet NaN；
+        // 而无论 probe.x 是什么，指数位被置满、尾数最高位被置上 ⇒ 恒为 NaN。
+        float nan = asfloat(asuint(_VistaFroxelReprojProbe.x) | 0x7FC00000u);
+        VistaFroxelBlendHistory((float4)1.0, float4(nan, 0.0, 0.0, 0.0), VISTA_REPROJ_OK, m, w);
+        if (m == VISTA_REPROJ_NAN)
+            InterlockedAdd(_VistaFroxelShadowProbeRW[VISTA_PROBE_REPROJ_HIT_NAN], 1u);
+
+        // 亮度：current 与 hist 都用合成值，一个全 1 一个全 0 ⇒ rel **恒等于 1**。
+        // 于是 t = saturate((1 − start)/(full − start)) ≥ 1 对任何合法的
+        // start < full ≤ 1 都成立 —— 这一条因此与场景、与美术填的两个滑条都无关。
+        // 拿真实的 current 去比就不是这样：无雾场景下 current.rgb = 0、hist = 0 ⇒
+        // rel = 0，这一格会在「场景里没雾」时静默变成空判据。
+        VistaFroxelBlendHistory((float4)1.0, (float4)0.0, VISTA_REPROJ_OK, m, w);
+        if (m == VISTA_REPROJ_LUMINANCE)
+            InterlockedAdd(_VistaFroxelShadowProbeRW[VISTA_PROBE_REPROJ_HIT_LUM], 1u);
+    }
 }
