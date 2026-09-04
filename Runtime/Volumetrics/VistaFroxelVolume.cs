@@ -34,12 +34,17 @@ namespace Vista
         public const int k_IntegrationReportFloat4PerSlice = 4;
 
         /// <summary>
-        /// 阴影覆盖性探针的槽位数（#20 起 19，#22a 追加重投影的 14 格到 33）。必须与
+        /// 阴影覆盖性探针的槽位数（#20 起 19，#22a 追加重投影的 14 格到 33，
+        /// #22b 追加抖动源统计的 47 格到 80）。必须与
         /// <c>VolumetricFog.compute</c> 里 <c>VISTA_PROBE_*</c> 那组下标的最大值 + 1 一致 ——
         /// 少一个的症状是最后一个槽位的 Interlocked 写越界，而 D3D11 上越界 UAV 写是**静默丢弃**，
         /// 判据会读到一个恒为初值的格子并把它当成「这一路没执行」。
+        ///
+        /// 这一条由判据⓿双向盯着（<c>VistaVolumetricFogState</c> 的 <c>k_SlotTotal</c>
+        /// 必须与这里逐位相等），所以三个数（这里、shader 的下标上限、Editor 的镜像）
+        /// 里任意一个漏改都会在报表第一格红掉，而不是变成静默丢弃的写。
         /// </summary>
-        public const int k_ShadowProbeSlots = 33;
+        public const int k_ShadowProbeSlots = 82;
 
         // 探针里三个走 InterlockedMin 的槽位
         // （SHADOW_MIN = 0, SHADOWMAP_MIN = 8, SEG_X_MIN = 17）。
@@ -49,6 +54,11 @@ namespace Vista
         // #22a 追加的 14 格（19~32）全部是 Add / Or / Max，没有新的 min 槽位 ——
         // 于是这个数组不用动。这句话是**结论**而不是省事：如果哪天加了一格 min
         // 却忘了登记，它的读数会恒为 0，而 0 在那些格子里是合法读数。
+        //
+        // #22b 追加的 47 格（33~79）同理，全部是 Add / Max。特别地那四个
+        // 「档位接线」的槽位（76~79）走的是 InterlockedMax 而不是 Min：
+        // 判据要的是「max|online − 某一档| 恰好为 0」，用 Min 的话初值 0 会让
+        // 每一格都是 0，「恰好有一个为 0」变成四个都为 0 —— 一个自己造不出失败的判据。
         static readonly int[] k_ShadowProbeMinSlots = { 0, 8, 17 };
 
         readonly ComputeShader m_Cs;
@@ -60,6 +70,7 @@ namespace Vista
         readonly int m_KernelSynthMediumIdx = -1;
         readonly int m_KernelIntegralVerifyIdx = -1;
         readonly int m_KernelReprojProbeIdx = -1;
+        readonly int m_KernelJitterProbeIdx = -1;
 
         // 注入表是**双缓冲**（#22）：本帧写一张、读另一张做时间重投影。
         //
@@ -116,20 +127,22 @@ namespace Vista
                 m_KernelIntegralVerifyIdx = m_Cs.FindKernel("FroxelIntegralVerify");
             if (m_Cs.HasKernel("FroxelReprojProbe"))
                 m_KernelReprojProbeIdx = m_Cs.FindKernel("FroxelReprojProbe");
+            if (m_Cs.HasKernel("FroxelJitterProbe"))
+                m_KernelJitterProbeIdx = m_Cs.FindKernel("FroxelJitterProbe");
         }
 
         /// <summary>
-        /// 八个核都在。分开判「资源在不在」（<see cref="isAllocated"/>）与「核在不在」，
+        /// 九个核都在。分开判「资源在不在」（<see cref="isAllocated"/>）与「核在不在」，
         /// 理由与 <c>VistaAtmosphereLuts</c> 那四个独立的 valid 属性相同：
         /// 前者是每帧可变的状态，后者在构造之后就是常量，混成一个属性
         /// 会让「shader 编译坏了」与「这一帧还没分配」在日志上长得一样。
         ///
-        /// 要求**全部都在**而不是按核分成八个属性：它们在同一个 .compute 文件里，
-        /// 一个编译失败就是八个都没有。真正会出现的「部分缺失」只有一种 ——
+        /// 要求**全部都在**而不是按核分成九个属性：它们在同一个 .compute 文件里，
+        /// 一个编译失败就是九个都没有。真正会出现的「部分缺失」只有一种 ——
         /// #pragma kernel 那行写错了名字 —— 那时按整体判会让整条近层雾路径退出，
-        /// 比让七个核继续跑、第八个安静地什么都不做要好归因。
+        /// 比让八个核继续跑、第九个安静地什么都不做要好归因。
         ///
-        /// 三个自检核（SynthMedium / IntegralVerify / ReprojProbe）也算进来，
+        /// 四个自检核（SynthMedium / IntegralVerify / ReprojProbe / JitterProbe）也算进来，
         /// 尽管线上路径不派发它们：
         /// 「一个默认关闭、又没有判据覆盖的开关，等于一段永远不会被发现写错的代码」——
         /// 把它们纳入 isValid，核名写错就会在**第一次真实渲染**时报出来，
@@ -139,7 +152,8 @@ namespace Vista
             && m_KernelPlaceholderIdx >= 0 && m_KernelSliceVerifyIdx >= 0
             && m_KernelInjectionIdx >= 0 && m_KernelShadowProbeIdx >= 0
             && m_KernelIntegrationIdx >= 0 && m_KernelSynthMediumIdx >= 0
-            && m_KernelIntegralVerifyIdx >= 0 && m_KernelReprojProbeIdx >= 0;
+            && m_KernelIntegralVerifyIdx >= 0 && m_KernelReprojProbeIdx >= 0
+            && m_KernelJitterProbeIdx >= 0;
 
         public bool isAllocated => m_InjectionBuffers[0] != null && m_InjectionBuffers[1] != null
             && m_Integral != null;
@@ -411,6 +425,8 @@ namespace Vista
             dispatcher.SetTexture(m_Cs, m_KernelInjectionIdx,
                 VistaShaderIDs._VistaFroxelInjectionHistory, VistaLutSlot.FroxelInjectionHistory);
 
+            BindBlueNoise(dispatcher, m_KernelInjectionIdx);
+
             dispatcher.Dispatch(m_Cs, m_KernelInjectionIdx,
                 VistaComputeUtils.DivRoundUp(desc.width, 8),
                 VistaComputeUtils.DivRoundUp(desc.height, 8),
@@ -420,6 +436,30 @@ namespace Vista
             // 推进错的症状是下一帧把一张没写过的表当历史混进去，
             // 而 fp16 的未初始化显存可能是 NaN —— 一进表就永久驻留。
             NoteInjectionDispatched();
+        }
+
+        /// <summary>
+        /// 蓝噪声瓦片的逐核绑定（#22b）。三个核要读它：注入、重投影探针（角色 1 的
+        /// 两次抽样）、抖动探针。抽成一个方法而不是抄三遍：三处的**条件**必须完全一样，
+        /// 而抄三遍时漏掉一处的症状是那个核读到全 0 —— 抖动退化成常数相位偏移，
+        /// 画面上 banding 回来、报表上一格不红（#22b 的成因就是这个形态）。
+        ///
+        /// 条件问的是 <c>dispatcher.HasTexture</c> 而不是 <c>VistaBlueNoise.available</c>：
+        /// graph 侧还要求本趟 pass 确实 import + <c>UseTexture</c> 过它，
+        /// 而 <c>available</c> 对此一无所知（两份真相）。问 dispatcher 则是问
+        /// **被测的那份绑定源自己**。
+        ///
+        /// 为什么必须有条件：一个无效 handle / null RTHandle 绑上去**不会炸** ——
+        /// 隐式转换给出 <c>default(RenderTargetIdentifier)</c>，也就是 CameraTarget，
+        /// 那是一次静默绑错。而缺失本身是合法路径（回落到程序化抖动，
+        /// 由 <c>Data.Bind</c> 把源位一起清成 0，两处保持一致）。
+        /// </summary>
+        void BindBlueNoise<T>(in T dispatcher, int kernelIdx) where T : IVistaLutDispatcher
+        {
+            if (!dispatcher.HasTexture(VistaLutSlot.BlueNoise)) return;
+
+            dispatcher.SetTexture(m_Cs, kernelIdx,
+                VistaShaderIDs._VistaFroxelBlueNoise, VistaLutSlot.BlueNoise);
         }
 
         /// <summary>
@@ -593,8 +633,45 @@ namespace Vista
                 VistaShaderIDs._VistaFroxelInjectionHistory, VistaLutSlot.FroxelInjectionHistory);
             dispatcher.SetBuffer(m_Cs, m_KernelReprojProbeIdx,
                 VistaShaderIDs._VistaFroxelShadowProbeRW, VistaLutBufferSlot.FroxelShadowProbe);
+            // 角色 1 的两次抽样走 VistaFroxelJitterOffset(Alt)Phase ⇒ 蓝噪声档下它读那张图。
+            BindBlueNoise(dispatcher, m_KernelReprojProbeIdx);
             // 32×32×16 / numthreads(8,8,1)
             dispatcher.Dispatch(m_Cs, m_KernelReprojProbeIdx, 4, 4, 16);
+        }
+
+        /// <summary>
+        /// #22b 的抖动源探针（判据⑰⑱⑲⑳ + 档位接线）。
+        ///
+        /// 与上面那七趟不同，这一趟**一张 LUT 都不绑**：抖动偏移是下标的纯函数，
+        /// 它不读注入表、不读大气表、也不需要相机。输入只有
+        /// <c>_VistaFroxelJitter</c> / <c>_VistaFroxelJitterPhase</c>（由
+        /// <see cref="VistaFroxelReprojection.Data.Bind"/> 下发的那一份，也就是**注入核
+        /// 实际吃进去的那一份**）加上蓝噪声瓦片，输出只有探针缓冲。
+        /// 「刻意不声明一个用不到的资源」——多绑一张表会让「这一格到底依赖什么」变模糊，
+        /// 也会让一次「注入表还没分配」错误地把这一格拖成未覆盖。
+        ///
+        /// 蓝噪声那张是**唯一的纹理输入**，而它必须显式绑（#22b）：
+        /// <c>Shader.SetGlobalTexture</c> 写的是立即态全局表，不进命令流，
+        /// 而 compute dispatch 的纹理是在命令流里解析的 ——
+        /// 完整因果见 <see cref="VistaBlueNoise.handle"/>。
+        ///
+        /// 也**不**加 <see cref="isAllocated"/> 这道门，同一条理由：
+        /// 它不碰那三张纹理。挂 isAllocated 的代价是判据在立即模式下变成空判据。
+        ///
+        /// 派发口径固定 8×8 组 = 64×64 线程 = 蓝噪声瓦片的一个整周期，
+        /// 与体积的 xy 尺寸无关（⑰的「每桶正好 512」这条精确期望依赖它）。
+        /// 唯一的体积依赖是⑳要用的片数，那道门在 shader 里判（片数 ≠ 64 时
+        /// 对角恒等式的前提不成立 ⇒ 计数槽留 0 ⇒ 报表点名未覆盖）。
+        /// </summary>
+        public void DispatchJitterProbe<T>(in T dispatcher) where T : IVistaLutDispatcher
+        {
+            if (!isValid || m_ShadowProbe == null) return;
+
+            dispatcher.SetBuffer(m_Cs, m_KernelJitterProbeIdx,
+                VistaShaderIDs._VistaFroxelShadowProbeRW, VistaLutBufferSlot.FroxelShadowProbe);
+            BindBlueNoise(dispatcher, m_KernelJitterProbeIdx);
+            // 64×64 / numthreads(8,8,1)
+            dispatcher.Dispatch(m_Cs, m_KernelJitterProbeIdx, 8, 8, 1);
         }
 
         void Allocate(in VistaFroxelVolumeDesc desc)

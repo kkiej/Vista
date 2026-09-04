@@ -151,6 +151,18 @@ namespace Vista
 
         /// <summary>见 <see cref="froxelReprojProbeRole3Dispatches"/>。</summary>
         public int froxelReprojProbeRole4Dispatches => m_Luts != null ? m_Luts.reprojProbeRole4Dispatches : -1;
+
+        /// <summary>
+        /// 仅 Editor 自检：抖动探针（#22b）派发了几趟。期望 1。
+        ///
+        /// 它存在的理由是把两种「读数全 0」分开：**压根没派发**（m_FroxelVolume 为 null、
+        /// 或那趟 pass 没排进去）与**派发了但核内第一道守卫早退**（抖动幅度为 0）。
+        /// 两者的 COUNT 槽都是 0，而前者是布景/接线问题、后者是配置问题 ——
+        /// 报表要能一眼分开，否则归因会从「探针坏了」开始查一件其实是「旋钮关着」的事。
+        ///
+        /// 同上：取不到 LUT 时返回 **−1**，不是 0。
+        /// </summary>
+        public int froxelJitterProbeDispatches => m_Luts != null ? m_Luts.jitterProbeDispatches : -1;
 #endif
 
         /// <summary>
@@ -287,6 +299,18 @@ namespace Vista
             m_FroxelDebugPass = null;
             m_Luts?.Dispose();
             m_Luts = null;
+
+            // 蓝噪声的解析缓存也一起丢掉（#22b）。放在这里而不是另开一个
+            // RenderPipelineManager.activeRenderPipelineDisposed 钩子：这一趟 Dispose
+            // 正好覆盖那些让缓存失效的事件 —— 换 URP 资产、改全局设置、shader 重编译。
+            // 缓存的内容是 GetRenderPipelineSettings 的结果（绑在当前
+            // RenderPipelineGlobalSettings 上）与一个包着它的 RTHandle；不丢的症状是
+            // 换过全局设置资产之后句柄指向一张可能已被卸载的 Texture2D。
+            //
+            // 与「新实例 Create → 旧实例 Dispose」的顺序无冲突：Invalidate 只丢缓存，
+            // 下一次访问会重新解析；而 import 发生在每帧的 RecordRenderGraph 里，
+            // 不在 Create 里，所以这一刻不会有人正持着那个 handle。
+            VistaBlueNoise.Invalidate();
         }
     }
 }

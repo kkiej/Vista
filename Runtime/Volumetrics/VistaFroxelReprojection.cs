@@ -45,10 +45,20 @@ namespace Vista
         // ⇒ 20 帧），随机数在 20 个样本里的覆盖有洞（生日碰撞），洞的症状是残影里
         // 一层低频斑。Kronecker 序列的差异度有下界，1D 上是可证最优的一类。
         //
-        // 为什么不是一张 z=64 的 3D 噪声纹理：那个每 64 帧循环一次，而这个**永不循环**。
-        // 而且「对每个像素加同一个 t·α」是平移变换，所以空间上的蓝噪声性质逐帧保持 ——
-        // 2D 蓝噪声 + 这条时间轴在**两个边缘轴**上都是最优的，真 3D STBN 多买到的
-        // 只有斜对角频率，而体积雾这种低频信号对斜对角最不敏感。
+        // 为什么不是一张 z=64 的 3D 噪声纹理（STBN）：那个每 64 帧循环一次，而这个**永不循环**。
+        //
+        // ---- 一条被本轮否证的论证，留在这里 ----
+        //  #22a 时这里写的是：「对每个像素加同一个 t·α 是平移变换，所以空间上的蓝噪声
+        //  性质逐帧保持；2D 蓝噪声 + 这条时间轴在两个边缘轴上都是最优的，真 3D STBN
+        //  多买到的只有斜对角频率」。**这条太强了，是错的。**
+        //  frac 的绕回不是平移：两个值上相距很远（因此在蓝噪声里是合法邻居）的像素，
+        //  例如 0.99 与 0.01，加 0.1 之后变成 0.09 与 0.11 —— 一对**近值邻居**，
+        //  正是蓝噪声要避免的东西。所以动画之后那一片的谱是会退化的。
+        //  真 3D STBN 多买到的也不只是斜对角频率，而是**联合**的空间-时间谱，
+        //  它在「时间窗口内还要跑一个空间滤波」时才真正兑现（本项目没有那一步）。
+        //
+        //  这条更正的直接后果：判据⑱量的必须是 frac(v + n·φ)（**动画后**那一片）的谱，
+        //  而不是源纹理自己的谱 —— 后者是一个「布景不走被测代码路径」的空判据。
         const double k_Plastic = 1.2207440846057594753616853503;
 
         static readonly Vector3 k_R3Alpha = new Vector3(
@@ -76,7 +86,15 @@ namespace Vista
             /// <summary>xyz = R3 序列的本帧相位 ∈ [0,1)³；w 保留。</summary>
             public readonly Vector4 jitterPhase;
 
-            /// <summary>x = 横向抖动幅度（格），y = 深度抖动幅度（片），zw 保留。</summary>
+            /// <summary>
+            /// x = 横向抖动幅度（格），y = 深度抖动幅度（片），
+            /// z = 抖动源（0 程序化 / 1 蓝噪声），w = 横向偏移的 z 步进倍数
+            /// （0 逐列一致 / 1 逐片独立）。
+            ///
+            /// zw 两个档位都是**运行时**值而不是宏，与项目里「算法档运行时可切」一致。
+            /// 零态（全 0）落在「程序化 + 逐列一致」上，而幅度也是 0 ⇒ 整个函数返回 0，
+            /// 所以那两位在失能态下读不到、也不需要有意义。
+            /// </summary>
             public readonly Vector4 jitter;
 
             /// <summary>x = 亮度死区下端，y = 1/(上端 − 下端)，zw 保留。</summary>
@@ -100,6 +118,8 @@ namespace Vista
             /// 下发。走全局而不是逐核参数：注入核与探针核都要读同一组值，
             /// 而探针核必须读到**注入核实际吃进去的那一份**（同一条理由让
             /// <c>RenderFroxelShadowProbe</c> 刻意不重推 <c>_VistaFroxelCameraWS</c>）。
+            ///
+            /// 唯一一处**不逐字下发**的是抖动源位，见方法体里的注释。
             /// </summary>
             public void Bind<T>(in T dispatcher) where T : IVistaLutDispatcher
             {
@@ -107,7 +127,24 @@ namespace Vista
                 dispatcher.SetGlobalVector(VistaShaderIDs._VistaFroxelPrevRange, prevRange);
                 dispatcher.SetGlobalVector(VistaShaderIDs._VistaFroxelPrevCameraWS, prevCameraWS);
                 dispatcher.SetGlobalVector(VistaShaderIDs._VistaFroxelJitterPhase, jitterPhase);
-                dispatcher.SetGlobalVector(VistaShaderIDs._VistaFroxelJitter, jitter);
+
+                // 抖动源位（z）与「这一趟到底拿不拿得到那张蓝噪声图」必须一致。
+                // 源位是 1 而纹理没绑上时，D3D11 上核里读到的是全 0（未绑定 SRV 读 0，
+                // **不是**引擎默认白图 —— 那条经验只对 material shader 成立），
+                // 于是 frac(0 + φ) ≡ φ，抖动退化成一个逐帧常数的相位偏移：
+                // 画面上 banding 回来，报表上一格不红。#22b 的成因正是这个形态。
+                //
+                // 所以这一位在这里由**绑定源自己**兜底，而不是只靠 CPU 侧的
+                // VistaBlueNoise.available：后者对「本趟 pass 有没有 import +
+                // UseTexture 过它」一无所知，那是两份真相。
+                // 兜底之后「资产缺失」与「pass 忘了声明」这两种缺失都会让判据㉑变红
+                // （期望取自 settings + CPU 侧回落原因，读数取自 cbuffer）——
+                // 一个原本查不出来的错，现在有一格能替它失败。
+                var effJitter = jitter;
+                if (!dispatcher.HasTexture(VistaLutSlot.BlueNoise))
+                    effJitter.z = 0f;
+                dispatcher.SetGlobalVector(VistaShaderIDs._VistaFroxelJitter, effJitter);
+
                 dispatcher.SetGlobalVector(VistaShaderIDs._VistaFroxelReprojParams, rejectParams);
             }
 
@@ -228,6 +265,7 @@ namespace Vista
 
             Vector4 phase = Vector4.zero;
             Vector4 jitter = Vector4.zero;
+            jitterFallbackReason = null;   // Off 档没有「回落」这件事，别留上一帧的陈旧串
             if (jitterOn)
             {
                 // frac(frameIndex · α)。乘法在 double 上做：float 下 frameIndex 到
@@ -238,11 +276,10 @@ namespace Vista
                     (float)Frac(m_FrameIndex * (double)k_R3Alpha.y),
                     (float)Frac(m_FrameIndex * (double)k_R3Alpha.z),
                     0f);
-                jitter = new Vector4(
-                    Mathf.Clamp01(settings.lateralJitterAmount),
-                    Mathf.Clamp01(settings.depthJitterAmount),
-                    0f, 0f);
+                jitter = JitterParamsOf(settings);
             }
+
+            lastJitterPhase = phase;
 
             Vector4 reject = RejectParamsOf(settings);
 
@@ -268,6 +305,64 @@ namespace Vista
         }
 
         static double Frac(double x) => x - System.Math.Floor(x);
+
+        /// <summary>本帧抖动源是否回落了（选了蓝噪声但取不到图）。null = 没回落。</summary>
+        public string jitterFallbackReason { get; private set; }
+
+        /// <summary>
+        /// 本帧实际下发的抖动相位 frac(frameIndex · α)（Off 档为零向量）。
+        ///
+        /// 专门为判据⑱开的只读访问器。它不是「多余的调试字段」：⑱只能判邻域相关的
+        /// **符号**，幅值随相位摆动而那个摆幅没有紧的界，所以报表必须把当帧的 φ
+        /// 印出来 —— 否则同一格在不同帧给出量级不同的幅值时，读者无从判断
+        /// 「是相位换了」还是「抽头写坏了」。
+        /// </summary>
+        public Vector4 lastJitterPhase { get; private set; }
+
+        /// <summary>
+        /// 抖动那一组 (幅度x, 幅度y, 源, z 步进倍数) 的下发形式。
+        ///
+        /// 蓝噪声档的**回落判定在 CPU 上做**：资产取不到时源位就写 0（程序化），
+        /// 而不是照写 1 让 shader 去兜底 —— 未绑定的纹理在 D3D11 上逐像素读到 0
+        /// （**不是**引擎默认白图，那条经验只对 material shader 成立），
+        /// 于是 frac(0 + φ) ≡ φ，抖动退化成一个逐帧常数的相位偏移：画面上 banding
+        /// 回来，报表上一格不红。回落之后原因会打印进状态日志
+        /// （<see cref="jitterFallbackReason"/>），于是「我选了蓝噪声但它跟程序化
+        /// 一模一样」有一个能读的答案。
+        ///
+        /// 这里判的只是「资产存不存在」。「这一趟 dispatch 到底拿不拿得到它」是
+        /// 另一件事（graph 侧还要求本趟 pass import + UseTexture 过），
+        /// 由 <see cref="Data.Bind{T}"/> 问 <c>dispatcher.HasTexture</c> 再兜一次 ——
+        /// 两处判的是两个不同的前提，不是同一个量的两份实现。
+        ///
+        /// 绑定**不在这里做**：<c>Shader.SetGlobalTexture</c> 写的是立即态全局表，
+        /// 它不进命令流，而 compute dispatch 的纹理是在命令流里解析的
+        /// （#22b 的成因，完整因果见 <see cref="VistaBlueNoise.handle"/>）。
+        /// 现在这张图走 <see cref="VistaLutSlot.BlueNoise"/> 槽位，由消费它的
+        /// 那几趟 pass import + 逐核显式绑。
+        /// </summary>
+        Vector4 JitterParamsOf(VistaVolumetricFogSettings settings)
+        {
+            jitterFallbackReason = null;
+
+            float source = 0f;
+            if (settings.jitterMode == JitterMode.BlueNoise)
+            {
+                if (VistaBlueNoise.available)
+                    source = 1f;
+                else
+                    jitterFallbackReason = VistaBlueNoise.lastFailure ?? "未知原因";
+            }
+
+            // 逐片独立 = 1（hash/抽头的 z 输入乘 1），逐列一致 = 0（z 输入被清零）。
+            // 做成「倍数」而不是布尔的收益：两个源共用同一行代码，且**一个分支都不需要**。
+            float zStride = settings.lateralJitterShape == LateralJitterShape.PerSlice ? 1f : 0f;
+
+            return new Vector4(
+                Mathf.Clamp01(settings.lateralJitterAmount),
+                Mathf.Clamp01(settings.depthJitterAmount),
+                source, zStride);
+        }
 
         /// <summary>
         /// 本类**唯一**一处构造 viewProj 的地方。判据⑬（静止恒等性）的精确性依赖于

@@ -106,7 +106,9 @@ CBUFFER_START(VistaFroxelReprojCB)
     float4 _VistaFroxelPrevCameraWS;
     // xyz: R3 塑性常数 Kronecker 序列的本帧相位 ∈ [0,1)³。
     float4 _VistaFroxelJitterPhase;
-    // x: 横向抖动幅度（单位 = 一格宽），y: 深度抖动幅度（单位 = 一片厚）。
+    // x: 横向抖动幅度（单位 = 一格宽），y: 深度抖动幅度（单位 = 一片厚），
+    // z: 抖动源（0 = 程序化 hash，1 = 蓝噪声瓦片），w: 横向偏移的 z 步进倍数
+    //    （0 = 逐列一致，1 = 逐片独立）。
     float4 _VistaFroxelJitter;
     // x: 亮度死区下端，y: 1/(上端 − 下端)。宽度由 CPU 保证 > 0。
     float4 _VistaFroxelReprojParams;
@@ -272,19 +274,63 @@ float3 VistaFroxelUvw(uint3 id)
 // ----------------------------------------------------------------------------
 //  抖动（#22）
 //
-//  空间上一个整数 hash（PCG3D），时间上把 CPU 算好的 R3 相位加上去再取小数。
-//  「加同一个相位」是平移变换，所以空间上的噪声性质逐帧保持 —— 这也是
-//  #22b 换成蓝噪声纹理时**只需要换掉 hash 那一行**的原因。
+//  空间上两个可选源（uniform 分支，不是宏）：
+//    · 程序化：整数 hash（PCG3D）—— 空间上是**白**噪声。
+//    · 蓝噪声：URP 自带的 64×64 环形 void-and-cluster 瓦片，三次固定偏移抽头。
+//  时间上都是同一条：把 CPU 算好的 R3 相位加上去再取小数。
 //
-//  hash 把 z（切片）算进去，于是同一列上每片的偏移互不相关。
-//  代价：横向抖动逐片不同 ⇒ 积分那一趟走的是一条微微扭动的射线，
-//  而不是严格的直线。60 m 处一格宽 0.94 m，扭动是亚格量级；
-//  HDRP 与 UE5 的抖动同样是逐 voxel 三维的。换来的是同一列上 N 个样本
-//  在横向也互相独立，方差按 N 降而不是按 1 降。
+//  ---- 一条被否证的论证 ----
+//  #22a 这里写的是「加同一个相位是平移变换，所以空间上的噪声性质逐帧保持，
+//  #22b 换蓝噪声只需要换掉 hash 那一行」。**那条是错的。**
+//  frac 的绕回不是平移：值上相距很远（在蓝噪声里是合法邻居）的 0.99 与 0.01，
+//  加 0.1 之后成为 0.09 与 0.11 —— 一对近值邻居，正是蓝噪声要避免的。
+//  所以「动画之后那一片还是不是蓝的」必须被量出来（判据⑱量的是 frac(v + φ)，
+//  不是源图），而不是靠这条论证。
+//
+//  ---- 横向偏移沿 z 的形态：为什么它决定蓝噪声有没有用 ----
+//  #22a 的 hash 输入带 id.z，于是横向偏移**逐片独立**，同一列上 N 个样本在横向
+//  也互相独立、方差按 N 降。那条收益是真的，但它与蓝噪声互斥 ——
+//  一个像素看到的是沿列积分的和 = N ≈ 64 个偏移场的和，聚合之后源图的空间性质
+//  就不是原来那个了。**但退化成什么，#22b 算出来的答案与 #22a 写的不一样：**
+//
+//  #22a 这里写的是「中心极限定理把这个和推向高斯**白**噪声」。那条对程序化 hash
+//  成立（每片独立），对蓝噪声**不成立**。固定步进 s = (17,17) 下聚合是一个
+//  **线性滤波**：Ā(p) = (1/N)Σ_z w(p + s·z)，w = frac(v + φ)。它的 Fourier
+//  乘子是 K(f) = (1/N)Σ_{z=0..63} e^{2πi f·s z/64} = δ[f_x + f_y ≡ 0 (mod 64)]
+//  （精确成立，因为 17 在 mod 64 下可逆、z 跑满整个周期）。支撑集落在
+//  f_x + f_y ≡ 0 上 ⇒ 基函数是 e^{2πi f_x (x−y)/64} ⇒ **Ā(x,y) = h((x−y) mod 64)**，
+//  一个只依赖反对角的一维函数。也就是**对角条纹**，不是白噪声。
+//
+//  不用 Fourier 也能一句话看出来：17 与 64 互素 ⇒ {17z mod 64 : z = 0..63} = Z_64
+//  ⇒ 那 64 个抽样点正好是过 (x,y) 的**整条反对角线**，于是均值当然只依赖 x − y。
+//  这条论证对**任何**逐点函数 F 成立，所以 frac 的绕回救不了它。
+//
+//  代价的正确说法因此是：逐片独立买到 /√N 的幅度，代价是引入**方向性相关**
+//  （判据⑳量 max|Ā(p+(1,1)) − Ā(p)| ≈ 0，而 max|Ā(p+(1,0)) − Ā(p)| 是 O(0.1)）。
+//  逐列一致（_VistaFroxelJitter.w = 0）不买那个 /√N，但聚合偏移仍然是源图本身，
+//  而它正好是 UE5（View.VolumetricFogTemporalJitter）与 HDRP（_VBufferSampleOffset）
+//  那个「全屏一个常量偏移」的结构，只是从「全屏一个」升级成「逐屏幕瓦片一个」。
+//  两档都留成运行时开关，因为这条取舍本身就是判据⑳量出来的读数，不是断言的。
+//
+//  待办（#22b 刻意不做）：把逐片的横向偏移改成**逐片随机**的瓦片偏移
+//  （而不是固定步进 s·z）。那时 K(f) = O(1/√N) 对所有 f ≠ 0 成立 ⇒ 聚合确实白，
+//  于是「/√N 的幅度」与「无结构」可以同时拿到。任何**固定**步进都逃不掉条纹。
+//
+//  **深度偏移永远逐片独立**，不受 .w 影响：每片是一个独立的积分子区间，
+//  让它们同步等于让整条射线一起前后平移，那才是真正丢掉方差收益
+//  （症状：切片台阶不消失，只是整体前后晃）。
 //
 //  幅度为 0 时返回恒 0（不是「幅度很小」）—— 失能态就是零态，
-//  于是 JitterMode.Off 不需要在 shader 里有任何分支。
+//  于是 JitterMode.Off 不需要在 shader 里有任何分支，而且零态下 .z = 0
+//  ⇒ 走程序化那一支 ⇒ **一次纹理读都不发**。
 // ----------------------------------------------------------------------------
+
+// URP 自带的蓝噪声瓦片（64×64，一个独立通道）。
+// 走 VistaLutSlot.BlueNoise：由消费它的那几趟 pass import + UseTexture，
+// 再由 VistaFroxelVolume.BindBlueNoise 逐核绑（#22b）。
+// **不能**走 Shader.SetGlobalTexture —— 那写的是立即态全局表，不进命令流，
+// 而 compute dispatch 的纹理是在命令流里解析的。完整因果见 VistaBlueNoise.handle。
+Texture2D _VistaFroxelBlueNoise;
 
 // PCG3D（Jarzynski & Olano 2020）。选它而不是常见的 sin(dot(p, k)) * 43758.5453：
 // 后者在 fp32 上依赖 sin 的低位，不同驱动/不同平台给出不同结果，
@@ -298,15 +344,139 @@ uint3 VistaFroxelHash3(uint3 v)
     return v;
 }
 
-// 本 froxel 本帧的抖动偏移。xy 单位 = 一格宽，z 单位 = 一片厚，范围 ±幅度/2。
+// 蓝噪声瓦片的边长。与 C# 侧 VistaBlueNoise.k_TileSize 耦合，而那一侧会拒绝
+// 任何别的尺寸（尺寸不符时回落到程序化），所以这里可以当成常量用。
+#define VISTA_BLUE_NOISE_SIZE  64u
+
+// 三路抽头的偏移（像素）。三个偏移互不相同、且都不是 (0,0)，
+// 于是三个轴读到的是同一张图上三个不同位置 —— Georgiev & Fajardo 2016 的做法。
+// 判据⑲量三路之间的相关性，所以「偏移选得好不好」是量出来的，不是这里断言的。
+#define VISTA_BLUE_NOISE_TAP_X  uint2( 0u,  0u)
+#define VISTA_BLUE_NOISE_TAP_Y  uint2(37u, 17u)
+#define VISTA_BLUE_NOISE_TAP_Z  uint2(11u, 43u)
+
+// z 方向的瓦片步进。**17 与 64 互素**，所以 (z·17) mod 64 在 64 片上是一个双射：
+// 64 片各自落在瓦片上互不相同的一行/一列组合上。取一个 2 的幂（比如 16）会让
+// 每 4 片重复一次，症状是那几片的偏移完全相同 —— 深度抖动等效只有 16 个样本。
+#define VISTA_BLUE_NOISE_Z_STRIDE  17u
+
+// 采一格蓝噪声。Point 采样（图本身 filterMode 就是 Point），整数下标按瓦片取模 ——
+// 环形图取模即无缝平铺，不需要边界处理。
+//
+// **读 .a 而不是 .r**（#22b 的第二个缺陷，也是「读到全 0」的真凶）：
+// URP 那张 Textures/BlueNoise64/L/LDR_LLL1_0.png 的 .meta 里
+//   textureType: 10           = TextureImporterType.SingleChannel
+//   singleChannelComponent: 0 = Alpha
+//   alphaUsage: 2             = FromGrayScale
+// ⇒ 导入后是 TextureFormat.Alpha8（D3D11 侧 DXGI_FORMAT_A8_UNORM），数据只在 **A** 通道；
+// 在 D3D11 上读 .r 逐像素得 0 —— 症状与「压根没绑上」完全同形
+// （这就是为什么需要判据⑰d 用核里的 GetDimensions 把两者分开）。
+// 铁证是 URP 自己的消费点：ShaderLibrary/LODCrossFade.hlsl:19 拿**同一张资产**
+// 读的就是 `.a`。文件名里的 "LLL1" 说的是**源图**里 R=G=B=L，
+// 那不是导入后的样子 —— 通道由导入设置决定，不由文件名决定。
+//
+// 通道选得对不对由判据⑰c 盯着：源图 8bit 满秩 ⇒ 均值精确 0.5。
+// 若 URP 哪天把它改回 Red 导入，.a 会读到 1.0 ⇒ ⑰b 全落第 7 桶、⑰c 变红。
+float VistaFroxelBlueNoiseAt(uint2 pixel)
+{
+    uint2 p = pixel % VISTA_BLUE_NOISE_SIZE;
+    // Load 而不是 Sample：不需要过滤，也就不需要指望某个 sampler 状态是 Point。
+    // 「一个夹紧/过滤规则若留给采样器去做」是本项目点过名的坑。
+    return _VistaFroxelBlueNoise.Load(int3((int2)p, 0)).a;
+}
+
+// 本 froxel 的抖动偏移，**所有档位都作为形参**。xy 单位 = 一格宽，z 单位 = 一片厚。
+//
+// 为什么把 phase / latZStride / blueNoise 三个都参数化，而不是让它们直接读 cbuffer：
+// 三条判据都需要在**同一次运行里**同时读到两个档位 ——
+//   · ⑱⑲ 要并排比「程序化」与「蓝噪声」的空间统计；
+//   · ⑳ 要并排比「逐列一致」与「逐片独立」的聚合谱（那一格就是把 CLT 论证量出来）；
+//   · 抖动散布那一格要的是同一个 froxel 在**两帧**之间的差，也就是挪相位。
+// 靠「让美术翻档位、跑两次、人肉对比」不行：那正是「一个不重新导入资产就换档的
+// 验证流程，会让两个档位的画面看起来一模一样」的形状 —— 两次运行之间还差了
+// 相机、时间、场景，读数不可比。
+//
+// 参数化之后仍然只有**一份实现**：线上那个包装只负责把 cbuffer 里的档位递进来，
+// 而「包装递的是不是那三个 uniform」由一格双向判据盯着
+// （探针同时记 max|online − 逐列| 与 max|online − 逐片|，CPU 按 settings 断言
+//  恰好有一个为 0、且是它选的那一个）。
+float3 VistaFroxelJitterOffsetIn(uint3 id, float3 phase, uint latZStride, bool blueNoise)
+{
+    // 横向抖动看到的 z：逐列一致时 latZStride = 0 ⇒ 恒 0（同一列所有片同一个偏移），
+    // 逐片独立时 = 1 ⇒ = id.z。一次乘法，没有分支。
+    uint zLat = id.z * latZStride;
+
+    float3 n;
+    if (blueNoise)
+    {
+        // ---- 蓝噪声：三次抽头 ----
+        //  横向两路的瓦片坐标带 zLat（逐列一致时它是 0）；
+        //  深度那一路**永远**带 id.z，且用互素步进 17 保证 64 片互不重复。
+        uint2 baseLat = id.xy + zLat * uint2(VISTA_BLUE_NOISE_Z_STRIDE, VISTA_BLUE_NOISE_Z_STRIDE);
+        n.x = VistaFroxelBlueNoiseAt(baseLat + VISTA_BLUE_NOISE_TAP_X);
+        n.y = VistaFroxelBlueNoiseAt(baseLat + VISTA_BLUE_NOISE_TAP_Y);
+        n.z = VistaFroxelBlueNoiseAt(id.xy + id.z * VISTA_BLUE_NOISE_Z_STRIDE
+                                     + VISTA_BLUE_NOISE_TAP_Z);
+    }
+    else
+    {
+        // ---- 程序化：两次 hash ----
+        //  两次而不是一次：一次 hash 的三个分量共用同一个 uint3 输入，
+        //  而横向要吃 zLat、深度要吃 id.z —— 逐列一致档下这两个 z 不同，
+        //  一次调用没法同时满足。
+        //  第二次的 z 加一个大质数偏移（PCG3D 的雪崩会把它彻底打散），
+        //  于是「深度与横向解相关」不依赖于 hash 的分量间独立性 ——
+        //  而这条解相关性由判据⑲量出来，不是这里断言的。
+        //
+        //  右移 8 位再转 float：uint 全 32 位转 fp32 会丢低 8 位（尾数只有 24 位），
+        //  于是「hash 的低位」这件事在不同编译器下取整方向可能不同。
+        //  先丢掉再转，结果在 [0,1) 上精确可表示。
+        float3 hLat = (float3)(VistaFroxelHash3(uint3(id.xy, zLat)) >> 8u) * (1.0 / 16777216.0);
+        float3 hDep = (float3)(VistaFroxelHash3(uint3(id.xy, id.z + 7919u)) >> 8u) * (1.0 / 16777216.0);
+        n = float3(hLat.xy, hDep.z);
+    }
+
+    float3 u = frac(n + phase) - 0.5;
+    return u * float3(_VistaFroxelJitter.x, _VistaFroxelJitter.x, _VistaFroxelJitter.y);
+}
+
+// 档位的**唯一**解包处。抽成两个函数是因为判据的探针核也要按 cbuffer 里的档位
+// 去构造对照（「档位从 cbuffer 里取」这件事本身是被判的对象），而在探针里再写一遍
+// `(uint)(.w + 0.5)` 就是「同一个量的第二份实现连 8 行的辅助函数也算」。
+// 特别地 .w 用 +0.5 取整而不是直接截断：CPU 下发的是精确的 0.0/1.0，
+// 但 fp32 cbuffer 往返之后 1.0 若变成 0.99999 就会被截断成 0 —— 一次静默换档。
+uint VistaFroxelJitterZStride()     { return (uint)(_VistaFroxelJitter.w + 0.5); }
+bool VistaFroxelJitterUseBlueNoise() { return _VistaFroxelJitter.z > 0.5; }
+
+// 档位从 cbuffer 里取的那个薄包装（线上唯一的调用形式）。
 float3 VistaFroxelJitterOffset(uint3 id)
 {
-    // 右移 8 位再转 float：uint 全 32 位转 fp32 会丢低 8 位（尾数只有 24 位），
-    // 于是「hash 的低位」这件事在不同编译器下取整方向可能不同。
-    // 先丢掉再转，结果在 [0,1) 上精确可表示。
-    float3 n = (float3)(VistaFroxelHash3(id) >> 8u) * (1.0 / 16777216.0);
-    float3 u = frac(n + _VistaFroxelJitterPhase.xyz) - 0.5;
-    return u * float3(_VistaFroxelJitter.x, _VistaFroxelJitter.x, _VistaFroxelJitter.y);
+    return VistaFroxelJitterOffsetIn(
+        id, _VistaFroxelJitterPhase.xyz,
+        VistaFroxelJitterZStride(),
+        VistaFroxelJitterUseBlueNoise());
+}
+
+// 判据用：把相位挪到另一帧上，得到同一个 froxel 的第二次独立抽样。
+//
+// 挪 0.5 而不是挪一个 α：{frac(k·α)} 在 [0,1)³ 上**稠密**，所以 (0.5,0.5,0.5)
+// 是某一对帧的真实相位差，「两次抽样同分布」这条仍然成立。
+// 而挪 α 需要把那个塑性常数在 HLSL 里再写一份 —— 「同一个量的第二份实现」。
+//
+// 点名它不是上界：这是同分布的**一次**抽样，不是所有帧间差的最大值。
+// 报表那一格读的是 16384 个 froxel 上的 max，尾部由 froxel 数量覆盖，不由 δ 覆盖。
+//
+// #22a 那里是靠「把 hash 的 z 输入挪 977 片」造第二次抽样的，#22b 换掉了它：
+// 逐列一致档下 zLat 恒为 0 ⇒ 两次抽样的**横向偏移逐位相同** ⇒ 读数里只剩深度那一项，
+// 是一个**偏低**的下界。而偏低的下界会让亮度死区看起来有裕度。
+#define VISTA_JITTER_PROBE_PHASE_DELTA  0.5
+
+float3 VistaFroxelJitterOffsetAltPhase(uint3 id)
+{
+    return VistaFroxelJitterOffsetIn(
+        id, frac(_VistaFroxelJitterPhase.xyz + VISTA_JITTER_PROBE_PHASE_DELTA),
+        VistaFroxelJitterZStride(),
+        VistaFroxelJitterUseBlueNoise());
 }
 
 // ----------------------------------------------------------------------------

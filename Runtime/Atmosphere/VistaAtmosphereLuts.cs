@@ -1247,6 +1247,59 @@ namespace Vista
         }
 
         /// <summary>
+        /// 仅供 Editor 自检：#22b 的抖动源探针（判据⑰⑱⑲⑳ + 档位接线）。
+        /// 结果写进阴影探针缓冲的 33~79 号槽位，与 #20/#21/#22a 完全不重叠。
+        ///
+        /// ---------------------------------------------------------------- 为什么要显式重绑 online
+        /// 这一趟**必须**自己把 <paramref name="online"/> 绑一遍，不能像
+        /// <c>RenderFroxelReprojProbe</c> 的角色 1 那样「靠自己是第一趟」去继承线上那份 ——
+        /// 因为角色 2~4 已经把 <c>VistaFroxelReprojCB</c> 覆盖成
+        /// <c>Data.disabled</c> / <c>identity</c> 了，那两份的抖动幅度都是 0，
+        /// 探针会在第一道守卫处整核早退（症状：三个计数槽全 0，报表点名未覆盖）。
+        ///
+        /// 显式重绑不削弱判据：绑的是**注入核实际吃进去的那一个 Data 实例**，
+        /// 于是 settings → <c>JitterParamsOf</c> → uniform 这条链照样被完整走一遍，
+        /// 而「档位接线」那一格的期望来自 settings 对象、读数来自 uniform ⇒ 不是自证。
+        /// 好处是这一格不再依赖派发顺序 —— 顺序性论证在这里本来就是**假的**。
+        ///
+        /// ---------------------------------------------------------------- 为什么蓝噪声是无条件声明的
+        /// 线上只在「档位选了蓝噪声」时才把源位写成 1（见 <c>JitterParamsOf</c>），
+        /// 但判据⑰⑲要量的是**那张资产本身**（直方图、邻域抽头的解相关），
+        /// 与线上档位无关：条件声明的话，「线上选了程序化」会让⑰和⑲的蓝噪声那一半
+        /// 变成空判据 —— 而空判据在报表上和通过长得一样。
+        /// 所以录这一趟 pass 的地方无条件 import + <c>UseTexture</c> 它
+        /// （见 <c>VistaAtmospherePass</c> 里 "Vista Froxel Jitter Probe" 那一段），
+        /// 而绑定由 <c>DispatchJitterProbe</c> 按 <c>HasTexture</c> 有条件地做 ——
+        /// 绑一个无效 handle 会经隐式转换落到 CameraTarget 上，是一次静默绑错。
+        /// 资产压根取不到时⑰⑲会读到 0 并判红，报表按
+        /// <see cref="VistaBlueNoise.lastFailure"/> 点名成因。
+        /// </summary>
+        /// <param name="online">
+        /// 线上那一帧的 <c>VistaFroxelReprojection.Data</c>（注入核吃进去的那一份）。
+        /// 判据要的是它的 <c>jitter</c> 与 <c>jitterPhase</c>；其余分量这个核一个都不读。
+        /// </param>
+        public void RenderFroxelJitterProbe<T>(T d, in VistaFroxelReprojection.Data online)
+            where T : struct, IVistaLutDispatcher
+        {
+            m_JitterProbeDispatches = 0;
+
+            if (m_FroxelVolume == null) return;
+
+            online.Bind(d);
+
+            m_FroxelVolume.DispatchJitterProbe(d);
+            m_JitterProbeDispatches++;
+        }
+
+        // 抖动探针派发了几趟（0 或 1）。判据要它是为了把「压根没派发」与
+        // 「派发了但核内第一道守卫早退（幅度 ≤ 0）」分开 ——
+        // 两者的 COUNT 槽都是 0，而前者是布景问题、后者是配置问题。
+        int m_JitterProbeDispatches;
+
+        /// <summary>上一次 <see cref="RenderFroxelJitterProbe{T}"/> 派发了几趟（0 或 1）。</summary>
+        public int jitterProbeDispatches => m_JitterProbeDispatches;
+
+        /// <summary>
         /// 仅供 Editor 自检：深度分布正反映射 round-trip。
         /// 结果写进 apScatterLut 的 (0, 0, slice) 一列，
         /// RGBA = |Δw|·<see cref="k_RoundTripScale"/>、距离(km)、w、texW。

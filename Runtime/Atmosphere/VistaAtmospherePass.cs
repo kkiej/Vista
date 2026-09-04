@@ -56,6 +56,11 @@ namespace Vista
             public TextureHandle froxelInjectionHistory;
             public TextureHandle froxelIntegral;
             public BufferHandle froxelShadowProbe;
+            /// <summary>
+            /// 蓝噪声瓦片（#22b）。三趟 pass 会声明它（注入 / 重投影探针 / 抖动探针），
+            /// 其余趟留 default。资产取不到时也是 default ⇒ 派发处回落到程序化档。
+            /// </summary>
+            public TextureHandle froxelBlueNoise;
             /// <summary>注入核要的分配口径（切片数 + 距离范围）。</summary>
             public VistaFroxelVolumeDesc froxelDesc;
             /// <summary>
@@ -108,6 +113,7 @@ namespace Vista
             froxelInjection = d.froxelInjection,
             froxelInjectionHistory = d.froxelInjectionHistory,
             froxelIntegral  = d.froxelIntegral,
+            blueNoise       = d.froxelBlueNoise,
             froxelShadowProbe = d.froxelShadowProbe,
         };
 
@@ -324,6 +330,23 @@ namespace Vista
                 ? renderGraph.ImportTexture(m_Luts.froxelVolume.injectionHistory) : default;
             var froxelIntegral  = froxelEnabled
                 ? renderGraph.ImportTexture(m_Luts.froxelVolume.integral) : default;
+
+            // 蓝噪声瓦片（#22b）。它是**引擎的资产**、只读、没有生产者，但仍然必须走
+            // import：ComputeCommandBuffer 的 SetGlobalTexture / SetComputeTextureParam
+            // 全部只吃 TextureHandle，没有任何入口接受裸 Texture。而
+            // Shader.SetGlobalTexture 那条路已经被证伪 —— 它写的是立即态全局表，
+            // 不进命令流，症状是核里逐像素读到 0 而 CPU 侧一切表面证据都显示接上了
+            // （完整因果记在 VistaBlueNoise.handle 的注释里）。
+            //
+            // 无条件（只要 froxelEnabled）导入而不是挂在「线上档位选了蓝噪声」上：
+            // 判据⑰⑲量的是**这张资产本身**，与线上档位无关，条件导入会让它们
+            // 在程序化档下静默变成空判据。
+            //
+            // 资产取不到时留 default —— 那不是错误路径，而是「回落到程序化抖动」，
+            // 由派发处的 HasTexture 挡住（绑一个 null/default 会经隐式转换落到
+            // CameraTarget 上，是一次静默绑错）。
+            var froxelBlueNoise = froxelEnabled && VistaBlueNoise.handle != null
+                ? renderGraph.ImportTexture(VistaBlueNoise.handle) : default;
 
             // 把两个句柄交给帧内更晚的消费方（#21 的调试视图；#25 的合成）。
             // 只在真的分配了体积时 Create —— 消费方于是用 Contains 判「这一帧有没有表」，
@@ -592,10 +615,17 @@ namespace Vista
                     data.froxelCameraWS = froxelCameraWS;
                     data.froxelShadowmapBound = shadowmapBound;
                     data.froxelReproj = froxelReproj;
+                    data.froxelBlueNoise = froxelBlueNoise;
 
                     builder.UseTexture(transmittance, AccessFlags.Read);
                     builder.UseTexture(multiScattering, AccessFlags.Read);
                     builder.UseTexture(froxelInjection, AccessFlags.Write);
+                    // 蓝噪声瓦片（#22b）。**只读、没有生产者**，所以这条声明不是为了让图
+                    // 同步任何状态转换 —— 它是「本趟 pass 拿得到有效 handle」的唯一途径
+                    // （没声明过就是 default，HasTexture 判 false，派发处不绑）。
+                    // 判空：资产取不到时 handle 是 default，那是回落到程序化档，不是错误。
+                    if (froxelBlueNoise.IsValid())
+                        builder.UseTexture(froxelBlueNoise, AccessFlags.Read);
                     // 历史表是 Read（SRV）。这条声明是「本帧的写 → 下一帧的读」在图里
                     // 唯一的依据：两张资源都是 import 进来的持久 RTHandle，
                     // 少了它，D3D11 上照样能跑（隐式状态转换），Vulkan/Metal 上
@@ -738,6 +768,7 @@ namespace Vista
                         data.froxelReprojIdentity = froxelReprojIdentity;
                         data.froxelReprojCamera = cameraData.camera;
                         data.froxelProbeRequested = true;
+                        data.froxelBlueNoise = froxelBlueNoise;
 
                         // 角色 1 会跑两次 VistaFroxelInject（量抖动自己的亮度散布），
                         // 所以大气那两张表与天光 SH 都要声明。
@@ -749,6 +780,10 @@ namespace Vista
                         builder.UseBuffer(froxelShadowProbe, AccessFlags.ReadWrite);
                         if (shadowmapBound)
                             builder.UseTexture(mainShadows, AccessFlags.Read);
+                        // 角色 1 的两次抽样走 VistaFroxelJitterOffset(Alt)Phase
+                        // ⇒ 蓝噪声档下它读这张图。声明的理由同注入那一趟。
+                        if (froxelBlueNoise.IsValid())
+                            builder.UseTexture(froxelBlueNoise, AccessFlags.Read);
 
                         // 探针核**不**碰本帧的注入表（它自己现算 VistaFroxelInject，
                         // 不读回那张表）—— 所以这里刻意不声明 froxelInjection。
@@ -765,6 +800,46 @@ namespace Vista
                                 new VistaGraphLutDispatcher(ctx.cmd, Handles(d)),
                                 d.view, d.fogSettings, d.froxelReprojCamera,
                                 d.froxelDesc, d.froxelReprojIdentity));
+                    }
+
+                    // 抖动源的探针（#22b，判据⑰⑱⑲⑳ + 档位接线）。**第三趟独立 pass**，
+                    // 写 33~79 号槽位。排在重投影探针之后不是正确性要求（槽位不重叠、
+                    // 而且它自己重绑一遍线上的 VistaFroxelReprojCB），而是可读性要求：
+                    // 三趟按槽位区间排列，「哪一趟没跑」在报表上按区间显形。
+                    //
+                    // 声明的资源只有探针缓冲 + 蓝噪声瓦片两个。这个核不读注入表、
+                    // 不读历史表、不读大气表、也不需要相机 —— 抖动偏移是下标的纯函数。
+                    //
+                    // 蓝噪声那张**只读、无生产者**，没有 UAV→SRV 的状态转换要图去同步；
+                    // 但它照样必须 import + UseTexture，因为那是 graph 侧
+                    // **拿到有效 handle 的唯一途径** —— ComputeCommandBuffer 的绑定入口
+                    // 只吃 TextureHandle，而 Shader.SetGlobalTexture 写的立即态全局表
+                    // 根本进不了命令流（#22b 的成因，见 VistaBlueNoise.handle）。
+                    using (var builder = renderGraph.AddComputePass<LutPassData>(
+                               "Vista Froxel Jitter Probe", out var data))
+                    {
+                        data.luts = m_Luts;
+                        data.froxelReproj = froxelReproj;
+                        data.froxelShadowProbe = froxelShadowProbe;
+                        data.froxelProbeRequested = true;
+                        data.froxelBlueNoise = froxelBlueNoise;
+
+                        builder.UseBuffer(froxelShadowProbe, AccessFlags.ReadWrite);
+                        // 判据⑰⑲量的是这张资产本身（直方图、邻域抽头的解相关），
+                        // 与线上档位无关 —— 所以这里的声明是无条件的，
+                        // 只在「资产压根取不到」时才缺席（那时⑰⑲的格子会自己判红）。
+                        if (froxelBlueNoise.IsValid())
+                            builder.UseTexture(froxelBlueNoise, AccessFlags.Read);
+
+                        // 它要把线上那份 VistaFroxelReprojCB 重绑回来（上一趟的角色 2~4
+                        // 已经把它覆盖成幅度 0 了），所以确实改全局。
+                        builder.AllowGlobalStateModification(true);
+                        builder.AllowPassCulling(false);
+
+                        builder.SetRenderFunc((LutPassData d, ComputeGraphContext ctx) =>
+                            d.luts.RenderFroxelJitterProbe(
+                                new VistaGraphLutDispatcher(ctx.cmd, Handles(d)),
+                                d.froxelReproj));
                     }
                 }
 #endif

@@ -85,7 +85,40 @@ namespace Vista.EditorTools
         const int k_SlotReprojHitNaN      = 30;
         const int k_SlotReprojCoverCount  = 31;
         const int k_SlotReprojJitterSpread = 32;
-        const int k_SlotTotal         = 33;
+        // ---- #22b 追加：抖动源的统计 + 横向形态两档的聚合对照 ----
+        // 这一批全部由第九个核 FroxelJitterProbe 写，它**一张表都不读** ——
+        // 抖动偏移是下标的纯函数。所以这些读数不依赖体积的 xy 尺寸、不依赖相机，
+        // 唯一的体积依赖是⑳要用的片数（核内那道 slices == 64 的门）。
+        const int k_SlotBnHist0     = 33;   // 33..40：源图 8 桶直方图
+        const int k_SlotBnSum       = 41;
+        const int k_SlotBnSq        = 42;
+        const int k_SlotBnCount     = 43;
+        const int k_SlotJitProcBase = 44;   // 44..54
+        const int k_SlotJitBlueBase = 55;   // 55..65
+        const int k_JitOfsSum       = 0;    // +0/+1/+2
+        const int k_JitOfsSq        = 3;    // +3/+4/+5
+        const int k_JitOfsNbX       = 6;
+        const int k_JitOfsNbY       = 7;
+        const int k_JitOfsXY        = 8;
+        const int k_JitOfsXZ        = 9;
+        const int k_JitOfsYZ        = 10;
+        const int k_SlotJitCount    = 66;
+        const int k_SlotAggColSum   = 67;
+        const int k_SlotAggColSq    = 68;
+        const int k_SlotAggColDAxis = 69;
+        const int k_SlotAggColDDiag = 70;
+        const int k_SlotAggSlcSum   = 71;
+        const int k_SlotAggSlcSq    = 72;
+        const int k_SlotAggSlcDAxis = 73;
+        const int k_SlotAggSlcDDiag = 74;
+        const int k_SlotAggCount    = 75;
+        const int k_SlotJitDCol     = 76;
+        const int k_SlotJitDSlc     = 77;
+        const int k_SlotJitDProc    = 78;
+        const int k_SlotJitDBlue    = 79;
+        const int k_SlotBnWidth     = 80;   // ⑰d：核里 GetDimensions 问出来的尺寸
+        const int k_SlotBnHeight    = 81;
+        const int k_SlotTotal         = 82;
 
         const uint k_FlagCascade   = 1u;
         const uint k_FlagShadowmap = 2u;
@@ -183,6 +216,89 @@ namespace Vista.EditorTools
         const uint k_ReprojLuminance = 16u;
         const uint k_ReprojNaN       = 32u;
 
+        // ================================================================ #22b 抖动源
+        /// <summary>
+        /// 抖动探针的窗口边长。蓝噪声瓦片是环形的、周期 64，取一个**整周期**是
+        /// ⑰的「每桶正好 512」与⑳的对角恒等式两条精确期望的前提。
+        /// </summary>
+        const int k_JitProbeDim = 64;
+        const int k_JitProbeCountExpected = k_JitProbeDim * k_JitProbeDim;
+
+        const float k_JitProbeScale  = 1.0e5f;   // 矩：与 shader 的 VISTA_JITTER_PROBE_SCALE 一致
+        const float k_JitProbeDScale = 1.0e9f;   // 逐点差的 max：VISTA_JITTER_PROBE_D_SCALE
+
+        /// <summary>直方图每桶的**精确**期望，见 VolumetricFog.compute 里那段点算。</summary>
+        const int k_BnBinExpected = k_JitProbeCountExpected / 8;   // 512
+
+        /// <summary>
+        /// 源图均值的门。Σv = 2048 精确 ⇒ 均值 0.5 精确。
+        /// 定点累加是**向零截断**的（VistaProbeFixed），每次 add 少算 &lt; 1e-5，
+        /// 4096 次之后均值只会**偏低** ≤ 1e-5 ⇒ 相对 2e-5。门取 1e-4，留 5 倍。
+        /// 这一格判的不是统计，是精确算术：0.5 是算出来的，不是「打印出来看看」。
+        /// </summary>
+        const float k_BnMeanGate = 1.0e-4f;
+
+        /// <summary>
+        /// 8 bit 秩均匀（每阶正好 16 个像素、值取 k/255）下的解析方差：
+        /// E[v²] = 511/(6·255) = 0.3339869 ⇒ Var = 0.0839869。
+        /// **只当 ⓘ 交叉核对**：⑱⑲⑳的归一化用的是实测的逐通道矩，
+        /// 判据的载荷路径上不留任何解析前提。
+        /// </summary>
+        const float k_BnVarAnalytic   = 0.0839869f;
+        const float k_BnVarContinuous = 1f / 12f;   // 连续均匀分布，差的那一点是 8 bit 量化
+
+        /// <summary>
+        /// 4096 个样本上相关系数的抽样标准差 ≈ 1/√n。程序化档那道「≈ 0」的带
+        /// 与⑲那道「三通道不相关」的带都按它的倍数摆，不是随手取的圆整数。
+        /// </summary>
+        const float k_JitCorrSigma = 1f / 64f;          // 1/√4096 = 1.5625e-2
+        const float k_JitCorrNullGate = 3f * k_JitCorrSigma;  // 4.6875e-2，≈3σ
+        const float k_JitCorrTapGate  = 6f * k_JitCorrSigma;  // 9.375e-2，≈6σ；要拒绝的是 ρ = 1
+
+        /// <summary>
+        /// 聚合场逐点差的 fp32 求和序地板（保守上界）。
+        ///
+        /// Ā = (Σ_{z&lt;64} j.x) / 64，|j.x| ≤ 0.5 ⇒ 部分和 |acc| ≤ 32。
+        /// 每次 add 的舍入 ≤ ½eps·|acc| = 6.0e-8 × 32 = 1.9e-6，64 次 ⇒ 1.2e-4，
+        /// 除 64 之后 1.9e-6；两列各一份 ⇒ **3.8e-6**。
+        /// 这是一个很松的上界（部分和实际在 0 附近随机游走），但门要按上界摆。
+        /// </summary>
+        const float k_AggDiagFloor = 3.8e-6f;
+
+        /// <summary>
+        /// 对角恒等式的门。要拒绝的最小错答案是「DDIAG 与 DAXIS 同量级」，
+        /// 也就是 O(1e-1)；门取地板上界 3.8e-6 与 1e-1 的**几何中点** = 6.2e-4。
+        /// </summary>
+        const float k_AggDiagGate = 6.2e-4f;
+
+        /// <summary>
+        /// 对照门：轴向差必须**远离** 0。
+        /// 少了这一格，一个「Ā 恒为常数」的 bug（= 抖动整个失效）会把对角恒等式假通过 ——
+        /// 而恒为常数正是抖动失效的样子。四格表里必须**恰好一格** ≈ 0。
+        /// </summary>
+        const float k_AggAxisGate = 1.0e-2f;
+
+        /// <summary>
+        /// ⑳b 的量级门。逐片独立时 Ā 是 N 个场的均值，方差按 1/N 收缩
+        /// （1/64 = 1.5625e-2）。这里只摆一道 1/8 的**量级**门，不摆 ≈1/N 的紧门：
+        /// 那 N 个场并不独立（固定步进 ⇒ 抽的是同一条反对角线），
+        /// 1/N 是独立情形的值，拿它当紧门是「用一个前提不成立的公式去摆门」。
+        /// </summary>
+        const float k_AggVarRatioGate = 0.125f;
+
+        /// <summary>
+        /// ⑳a 那条跨槽位对账的相对门（两组独立累加的同一个量）。
+        ///
+        /// 地板不是 0：⑳走的是 64 次 fp32 累加再除 64，⑲走的是一次求值。
+        /// 逐列一致档下 64 个被加数逐位相同，但 k·x 在 fp32 上并非对每个 k 都精确
+        /// （3x 就要多两位），所以 Ā 相对 j.x 有 ≤ 64·½eps = 3.8e-6 的相对误差。
+        /// 它传到**方差**上还要放大两次：E[v²] 的相对误差 ×2，再乘上
+        /// E[v²]/Var = 0.334/0.084 = 3.98 的杠杆 ⇒ ≤ 3.0e-5。
+        /// 定点截断的错配项（两组各截一次、只有跨格点时才差 1e-5）RMS 只有 ~1e-6，
+        /// 不是主导项。门取 1e-3，对方差那一路留 ×33。
+        /// </summary>
+        const float k_AggCrossGate = 1.0e-3f;
+
         [MenuItem("Window/Vista/Log Volumetric Fog State", priority = 142)]
         static void RunFromMenu()
         {
@@ -195,7 +311,7 @@ namespace Vista.EditorTools
 
         static void Run(StringBuilder sb)
         {
-            sb.AppendLine("=== Vista 体积雾状态（#20 注入 + #21 积分 + #22a 时间重投影 覆盖性判据）===");
+            sb.AppendLine("=== Vista 体积雾状态（#20 注入 + #21 积分 + #22a 时间重投影 + #22b 抖动源 覆盖性判据）===");
 
             var cam = FindGameCamera();
             if (cam == null)
@@ -242,9 +358,11 @@ namespace Vista.EditorTools
             var volume = feature.froxelVolume;
             if (volume == null || !volume.isValid)
             {
-                sb.AppendLine("✘ froxelVolume 不可用：VolumetricFog.compute 缺失，或八个核里有编译不出来的"
+                sb.AppendLine("✘ froxelVolume 不可用：VolumetricFog.compute 缺失，或九个核里有编译不出来的"
                             + "（FroxelPlaceholder / FroxelSliceVerify / FroxelInjection / FroxelShadowProbe / "
-                            + "FroxelIntegration / FroxelSynthMedium / FroxelIntegralVerify / FroxelReprojProbe）。");
+                            + "FroxelIntegration / FroxelSynthMedium / FroxelIntegralVerify / FroxelReprojProbe / "
+                            + "FroxelJitterProbe）。isValid 会 AND 掉全部九个下标 ≥ 0 —— "
+                            + "少一个核的症状是整个近层雾不生效，而不是那一个核静默失效。");
                 return;
             }
 
@@ -887,6 +1005,378 @@ namespace Vista.EditorTools
                 }
             }
 
+            // ================================================================ #22b 抖动源与横向形态
+            {
+                var reproj = feature.froxelReprojection;
+                int  jitDispatches = feature.froxelJitterProbeDispatches;
+                uint bnCount  = raw[k_SlotBnCount];
+                uint jitCount = raw[k_SlotJitCount];
+                uint aggCount = raw[k_SlotAggCount];
+                int  depth    = volume.allocatedDesc.HasValue ? volume.allocatedDesc.Value.depth : 0;
+
+                // 「线上实际用的是哪个源」。回落是一条真实路径：选了蓝噪声但取不到图时
+                // JitterParamsOf 会把源改成程序化，并把原因记在 jitterFallbackReason 上。
+                // 判据㉑的期望值必须用**回落之后**的源，否则回落一发生那一格就红，
+                // 而它红的理由是错的（接线是对的，是资产缺了）。
+                bool blueOnline = settings.jitterMode == JitterMode.BlueNoise
+                               && reproj != null && reproj.jitterFallbackReason == null;
+
+                sb.AppendLine("---- #22b 抖动源统计与横向形态两档对照 ----");
+                sb.AppendLine($"状态：源旋钮 = {settings.jitterMode} ⇒ 线上生效 = "
+                            + $"{(settings.jitterMode == JitterMode.Off ? "Off" : blueOnline ? "BlueNoise" : "Procedural")}"
+                            + $"，横向形态 = {settings.lateralJitterShape}"
+                            + $"，蓝噪声资产 available = {VistaBlueNoise.available}"
+                            + $"（Resolve 失败原因：{VistaBlueNoise.lastFailure ?? "（无）"}）"
+                            + $"，本帧回落原因 = {reproj?.jitterFallbackReason ?? "（无）"}");
+
+                // ---------------------------------------------------------- 判据⑰a 探针执行性
+                // 把两种「读数全 0」分开：**压根没派发**与**派发了但核内第一道守卫早退**。
+                // 两者的 COUNT 槽都是 0，而前者是接线问题、后者是配置问题（幅度旋钮为 0）。
+                // 没有这一格的话，归因会从「探针坏了」开始查一件其实是「旋钮关着」的事。
+                bool dispatchedOk = jitDispatches == 1;
+                bool jitRan = jitCount == (uint)k_JitProbeCountExpected;
+                sb.AppendLine($"{Mark(dispatchedOk)}判据⑰a 抖动探针派发性：{jitDispatches} 趟（期望 1；"
+                            + "−1 = 取不到 LUT，0 = 那趟 pass 没排进去或 froxelVolume 为 null）");
+                if (dispatchedOk && !jitRan)
+                {
+                    sb.AppendLine($"ⓘ 判据⑰b~㉑ 全部未覆盖：探针派发过，但核内第一道守卫"
+                                + "（any(_VistaFroxelJitter.xy ≤ 0)）命中并整核早退 ⇒ 三个计数槽留 0。"
+                                + $"归因：横向幅度 {settings.lateralJitterAmount:F2}、深度幅度 "
+                                + $"{settings.depthJitterAmount:F2}、jitterMode {settings.jitterMode} ——"
+                                + "任意一个把两个幅度之一压成 0 都会走到这里。这是配置问题，不是代码问题。");
+                }
+                else if (!dispatchedOk)
+                {
+                    sb.AppendLine("ⓘ 判据⑰b~㉑ 全部未覆盖：探针一趟都没派发，下面的读数是初值。");
+                }
+                else
+                {
+                    // ------------------------------------------------------ 判据⑰d 绑定到达性
+                    // 尺寸不问 CPU（VistaBlueNoise.texture.width），而是问**核里
+                    // GetDimensions 的返回值** —— 判据⑥a 的同一条理由：CPU 侧那个数
+                    // 只证明「资产存在」，证明不了「这一趟 dispatch 的 SRV 槽位上
+                    // 真的坐着它」。
+                    //
+                    // 这一格是 #22b 第二轮排查的产物：⑰b/⑰c 全零时，
+                    // 「未绑定 SRV 在 D3D11 上读 0」与「绑上了但内容是 0」在报表上
+                    // 完全同形，而两者的修法在两个不同的文件里。
+                    //
+                    // 双向：资产取不到时派发处刻意不绑 ⇒ 期望 0×0；
+                    // 取得到时期望 64×64。所以它在两条路径上都能失败。
+                    uint bnW = raw[k_SlotBnWidth];
+                    uint bnH = raw[k_SlotBnHeight];
+                    uint expW = VistaBlueNoise.available ? (uint)VistaBlueNoise.k_TileSize : 0u;
+                    bool dimOk = bnW == expW && bnH == expW;
+                    sb.AppendLine($"{Mark(dimOk)}判据⑰d 绑定到达性（核里 GetDimensions）："
+                                + $"{bnW}×{bnH}，期望 {expW}×{expW}"
+                                + $"（资产 available = {VistaBlueNoise.available}）");
+                    sb.AppendLine("  ⓘ 0×0 ⇒ 绑定**没到达核**（未绑定的 SRV 在 D3D11 上，"
+                                + "GetDimensions 返回 0、Load 返回 0）；"
+                                + $"{VistaBlueNoise.k_TileSize}×{VistaBlueNoise.k_TileSize} ⇒ 绑定到了，"
+                                + "此时⑰b/⑰c 若仍全零，问题在资产内容而不在绑定链。"
+                                + "槽位走 InterlockedMax、初值 0 ⇒ 「没绑上」与「核压根没跑」"
+                                + $"读数相同，两者由 BN_COUNT（{bnCount} / 期望 {k_JitProbeCountExpected}）分开 ——"
+                                + "这条依赖必须点名，否则这一格在核早退时会给出一个错的因果。");
+                    sb.AppendLine("  ⓘ 资产格式 = "
+                                + (VistaBlueNoise.texture != null
+                                    ? $"{VistaBlueNoise.texture.format}"
+                                      + $"（TextureFormat；graphicsFormat 的整数值 "
+                                      + $"{(int)VistaBlueNoise.texture.graphicsFormat}）"
+                                    : "（取不到）")
+                                + "。#22b 的真凶就藏在这一行：URP 把这张图导成 "
+                                + "textureType: 10（SingleChannel）+ singleChannelComponent: 0（Alpha）"
+                                + " ⇒ 数据只在 **.a**；HLSL 读 .r 在 D3D11 上逐像素得 0，"
+                                + "与「绑定没到达」在报表上完全同形。"
+                                + "URP 自己的消费点 ShaderLibrary/LODCrossFade.hlsl:19 "
+                                + "拿同一张资产读的也是 .a。");
+                    sb.AppendLine("  ⓘ 为什么印 TextureFormat 而不是 GraphicsFormat："
+                                + "GraphicsFormat **没有**任何 alpha-only 成员（反射过：A8 不在枚举里），"
+                                + "所以 graphicsFormat.ToString() 会印出一个没有名字的裸数字 54 —— "
+                                + "「一个报表里的魔数等于没有印」。TextureFormat.Alpha8 才是有名字的那个尺子。"
+                                + "这里只印不判：换平台时 Unity 可能给 SingleChannel 选别的等价格式，"
+                                + "把它摆成门会造出一个纯粹因为平台不同而红的假失败"
+                                + "（「一条只在这台机器成立的实测行为要做成 ⓘ 而不是门」）。"
+                                + "「通道选对了」这条真正由⑰b/⑰c 判：读错通道时那张图恒 0 或恒 1，"
+                                + "直方图会全落进第 0 桶或第 7 桶 ⇒ 两格同时红。");
+
+                    // ------------------------------------------------------ 判据⑰b/⑰c 源图
+                    // 这三格量的是**源图 v 本身**（VistaFroxelBlueNoiseAt 的返回值），
+                    // 不是动画之后的 n' —— 后者被 frac 绕回改写过分布（见下面那条 ⓘ）。
+                    if (!VistaBlueNoise.available)
+                    {
+                        sb.AppendLine("ⓘ 判据⑰b/⑰c 未覆盖：取不到蓝噪声资产 "
+                                    + $"（{VistaBlueNoise.lastFailure ?? "未知"}）。"
+                                    + "此时派发处（VistaFroxelVolume.BindBlueNoise）刻意**不绑** —— "
+                                    + "绑一个 null RTHandle 不会炸，隐式转换会给出 CameraTarget，"
+                                    + "那是一次静默绑错；而 compute 里未绑定的 SRV 在 D3D11 上读到全 0"
+                                    + "（**不是**引擎默认白图，那条经验只对 material shader 成立），"
+                                    + "于是 frac(0 + φ) ≡ φ ⇒ 抖动退化成常数相位偏移。"
+                                    + "所以这里报未覆盖，而不是让读数去伪造一个结论。");
+                    }
+                    else
+                    {
+                        bool bnCountOk = bnCount == (uint)k_JitProbeCountExpected;
+
+                        // ⑰b 直方图。期望是**精确**的，不是统计带：
+                        // 64×64 = 4096 像素、256 个 8 bit 灰阶、void-and-cluster 是秩均匀的
+                        // ⇒ 每阶正好 16 个像素；bin = floor(v·8) 的桶界落在
+                        // k = 31.875 / 63.75 / … 这些**非整数**上（fp32 余量 ~4e-3，比 eps 大五个量级），
+                        // 逐桶点算是 32 阶 × 16 = 512。所以它可以是一道硬门。
+                        var bins = new uint[8];
+                        uint binSum = 0u;
+                        bool binsOk = true;
+                        for (int i = 0; i < 8; i++)
+                        {
+                            bins[i] = raw[k_SlotBnHist0 + i];
+                            binSum += bins[i];
+                            if (bins[i] != (uint)k_BnBinExpected) binsOk = false;
+                        }
+                        sb.AppendLine($"{Mark(binsOk && bnCountOk)}判据⑰b 源图秩均匀（8 桶 × 精确 {k_BnBinExpected}）："
+                                    + $"[{string.Join(", ", bins)}]，和 {binSum}，线程数 {bnCount}/{k_JitProbeCountExpected}");
+                        if (!binsOk)
+                            sb.AppendLine("  ⚠ 桶不均匀 ⇒ 这张图不是秩均匀的 void-and-cluster 集合。"
+                                        + "归因（⑰d 已经把「绑定到不到核」独立判掉，所以这里只剩内容/通道）："
+                                        + "全落进第 0 桶 = **通道选错**，读到了一个恒 0 的通道"
+                                        + "（该资产 textureType: 10 + singleChannelComponent: 0 ⇒ Alpha8，"
+                                        + "数据只在 .a；D3D11 上读 .r 逐像素得 0 —— #22b 的真凶）；"
+                                        + "全落进第 7 桶 = 反过来读到了一个恒 1 的通道"
+                                        + "（若 URP 改回 Red 导入，则 .a 恒为 1）；"
+                                        + "整体倾斜 = 采样器不是 Point、或者纹理被当成 sRGB 解码了"
+                                        + "（资产上 sRGBTexture: 0、filterMode: 0，两者都不能改）。");
+
+                        float bnMean = raw[k_SlotBnSum] / k_JitProbeScale / k_JitProbeCountExpected;
+                        float bnVar  = raw[k_SlotBnSq]  / k_JitProbeScale / k_JitProbeCountExpected
+                                     - bnMean * bnMean;
+                        bool bnMeanOk = Mathf.Abs(bnMean - 0.5f) <= k_BnMeanGate;
+                        sb.AppendLine($"{Mark(bnMeanOk)}判据⑰c 源图均值：实测 {bnMean:F6}，精确期望 0.5"
+                                    + $"（Σv = 2048 精确），偏差 {Sci(bnMean - 0.5f)}，门 {Sci(k_BnMeanGate)}");
+                        sb.AppendLine("  ⓘ 这一格的载荷不是「噪声图长得均匀」，是**抖动不引入密度偏差**："
+                                    + "偏移是 (v − 0.5)，均值精确为 0.5 ⇒ 期望偏移精确为 0。"
+                                    + "偏差只可能**偏低**：VistaProbeFixed 向零截断，每次 add 少算 < 1e-5，"
+                                    + "4096 次之后均值偏低 ≤ 1e-5（相对 2e-5），门留了 5 倍。");
+                        sb.AppendLine($"  ⓘ 方差交叉核对：实测 {bnVar:F7}，8 bit 秩均匀解析值 "
+                                    + $"{k_BnVarAnalytic:F7}（E[v²] = 511/(6·255)），"
+                                    + $"连续均匀分布 1/12 = {k_BnVarContinuous:F7}。"
+                                    + "解析值**只是交叉核对**：⑱⑲⑳的归一化用的是实测矩，"
+                                    + "判据的载荷路径上不留解析前提。");
+                    }
+
+                    // ------------------------------------------------------ 判据⑱⑲ 两档并排
+                    var proc = ReadJitterTier(raw, k_SlotJitProcBase);
+                    var blue = ReadJitterTier(raw, k_SlotJitBlueBase);
+
+                    sb.AppendLine($"  动画后偏移场 n' = frac(n + φ) 的实测矩（slice 0、逐列一致档 —— "
+                                + "**最难的一档**：z 步进为 0 让深度那一路的抽头退化成 x 抽头的一个固定像素偏移）：");
+                    sb.AppendLine($"    程序化：均值 ({proc.mx:F4}, {proc.my:F4}, {proc.mz:F4})  "
+                                + $"方差 ({proc.vx:F5}, {proc.vy:F5}, {proc.vz:F5})");
+                    sb.AppendLine($"    蓝噪声：均值 ({blue.mx:F4}, {blue.my:F4}, {blue.mz:F4})  "
+                                + $"方差 ({blue.vx:F5}, {blue.vy:F5}, {blue.vz:F5})");
+                    sb.AppendLine("  ⓘ 这里的均值**不**判 0.5：frac 绕回不是平移。源图的 256 个灰阶是"
+                                + " k/255（含 0 与 1 两端），frac(v + φ) 之后两端撞在一起 ⇒ 多重集合变了，"
+                                + "均值偏离 0.5 到 O(1/256) = 4e-3 量级。判 0.5 的是⑰c（源图 v 本身），"
+                                + "而密度无偏这条结论也挂在那一格上 —— 线上偏移用的是 n'，"
+                                + $"所以这里的偏离量本身就是那条 frac 代价的读数（本次 {Sci(blue.mx - 0.5f)}）。");
+
+                    float rFloor = (1f / k_JitProbeScale) / Mathf.Max(blue.vx, 1e-12f);
+                    bool nbOk = blue.rNbX < 0f && blue.rNbY < 0f
+                             && Mathf.Abs(proc.rNbX) < k_JitCorrNullGate
+                             && Mathf.Abs(proc.rNbY) < k_JitCorrNullGate;
+                    sb.AppendLine($"{Mark(nbOk)}判据⑱ 邻域相关（lag 1）的**符号**："
+                                + $"蓝噪声 ρx {blue.rNbX:F4} / ρy {blue.rNbY:F4}（必须都 < 0），"
+                                + $"程序化 ρx {proc.rNbX:F4} / ρy {proc.rNbY:F4}"
+                                + $"（必须 |ρ| < {Sci(k_JitCorrNullGate)} ≈ 3σ）");
+                    sb.AppendLine($"  ⓘ 尺子的地板：定点分辨率 {Sci(1f / k_JitProbeScale)} ÷ 实测方差 "
+                                + $"{blue.vx:F5} ⇒ ρ 的地板 {Sci(rFloor)}，"
+                                + $"抽样标准差 1/√{k_JitProbeCountExpected} = {Sci(k_JitCorrSigma)}"
+                                + " —— 后者是主导项，所以程序化那道带按 σ 的倍数摆。"
+                                + "程序化档是一个**真正的空对照**：hash 之间独立，而独立性被任何逐点映射"
+                                + "（包括 frac）保留 ⇒ 它的 ρ ≡ 0 与相位无关。");
+                    sb.AppendLine("  ⓘ 必须自己说出来的两条窄化："
+                                + "①这一格量的是 **lag 1 的邻域相关，不是谱** —— 在一个 compute 探针里做 FFT "
+                                + "超出范围，所以它看不见 lag ≥ 2 上的结构；画面级的残差谱与判据⑯一起放在 #27。"
+                                + "②只判**符号**不判幅度：frac 绕回让 ρ 随相位 φ 摆动"
+                                + "（k=l=1 那一项里有一个 Re(e^{4πiφ}·E[e^{2πi(v+v')}])），"
+                                + "而那个摆幅没有推出紧的界 —— 「当推导给不出紧的上限时，"
+                                + "诚实地把门标成能守住的那一半」。符号本身不受影响，"
+                                + $"因为 φ 无关的那一项 −E[cos 2π(v−v')]/(2π²) 在蓝噪声下是负的。本帧 φ = "
+                                + $"({(reproj != null ? reproj.lastJitterPhase : Vector4.zero).x:F4}, "
+                                + $"{(reproj != null ? reproj.lastJitterPhase : Vector4.zero).y:F4}, "
+                                + $"{(reproj != null ? reproj.lastJitterPhase : Vector4.zero).z:F4})。");
+
+                    bool tapOk = Mathf.Abs(blue.rXY) < k_JitCorrTapGate
+                              && Mathf.Abs(blue.rXZ) < k_JitCorrTapGate
+                              && Mathf.Abs(blue.rYZ) < k_JitCorrTapGate
+                              && Mathf.Abs(proc.rXY) < k_JitCorrTapGate
+                              && Mathf.Abs(proc.rXZ) < k_JitCorrTapGate
+                              && Mathf.Abs(proc.rYZ) < k_JitCorrTapGate;
+                    sb.AppendLine($"{Mark(tapOk)}判据⑲ 三个抽头互不相关："
+                                + $"蓝噪声 ρxy {blue.rXY:F4} / ρxz {blue.rXZ:F4} / ρyz {blue.rYZ:F4}，"
+                                + $"程序化 ρxy {proc.rXY:F4} / ρxz {proc.rXZ:F4} / ρyz {proc.rYZ:F4}"
+                                + $"（门 |ρ| < {Sci(k_JitCorrTapGate)} ≈ 6σ）");
+                    sb.AppendLine("  ⓘ 这一格要拒绝的最小错答案是 **ρ = 1**：三个通道抄成同一个抽头。"
+                                + "那种错在画面上的症状是抖动只沿一条对角线走 —— 幅度看起来是对的，"
+                                + "方向永远只有一个，而这正是「一个物理上讲得通、因此最容易被接受」的形态。"
+                                + "蓝噪声档的三个抽头是同一张图的 (0,0)/(37,17)/(11,43) 三个偏移，"
+                                + "所以这一格顺带证明了那三个偏移量彼此够远。");
+
+                    // ------------------------------------------------------ 判据⑳ 聚合两档
+                    if (aggCount != (uint)k_JitProbeCountExpected)
+                    {
+                        sb.AppendLine($"ⓘ 判据⑳a~⑳c 未覆盖：AGG 计数 {aggCount}，片数 = {depth}"
+                                    + $" ≠ {k_JitProbeDim}。对角恒等式的推导要求 z 跑满 (17z mod 64) 的"
+                                    + "**整个周期** —— 17 在 mod 64 下可逆 ⇒ 一列的 64 个抽样点正好是"
+                                    + "整条反对角线，列均值因此只是 (x−y) 的函数。片数不是 64 时那 64 个点"
+                                    + "不再构成完整的反对角线，恒等式**本来就不该成立**，"
+                                    + "所以核在这里直接 return、报表点名未覆盖，而不是去判一条前提不成立的恒等式。");
+                    }
+                    else
+                    {
+                        const float nAgg = k_JitProbeCountExpected;
+                        float colMean = raw[k_SlotAggColSum] / k_JitProbeScale / nAgg;
+                        float colVar  = raw[k_SlotAggColSq]  / k_JitProbeScale / nAgg - colMean * colMean;
+                        float slcMean = raw[k_SlotAggSlcSum] / k_JitProbeScale / nAgg;
+                        float slcVar  = raw[k_SlotAggSlcSq]  / k_JitProbeScale / nAgg - slcMean * slcMean;
+
+                        // ⑳a 跨槽位对账。逐列一致档下 Ā ≡ n'.x(p, 0)（横向偏移沿 z 恒定），
+                        // 而⑲的蓝噪声档量的正是 n'.x(p, 0)。两组槽位**独立累加**同一个量 ⇒ 必须相等。
+                        // 这一格抓的是「⑳的列循环把源接错了」——那种错会让⑳c 照样全绿。
+                        float dMean = Mathf.Abs(colMean - blue.mx) / Mathf.Max(Mathf.Abs(blue.mx), 1e-12f);
+                        float dVar  = Mathf.Abs(colVar  - blue.vx) / Mathf.Max(Mathf.Abs(blue.vx), 1e-12f);
+                        bool crossOk = VistaBlueNoise.available
+                                    && dMean <= k_AggCrossGate && dVar <= k_AggCrossGate;
+                        sb.AppendLine($"{(VistaBlueNoise.available ? Mark(crossOk) : "ⓘ ")}判据⑳a 跨槽位对账"
+                                    + $"（逐列一致档下 Ā ≡ n'.x ⇒ 两组独立累加必须相等）："
+                                    + $"均值 {colMean:F6} vs {blue.mx:F6}（相对差 {Sci(dMean)}），"
+                                    + $"方差 {colVar:F6} vs {blue.vx:F6}（相对差 {Sci(dVar)}），"
+                                    + $"门 {Sci(k_AggCrossGate)}");
+                        if (!VistaBlueNoise.available)
+                            sb.AppendLine("  ⓘ 未覆盖：蓝噪声资产取不到，两边读到的都是引擎白图，"
+                                        + "相等是**平凡成立**的 —— 那不是通过。");
+                        sb.AppendLine("  ⓘ 这一格的**区分力边界**（必须自己说出来）：它能抓"
+                                    + "「COL 那一路的 latZStride 其实不是 0」（那时 Ā 的方差会按 ~1/N 掉，"
+                                    + "差出一个量级）、「+0.5 编码写错」、「rcpAmp 用错」、「槽位下标串了」。"
+                                    + "它**抓不到**「源接错了」—— 蓝噪声与程序化 hash 的边缘分布都是"
+                                    + "近似均匀的，均值和方差几乎一样。源接错那一半由⑱的符号门覆盖，"
+                                    + "两格合起来才是完整的。"
+                                    + $"（地板：Ā 走 64 次 fp32 累加，相对误差 ≤ 3.8e-6，"
+                                    + $"传到方差上带 ×2×3.98 的杠杆 ⇒ ≤ 3.0e-5；门 {Sci(k_AggCrossGate)} 留 ×33。）");
+
+                        // ⑳b 量级门。
+                        float varRatio = slcVar / Mathf.Max(colVar, 1e-12f);
+                        bool ratioOk = varRatio < k_AggVarRatioGate;
+                        sb.AppendLine($"{Mark(ratioOk)}判据⑳b 聚合幅度收缩：Var(Ā_逐片) / Var(Ā_逐列) = "
+                                    + $"{Sci(slcVar)} / {Sci(colVar)} = {Sci(varRatio)}"
+                                    + $"（门 < {k_AggVarRatioGate:F3}）");
+                        sb.AppendLine($"  ⓘ 独立情形的值是 1/N = {Sci(1f / k_JitProbeDim)}。"
+                                    + "**刻意不摆成 ≈1/N 的紧门**：固定步进下那 N 个场并不独立"
+                                    + "（抽的是同一条反对角线），1/N 的前提不成立 ——"
+                                    + "「用一个前提不成立的公式去摆门」会在收紧时伪造一个失败。"
+                                    + $"实测与 1/N 的比 {Sci(varRatio * k_JitProbeDim)} 只当 ⓘ 读。");
+
+                        // ⑳c 四格表。恰好一格 ≈ 0。
+                        float colDAxis = raw[k_SlotAggColDAxis] / k_JitProbeDScale;
+                        float colDDiag = raw[k_SlotAggColDDiag] / k_JitProbeDScale;
+                        float slcDAxis = raw[k_SlotAggSlcDAxis] / k_JitProbeDScale;
+                        float slcDDiag = raw[k_SlotAggSlcDDiag] / k_JitProbeDScale;
+
+                        bool tableOk = slcDDiag < k_AggDiagGate
+                                    && slcDAxis > k_AggAxisGate
+                                    && colDAxis > k_AggAxisGate
+                                    && colDDiag > k_AggAxisGate;
+                        sb.AppendLine($"{Mark(tableOk)}判据⑳c 对角条纹恒等式（四格里**恰好一格** ≈ 0）：");
+                        sb.AppendLine($"    逐列一致  max|Ā(p+(1,0)) − Ā(p)| = {Sci(colDAxis)}（须 > {Sci(k_AggAxisGate)}）"
+                                    + $"， max|Ā(p+(1,1)) − Ā(p)| = {Sci(colDDiag)}（须 > {Sci(k_AggAxisGate)}）");
+                        sb.AppendLine($"    逐片独立  max|Ā(p+(1,0)) − Ā(p)| = {Sci(slcDAxis)}（须 > {Sci(k_AggAxisGate)}）"
+                                    + $"， max|Ā(p+(1,1)) − Ā(p)| = {Sci(slcDDiag)}（须 < {Sci(k_AggDiagGate)}）");
+                        sb.AppendLine($"  ⓘ 门是怎么摆的：地板是 fp32 求和序误差的保守上界 {Sci(k_AggDiagFloor)}"
+                                    + "（|部分和| ≤ 32、½eps = 6.0e-8、64 次 add、除 64、两列各一份），"
+                                    + $"要拒绝的最小错答案是「DDIAG 与 DAXIS 同量级」= O(1e-1)，"
+                                    + $"门取两者的几何中点 {Sci(k_AggDiagGate)}。实测离地板 "
+                                    + $"×{(slcDDiag > 0f ? slcDDiag / k_AggDiagFloor : 0f):F2}，"
+                                    + $"离门 ×{(slcDDiag > 0f ? k_AggDiagGate / slcDDiag : float.PositiveInfinity):F1}。");
+                        sb.AppendLine("  ⓘ 这一格是本节的载荷，它替换掉一条我自己写错过的论证。"
+                                    + "原先注释里写的是「CLT 把逐片独立的聚合场抹成白噪声」——"
+                                    + "那条对程序化 hash 成立，对蓝噪声**是错的**：固定的逐片瓦片步进 "
+                                    + "s = (17,17) 让聚合滤波器精确地等于 K(f) = δ[f_x + f_y ≡ 0 (mod 64)]，"
+                                    + "剩下的基函数只有 e^{2πi f_x(x−y)/64} ⇒ Ā(x,y) = h((x−y) mod 64)，"
+                                    + "也就是**对角条纹**。初等版本更好核对：17·49 = 833 = 13·64 + 1 ⇒ "
+                                    + "17 在 mod 64 下可逆 ⇒ 一列的 64 个抽样点正好是整条反对角线 "
+                                    + "{(x+k, y+k)}，列均值当然只是 (x−y) 的函数。这条对任意逐点函数都成立，"
+                                    + "所以 frac 那次绕回救不了它。");
+                        sb.AppendLine("  ⓘ 为什么量的是**逐点恒等式的 max 差**，而不是相关系数："
+                                    + "①归一化的一阶相关 ρ₁ 判不出「变白了」—— N 个解相关场平均之后"
+                                    + "分子分母同比缩小，ρ₁ 不变；能判的是**方向性**。"
+                                    + $"②拿定点矩去算 ρ 时，尺子地板 {Sci(1f / k_JitProbeScale)} 对上 "
+                                    + $"Var(Ā_逐片) = {Sci(slcVar)}，ρ 的误差与 1e-3 的门只差个位数倍 ——"
+                                    + "「尺子的地板与被测量同量级时，尺子会自己伪造一个结论」。"
+                                    + "换成逐点差之后地板降到 fp32 求和序误差："
+                                    + "Ā(x+1,y+1) 与 Ā(x,y) 求和的是**同一个** 64 点多重集合、"
+                                    + "只是起点旋转了 17⁻¹ ≡ 49 片。注意**不是**「逐位相同」——"
+                                    + "fp32 加法不满足结合律，旋转求和次序会留下一点非零残差，"
+                                    + $"本次 {Sci(slcDDiag)}（那 {Sci(k_AggDiagFloor)} 的保守界因此不紧，"
+                                    + $"实测在它下面 ×{(slcDDiag > 0f ? k_AggDiagFloor / slcDDiag : float.PositiveInfinity):F0}）。");
+                        sb.AppendLine("  ⓘ 后续（未实现）：把逐片的瓦片偏移改成**随机**而不是固定步进，"
+                                    + "K(f) 就会退回 O(1/√N) 于所有 f ≠ 0，逐片独立与蓝噪声就不再互斥。"
+                                    + "不现在做的理由：它要先证明蓝噪声档的收益值得多一次 hash，"
+                                    + "而那正是判据⑱与 #27 的残差谱要回答的。");
+                        // 组合禁忌：这条以前是推导，现在是**读数**。#22b 修好通道之后
+                        // 蓝噪声这一路第一次真的活了，于是 ⑳c 量到的对角恒等式
+                        // （DDIAG ≈ 0 而 DAXIS = O(0.1)）就不再是一个纸上的预言。
+                        // 而 settings 目前允许美术把这两个枚举同时选上 ——
+                        //「一个默认关闭、又没有判据覆盖的开关」的近亲：
+                        // 这里是一个**允许被选中、且选中就出结构性瑕疵**的组合。
+                        bool hazardNow = blueOnline
+                                      && settings.lateralJitterShape == LateralJitterShape.PerSlice;
+                        sb.AppendLine($"  {(hazardNow ? "⚠" : "ⓘ")} 组合禁忌（本帧"
+                                    + (hazardNow ? "**正踩在上面**" : "未踩到")
+                                    + "）：源 = BlueNoise **且** 形态 = PerSlice 时，"
+                                    + $"聚合偏移场退化成对角条纹（本次量到 DDIAG {Sci(slcDDiag)} "
+                                    + $"对 DAXIS {Sci(slcDAxis)}，差 ×{(slcDDiag > 0f ? slcDAxis / slcDDiag : float.PositiveInfinity):F0}）。"
+                                    + "画面症状是切片台阶不再是台阶、而是一组 45° 的斜纹 —— "
+                                    + "比台阶更难被当成「雾本来就这样」。在随机瓦片偏移落地之前，"
+                                    + "这两档不要同时开；程序化 + PerSlice 不受影响"
+                                    + "（hash 之间独立 ⇒ CLT 那条论证在**那一档**上是对的）。");
+                    }
+
+                    // ------------------------------------------------------ 判据㉑ 档位接线（双向）
+                    // 在 **slice 1** 上做，不是 slice 0：z 步进 × 0 = 0 让两个形态档逐位相同
+                    // ⇒ D_COL ≡ D_SLC ≡ 0 ⇒「恰好有一个为 0」会以**两个都为 0** 的方式假通过 ——
+                    // 一个自己造不出失败的判据。
+                    //
+                    // 四个槽位走的是 InterlockedMax 而不是 Min：Min 的初值 0 会让四个都读 0，
+                    // 同样是一个造不出失败的判据。
+                    {
+                        uint dCol  = raw[k_SlotJitDCol];
+                        uint dSlc  = raw[k_SlotJitDSlc];
+                        uint dProc = raw[k_SlotJitDProc];
+                        uint dBlue = raw[k_SlotJitDBlue];
+
+                        bool shapeIsCol = settings.lateralJitterShape == LateralJitterShape.PerColumn;
+                        bool shapeOk = shapeIsCol ? (dCol == 0u && dSlc > 0u)
+                                                  : (dSlc == 0u && dCol > 0u);
+                        bool srcOk   = blueOnline ? (dBlue == 0u && dProc > 0u)
+                                                  : (dProc == 0u && dBlue > 0u);
+
+                        sb.AppendLine($"{Mark(shapeOk && srcOk)}判据㉑ 档位接线（双向：恰好一个为 0，且是 settings 指名的那一个）：");
+                        sb.AppendLine($"    形态：settings = {settings.lateralJitterShape} ⇒ 期望 "
+                                    + $"{(shapeIsCol ? "D_COL" : "D_SLC")} = 0；"
+                                    + $"实测 D_COL {dCol}, D_SLC {dSlc}（×{Sci(k_JitProbeDScale)}）");
+                        sb.AppendLine($"    源：线上生效 = {(blueOnline ? "BlueNoise" : "Procedural")} ⇒ 期望 "
+                                    + $"{(blueOnline ? "D_BLUE" : "D_PROC")} = 0；"
+                                    + $"实测 D_PROC {dProc}, D_BLUE {dBlue}");
+                        sb.AppendLine("  ⓘ 它为什么不是循环论证：**期望**来自 settings 对象（美术填的那个枚举），"
+                                    + "**读数**来自 shader 从 cbuffer 解出来的档位，中间整条 "
+                                    + "settings → JitterParamsOf → _VistaFroxelJitter → "
+                                    + "VistaFroxelJitterZStride/UseBlueNoise 都在载荷路径上。"
+                                    + "两对各只放开一个自由度（形态那一对的源取自 cbuffer，源那一对的形态取自 cbuffer），"
+                                    + "所以一格红能指到具体是哪一路接错了。");
+                        sb.AppendLine("  ⓘ 「另一个 > 0」这一半是必需的：只判「选中的那个为 0」时，"
+                                    + "一个把两档实现成同一件事的 bug（比如 zStride 根本没被读）会全绿 ——"
+                                    + "而那正是本节要抓的东西。");
+                    }
+                }
+            }
+
             // ---------------------------------------------------------------- 分配口径
             if (volume.allocatedDesc.HasValue)
             {
@@ -919,7 +1409,58 @@ namespace Vista.EditorTools
                         + "  代价点名：现在实现它要么加第九个核、要么让重投影探针那一趟去读注入表，"
                         + "而后者会推翻那一趟「刻意不声明 froxelInjection」的理由。"
                         + "失效症状（#27 要盯的那个）：「打开抖动之后雾稍微浓了一点」——"
-                        + "一个看起来像调好了的系统性偏差。");
+                        + "一个看起来像调好了的系统性偏差。\n"
+                        + "  【#22b 括注】第九个核已经存在了（FroxelJitterProbe），但它**不读任何一张表** ——"
+                        + "抖动偏移是下标的纯函数。⑯要的是「同一个 froxel 累积多帧之后的方差」，"
+                        + "那需要读注入表、还需要一个收敛参考解，两条都不在这个核的能力里。"
+                        + "所以上面那句「要么加第九个核」现在应读成「要么加第十个核」，"
+                        + "推迟的三条理由一条都没被这次改动结清。");
+        }
+
+        /// <summary>
+        /// 一档抖动的实测矩（#22b 判据⑱⑲）。定点槽 → 均值/方差/三个相关系数。
+        ///
+        /// 邻域那两格（rNbX/rNbY）以**基场自己的方差**归一，不为邻域场再累一份二阶矩：
+        /// p 与 p + Δ 的边缘分布同分布（蓝噪声瓦片是环形的 ⇒ 逐位同一个多重集合；
+        /// 程序化 hash 是同一族），所以 √(Var(p)·Var(p+Δ)) = Var(p)。
+        /// 少累一份矩就少一份要对账的读数 —— 但这条前提必须写下来，
+        /// 因为它一旦不成立（比如有人把邻域抽头改成 % 64 之外的越界坐标），
+        /// 归一化就错了，而症状是 ρ 的**幅值**偏移，正好落在⑱不判幅值的那一半里。
+        /// </summary>
+        struct JitterTierMoments
+        {
+            public float mx, my, mz;
+            public float vx, vy, vz;
+            public float rNbX, rNbY;
+            public float rXY, rXZ, rYZ;
+        }
+
+        static JitterTierMoments ReadJitterTier(uint[] raw, int b)
+        {
+            const float inv = 1f / k_JitProbeCountExpected;
+            const float eps = 1e-12f;
+
+            float sx = raw[b + k_JitOfsSum]     / k_JitProbeScale * inv;
+            float sy = raw[b + k_JitOfsSum + 1] / k_JitProbeScale * inv;
+            float sz = raw[b + k_JitOfsSum + 2] / k_JitProbeScale * inv;
+
+            var m = new JitterTierMoments
+            {
+                mx = sx, my = sy, mz = sz,
+                vx = raw[b + k_JitOfsSq]     / k_JitProbeScale * inv - sx * sx,
+                vy = raw[b + k_JitOfsSq + 1] / k_JitProbeScale * inv - sy * sy,
+                vz = raw[b + k_JitOfsSq + 2] / k_JitProbeScale * inv - sz * sz,
+            };
+
+            m.rNbX = (raw[b + k_JitOfsNbX] / k_JitProbeScale * inv - sx * sx) / Mathf.Max(m.vx, eps);
+            m.rNbY = (raw[b + k_JitOfsNbY] / k_JitProbeScale * inv - sx * sx) / Mathf.Max(m.vx, eps);
+            m.rXY  = (raw[b + k_JitOfsXY]  / k_JitProbeScale * inv - sx * sy)
+                   / Mathf.Max(Mathf.Sqrt(Mathf.Max(m.vx * m.vy, 0f)), eps);
+            m.rXZ  = (raw[b + k_JitOfsXZ]  / k_JitProbeScale * inv - sx * sz)
+                   / Mathf.Max(Mathf.Sqrt(Mathf.Max(m.vx * m.vz, 0f)), eps);
+            m.rYZ  = (raw[b + k_JitOfsYZ]  / k_JitProbeScale * inv - sy * sz)
+                   / Mathf.Max(Mathf.Sqrt(Mathf.Max(m.vy * m.vz, 0f)), eps);
+            return m;
         }
 
         static Camera FindGameCamera()

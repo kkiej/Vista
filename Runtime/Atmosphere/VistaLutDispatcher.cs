@@ -68,6 +68,32 @@ namespace Vista
         /// 这张表清空态全 0，存 T 会把「表没被写」升级成全黑）。写入在 #21。
         /// </summary>
         FroxelIntegral,
+
+        /// <summary>
+        /// 蓝噪声瓦片（64×64、8 bit、单通道），来源是 URP 自带的
+        /// <c>blueNoise64LTex</c>，见 <see cref="VistaBlueNoise"/>。**只读、无生产者。**
+        ///
+        /// ---------------------------------------------------------------- 为什么它是一个槽位而不是一句全局
+        /// #22b 一开始走的是 <c>Shader.SetGlobalTexture</c>，而那**到不了 compute kernel**：
+        /// 它写的是 Unity 的**立即态**全局属性表，不进命令流；compute dispatch 的纹理绑定
+        /// 是在命令流里解析的。症状是核里逐像素读到 0（D3D11 上未绑定的 SRV 读 0，
+        /// **不是**引擎默认白图 —— 那条「读到全 1」的经验只对 material shader 成立），
+        /// 而 CPU 侧的一切表面证据都显示接上了。
+        ///
+        /// 而 <c>ComputeCommandBuffer</c> 的 <c>SetGlobalTexture</c> / <c>SetComputeTextureParam</c>
+        /// 两组重载**只吃 TextureHandle**，没有任何入口接受裸 <c>Texture</c> ——
+        /// 于是这张外部资产必须被 import 进图，也就必须有一个槽位。
+        ///
+        /// ---------------------------------------------------------------- 它与其余槽位的两点不同
+        /// 1. 解析源不是 <c>m_Luts</c>，而是静态的 <see cref="VistaBlueNoise.handle"/>
+        ///    （立即模式）/ pass import 进来的 handle（graph 模式）。
+        /// 2. 它是唯一一个**允许解析不到**的纹理槽位（资产缺失时回落到程序化档），
+        ///    所以调用方必须先问 <see cref="IVistaLutDispatcher.HasTexture"/> ——
+        ///    无条件绑一个 null RTHandle 会经由隐式转换变成
+        ///    <c>default(RenderTargetIdentifier)</c>（= CameraTarget），
+        ///    那是一个静默绑错、且画面上完全说不出成因的形态。
+        /// </summary>
+        BlueNoise,
     }
 
     /// <summary>
@@ -117,6 +143,18 @@ namespace Vista
     public interface IVistaLutDispatcher
     {
         void SetTexture(ComputeShader cs, int kernelIndex, int nameID, VistaLutSlot slot);
+
+        /// <summary>
+        /// 这个槽位这一趟解析得到吗。**唯一的用途是 <see cref="VistaLutSlot.BlueNoise"/>**：
+        /// 它是唯一一个允许缺失的纹理槽位（资产取不到时回落到程序化抖动）。
+        ///
+        /// 为什么不在派发处直接问 <c>VistaBlueNoise.available</c>：那会变成两份真相 ——
+        /// graph 侧还要求「本趟 pass 确实 import + UseTexture 过它」，而
+        /// <c>available</c> 对此一无所知。少声明一趟的症状会是那一趟静默绑到
+        /// default handle 上。问 dispatcher 则是问**被测的那份绑定源自己**，
+        /// 于是「资产缺失」与「pass 忘了声明」这两种缺失走同一条回落路径。
+        /// </summary>
+        bool HasTexture(VistaLutSlot slot);
 
         /// <summary>
         /// 绑定某一级 mip。反射的 UAV 目标每级 mip 是一趟独立 dispatch，
@@ -174,6 +212,8 @@ namespace Vista
         public void SetTextureMip(ComputeShader cs, int kernelIndex, int nameID, VistaLutSlot slot, int mipLevel)
             => m_Cmd.SetComputeTextureParam(cs, kernelIndex, nameID, Resolve(slot), mipLevel);
 
+        public bool HasTexture(VistaLutSlot slot) => Resolve(slot) != null;
+
         public void SetBuffer(ComputeShader cs, int kernelIndex, int nameID, VistaLutBufferSlot slot)
             => m_Cmd.SetComputeBufferParam(cs, kernelIndex, nameID, Resolve(slot));
 
@@ -203,6 +243,10 @@ namespace Vista
             VistaLutSlot.FroxelInjectionRead    => m_Luts.froxelInjection,
             VistaLutSlot.FroxelInjectionHistory => m_Luts.froxelInjectionHistory,
             VistaLutSlot.FroxelIntegral         => m_Luts.froxelIntegral,
+            // 不来自 m_Luts：这张图是引擎的资产，Vista 只包了个 RTHandle
+            // （见 VistaBlueNoise.handle 的注释 —— 那里记着为什么不能走
+            //  Shader.SetGlobalTexture）。取不到时是 null，由 HasTexture 挡住。
+            VistaLutSlot.BlueNoise              => VistaBlueNoise.handle,
             _                               => null,
         };
 
@@ -234,6 +278,7 @@ namespace Vista
         readonly TextureHandle m_FroxelInjection;
         readonly TextureHandle m_FroxelInjectionHistory;
         readonly TextureHandle m_FroxelIntegral;
+        readonly TextureHandle m_BlueNoise;
         readonly BufferHandle m_SkyAmbientSh;
         readonly BufferHandle m_FroxelShadowProbe;
 
@@ -256,6 +301,7 @@ namespace Vista
             m_FroxelInjection = handles.froxelInjection;
             m_FroxelInjectionHistory = handles.froxelInjectionHistory;
             m_FroxelIntegral = handles.froxelIntegral;
+            m_BlueNoise = handles.blueNoise;
             m_SkyAmbientSh = handles.skyAmbientSh;
             m_FroxelShadowProbe = handles.froxelShadowProbe;
         }
@@ -265,6 +311,11 @@ namespace Vista
 
         public void SetTextureMip(ComputeShader cs, int kernelIndex, int nameID, VistaLutSlot slot, int mipLevel)
             => m_Cmd.SetComputeTextureParam(cs, kernelIndex, nameID, Resolve(slot), mipLevel);
+
+        // IsValid() 而不是 != default：一个没被本趟 pass 声明过的槽位拿到的就是
+        // default handle，而它到 RenderTargetIdentifier 的隐式转换是**合法**的
+        // （落到 CameraTarget 上），所以缺失必须在这里就被判出来。
+        public bool HasTexture(VistaLutSlot slot) => Resolve(slot).IsValid();
 
         // Resolve 返回 BufferHandle，靠 BufferHandle -> GraphicsBuffer 的隐式转换落到
         // SetComputeBufferParam 上。那个转换是在 execute 阶段查
@@ -299,6 +350,9 @@ namespace Vista
             VistaLutSlot.FroxelInjectionRead    => m_FroxelInjection,
             VistaLutSlot.FroxelInjectionHistory => m_FroxelInjectionHistory,
             VistaLutSlot.FroxelIntegral         => m_FroxelIntegral,
+            // 只有 import + UseTexture 过它的那几趟 pass 才拿得到有效 handle；
+            // 其余趟是 default ⇒ HasTexture 为 false ⇒ 派发处不绑（回落到程序化档）。
+            VistaLutSlot.BlueNoise              => m_BlueNoise,
             _                               => default,
         };
 
@@ -340,6 +394,14 @@ namespace Vista
         public TextureHandle froxelInjection;
         public TextureHandle froxelInjectionHistory;
         public TextureHandle froxelIntegral;
+        /// <summary>
+        /// 蓝噪声瓦片（#22b）。**只读、无生产者**，来源是 URP 的资产 ——
+        /// 由消费它的那几趟 pass 自己 import + UseTexture。没声明过的 pass
+        /// 在这里拿到 default，<c>HasTexture</c> 判 false，派发处不绑。
+        /// 为什么它必须进图而不是一句 <c>Shader.SetGlobalTexture</c>：
+        /// 见 <see cref="VistaBlueNoise.handle"/> 的注释。
+        /// </summary>
+        public TextureHandle blueNoise;
         /// <summary>阴影覆盖性探针（仅在 Editor 请求探针的那一帧被 import）。</summary>
         public BufferHandle froxelShadowProbe;
     }

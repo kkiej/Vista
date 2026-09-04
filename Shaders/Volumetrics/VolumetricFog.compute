@@ -2,8 +2,8 @@
 //  近层体积雾（Step 3 档 A）
 //
 //  #19 交付「资源 + 分布 + 判据」，#20 交付逐 froxel 的光照注入，#21 交付深度积分，
-//  #22a 交付抖动 + 时间重投影。
-//  八个核：
+//  #22a 交付抖动 + 时间重投影，#22b 交付蓝噪声源与横向形态的两档对照。
+//  九个核：
 //    FroxelPlaceholder   把切片几何写进注入表 —— 它**不是**雾，是一份能被读回来对账的
 //                        已知内容。存在的理由是「RWTexture3D 绑定失败」这个坑：
 //                        RTHandle 的 2D 便捷重载会静默建成 Tex2D，症状只有 Editor.log
@@ -20,6 +20,9 @@
 //                        静止恒等性的残差、以及抖动引起的相对亮度散布搬进探针 buffer。
 //                        它调的是**线上那一份**共享函数（VistaFroxelReprojectUvw），
 //                        靠调用点给 positionWS 减一个合成位移把拒绝分支驱进去。
+//    FroxelJitterProbe   #22b 判据的探针：抖动源的直方图/矩/邻域相关，以及
+//                        「逐列聚合偏移」在两个横向形态档下的对照。它**一张表都不读**，
+//                        因为抖动偏移是下标的纯函数。
 //
 //  #22a 之后 VistaFogSettings.Mode 里**仍然没有** Froxel 档 ——
 //  一个选了什么都不发生的枚举值等于把哑档位摆给美术，而把积分结果贴到画面上是 #25。
@@ -35,6 +38,7 @@
 #pragma kernel FroxelSynthMedium
 #pragma kernel FroxelIntegralVerify
 #pragma kernel FroxelReprojProbe
+#pragma kernel FroxelJitterProbe
 
 // 与大气那批核同一条排除线：GLES 没有 RWTexture3D，编译只会产出一堆噪声。
 #pragma only_renderers d3d11 vulkan metal playstation xboxone xboxseries switch
@@ -656,6 +660,81 @@ void FroxelIntegralVerify(uint3 id : SV_DispatchThreadID)
 #define VISTA_PROBE_REPROJ_COVER_COUNT    31u  // 角色 3 + 4：线程数
 #define VISTA_PROBE_REPROJ_JITTER_SPREAD  32u  // 角色 1：抖动引起的相对亮度散布 max，×1e6
 
+// ---- #22b 追加：抖动源本身的统计（判据⑰⑱⑲⑳ + 档位接线）----
+//  由**另一个核**（FroxelJitterProbe）写，槽位区间与上面完全不重叠。
+//  那个核一张表都不读 —— 抖动偏移是下标的纯函数 —— 所以它**不依赖体积的 xy 尺寸**，
+//  唯一的体积依赖是⑳要用的片数（见 VISTA_JITTER_AGG_SLICES）。
+//
+//  ⑰ 源图的直方图与矩：8 个桶 + Σv + Σv²。窗口固定 64×64 = 4096 个样本，
+//    正好是瓦片的一个整周期，所以「秩均匀 ⇒ 每桶正好 512」是一条**精确**的期望，
+//    不是统计近似。它要挡的是一次 sRGB 重导入（直方图不再均匀 ⇒ 均值 ≠ 0.5
+//    ⇒ 抖动偏移的期望 ≠ 0 ⇒ 开抖动之后雾整体偏浓或偏淡）。
+//  ⑱ 动画后那一片的一阶邻域相关（lag (1,0) 与 (0,1)）—— 蓝噪声必须显著为负、
+//    程序化必须 ≈ 0。量的是 frac(v + φ)，不是源图（那条「加相位是平移」的论证已被否证）。
+//  ⑲ 三路抽头之间的相关 —— 抽头偏移选重了（或写成同一个）时这一格红。
+//  ⑳ 逐列聚合偏移 Ā 的两档对照，见 FroxelJitterProbe 头部。
+//
+//  两组（程序化 / 蓝噪声）各 11 个槽位，顺序必须一致（SUM.xyz, SQ.xyz, NB_X, NB_Y,
+//  XY, XZ, YZ）—— 顺序写错的症状不会静默：相关性读数被记进方差槽时 Var 会跑到
+//  0.25 量级（一个 |n'| 的一阶量），离解析值 0.0839869 差 3 倍。
+#define VISTA_PROBE_BN_HIST0        33u  // 33..40：源图 8 桶直方图，每桶期望 512
+#define VISTA_PROBE_BN_SUM          41u  // Σv，×1e5（期望 2048 ⇒ 2.048e8）
+#define VISTA_PROBE_BN_SQ           42u  // Σv²，×1e5（期望 1368.0105）
+#define VISTA_PROBE_BN_COUNT        43u  // 线程数（期望 4096）
+
+#define VISTA_PROBE_JIT_PROC_BASE   44u  // 44..54：程序化档的 11 个矩槽
+#define VISTA_PROBE_JIT_BLUE_BASE   55u  // 55..65：蓝噪声档的 11 个矩槽
+#define VISTA_PROBE_JIT_STRIDE      11u
+
+// 组内偏移。C# 侧按 BASE + 这几个常量镜像，两边任何一处错位都会让⑰的
+// 「Var 落在 0.084 附近」这一格先红。
+#define VISTA_PROBE_JIT_OFS_SUM     0u   // +0/+1/+2 = Σn'.x / Σn'.y / Σn'.z
+#define VISTA_PROBE_JIT_OFS_SQ      3u   // +3/+4/+5 = Σn'.x² / …
+#define VISTA_PROBE_JIT_OFS_NB_X    6u   // Σ n'.x(p)·n'.x(p + (1,0))
+#define VISTA_PROBE_JIT_OFS_NB_Y    7u   // Σ n'.x(p)·n'.x(p + (0,1))
+#define VISTA_PROBE_JIT_OFS_XY      8u   // Σ n'.x·n'.y
+#define VISTA_PROBE_JIT_OFS_XZ      9u
+#define VISTA_PROBE_JIT_OFS_YZ     10u
+
+#define VISTA_PROBE_JIT_COUNT      66u   // ⑰⑱⑲ + 档位接线的线程数（期望 4096）
+
+// ⑳：逐列聚合偏移 Ā 的两档读数。DAXIS/DDIAG 是**逐点差的 max**，不是相关系数 ——
+// 相关系数量不出这件事（N 个场平均之后分子分母同比缩小，ρ₁ 不变），
+// 而条纹的预言是一条**逐点恒等式** Ā(x+1,y+1) = Ā(x,y)，它的地板只有 fp32 求和序误差。
+// DAXIS 是必需的对照：少了它，一个「Ā 恒为常数」的 bug 会把 DDIAG 那条恒等式假通过。
+#define VISTA_PROBE_AGG_COL_SUM    67u   // ×1e5，Ā + 0.5
+#define VISTA_PROBE_AGG_COL_SQ     68u   // ×1e5
+#define VISTA_PROBE_AGG_COL_DAXIS  69u   // max|Ā(p+(1,0)) − Ā(p)|，×1e9
+#define VISTA_PROBE_AGG_COL_DDIAG  70u   // max|Ā(p+(1,1)) − Ā(p)|，×1e9
+#define VISTA_PROBE_AGG_SLC_SUM    71u
+#define VISTA_PROBE_AGG_SLC_SQ     72u
+#define VISTA_PROBE_AGG_SLC_DAXIS  73u   // 必须 O(1e-2)：否则 DDIAG 是被常数场假通过的
+#define VISTA_PROBE_AGG_SLC_DDIAG  74u   // 必须 ≈ 0：这就是对角条纹那条恒等式
+#define VISTA_PROBE_AGG_COUNT      75u   // ⑳的线程数（期望 4096；片数 ≠ 64 时为 0）
+
+// 档位接线的**双向**判据：四个 max|online − 某一档|。
+// CPU 按 settings 断言「{COL, SLC} 恰好有一个为 0 且是它选的那一个」，
+// 以及「{PROC, BLUE} 恰好有一个为 0 且是它选的那一个」。
+// 期望来自 settings 对象、读数来自 uniform ⇒ 不是自证。
+#define VISTA_PROBE_JIT_D_COL      76u   // ×1e9
+#define VISTA_PROBE_JIT_D_SLC      77u
+#define VISTA_PROBE_JIT_D_PROC     78u
+#define VISTA_PROBE_JIT_D_BLUE     79u
+
+// 判据⑰d：**向被测资源自己问尺寸**，而不是相信 CPU 侧那句
+// 「VistaBlueNoise.available = True」。走 InterlockedMax，初值 0 ⇒
+// 「没绑上」与「核压根没跑」都读 0 —— 这两者由 VISTA_PROBE_BN_COUNT
+// （期望 4096）分开，报表必须点名这条依赖。
+//
+// 存在的理由（与判据⑥a 完全同一条）：#22b 第一次修好之后，⑰b 的直方图
+// 仍然是 [4096,0,…]、⑰c 的均值仍然精确为 0，而 CPU 侧一切表面证据都显示
+// 接上了（资产 available、import 过、UseTexture 过、逐核 SetComputeTextureParam
+// 过）。此时「未绑定 SRV 在 D3D11 上读到全 0」与「绑上了但这张资产的
+// GPU 内容是 0」在报表上**长得一模一样** —— 而这一格把两者分开：
+// 0×0 ⇒ 绑定没到达核；64×64 ⇒ 绑定到了，问题在资产内容。
+#define VISTA_PROBE_BN_WIDTH       80u
+#define VISTA_PROBE_BN_HEIGHT      81u
+
 // 位 4「跑过」是必需的：只靠位 0~3 的话，一个从未派发的核留下的全零
 // 与「级联关 + 阴影图未绑 + 屏幕空间关 + 软阴影关」这个**完全合法**的组合
 // 在报表上长得一模一样。
@@ -908,12 +987,17 @@ void FroxelReprojProbe(uint3 id : SV_DispatchThreadID)
         //  **不**拿 hist 与 current 去比 —— 那个差里混着相机运动与场景变化，
         //  量出来的是一个被污染的上界。这里改成两次**独立抖动抽样**的相对差：
         //  逐帧的相位平移本来也是独立抽样，所以两者同分布。
-        //  第二次把 hash 的输入挪 977 片（一个奇数，与任何 2 的幂互素，
-        //  PCG3D 的雪崩会把它彻底打散）。
+        //
+        //  第二次抽样靠**挪相位**（VistaFroxelJitterOffsetAltPhase），不是挪下标。
+        //  #22a 原来写的是「把 hash 的 z 输入挪 977 片」，#22b 把它换掉了：
+        //  逐列一致档（默认档）下横向抖动看到的 z 恒为 0，于是挪 z 对横向偏移
+        //  **一个 bit 都不改** ⇒ jA.xy ≡ jB.xy ⇒ 读数里只剩深度那一项。
+        //  那是一个**偏低**的下界，而偏低的下界会让死区看起来有裕度 ——
+        //  「一个偏低的成本代理会让门看起来有裕度」。
         //
         //  读数是 16384 个 froxel 上的 **max**，不是均值 —— 死区要挡的是尾部。
         float3 jA = VistaFroxelJitterOffset(fid);
-        float3 jB = VistaFroxelJitterOffset(fid + uint3(0u, 0u, 977u));
+        float3 jB = VistaFroxelJitterOffsetAltPhase(fid);
         float  lA = VistaFroxelLuminance(
             VistaFroxelInject((float2)fid.xy + 0.5 + jA.xy, (float)fid.z + jA.z).rgb);
         float  lB = VistaFroxelLuminance(
@@ -1008,4 +1092,218 @@ void FroxelReprojProbe(uint3 id : SV_DispatchThreadID)
         if (m == VISTA_REPROJ_LUMINANCE)
             InterlockedAdd(_VistaFroxelShadowProbeRW[VISTA_PROBE_REPROJ_HIT_LUM], 1u);
     }
+}
+
+// ============================================================================
+//  #22b 判据的探针：抖动源的统计 + 横向形态两档的聚合对照
+//
+//  一线程一个瓦片像素（固定 64×64 = 4096 个线程）。它**一张表都不读**：
+//  抖动偏移是下标的纯函数，所以这个核不依赖体积的 xy 尺寸，也不需要相机 ——
+//  唯一的体积依赖是⑳要用的片数，见下面那条 == 64 的门。
+//
+//  ---- 为什么窗口正好是 64×64 ----
+//  蓝噪声瓦片是**环形**的、周期 64。取一个整周期意味着：
+//    · ⑰的「秩均匀 ⇒ 每桶正好 512」是一条精确期望，不是统计近似；
+//    · ⑱的邻域对不需要边界处理 —— pixel + (1,0) 在 x = 63 处自然绕回 0，
+//      而那正是环形图的真邻居（VistaFroxelBlueNoiseAt 内部取模）；
+//    · ⑳的对角恒等式要求 z 跑满 17 在 mod 64 下的整个周期。
+//  程序化那一档不是周期函数，pixel + (1,0) 在 x = 63 处给出的是真正的
+//  hash(64, ·) —— 也是对的邻居。两档因此共用同一段代码而不需要各自的绕回规则。
+//
+//  ---- ⑰的期望是怎么算出来的 ----
+//  64×64 = 4096 个像素、256 个 8 bit 灰阶、void-and-cluster 的排序是**秩均匀**的
+//  ⇒ 每一阶正好 16 个像素。8 个桶按 bin = floor(v·8) 划：
+//  bin b 收下的是 b ≤ 8k/255 < b+1，也就是 k ∈ [31.875b, 31.875(b+1))，
+//  逐桶点算 k 的个数是 32/32/32/32/32/32/32/32 —— **每桶正好 32 阶 × 16 = 512**。
+//  桶界落在 k = 31.875、63.75 … 这些**非整数**上，所以 v·8 永远不会贴着某个整数，
+//  fp32 的取整方向在这里不参与结论（余量 ~4e-3，比 eps 大五个量级）。
+//  Σv = 2048 精确（均值 0.5 精确）⇒ 抖动偏移 (v − 0.5) 的期望精确为 0
+//  ⇒ **开抖动不引入密度偏差**。E[v²] = 511/(6·255) = 0.3339869 ⇒ Var = 0.0839869
+//  （连续均匀分布是 1/12 = 0.0833333，差的那一点是 8 bit 量化）。
+//  这两个解析值只当 ⓘ 交叉核对：⑱⑲⑳的归一化用的是**实测**的逐通道矩，
+//  于是判据的载荷路径上不留任何解析前提。
+//
+//  ---- ⑳量的是什么 ----
+//  Ā(p) = (1/N)·Σ_z u_lat.x(p, z)，也就是一个像素沿整列看到的**聚合横向偏移**。
+//  逐列一致档下 Ā ≡ u.x(p, 0)（就是源图自己）；逐片独立档下 Ā 的幅度按 /√N 收缩，
+//  但它退化成 h((x−y) mod 64) —— 一个只依赖反对角的一维函数，也就是**对角条纹**
+//  （推导见 FroxelVolume.hlsl 的抖动一节）。
+//
+//  所以⑳量的**不是**相关系数：归一化的一阶相关 ρ₁ 判不出「变白了」——
+//  N 个场平均之后分子分母同比缩小，ρ₁ 不变。条纹的预言是一条**逐点恒等式**
+//  Ā(x+1,y+1) = Ā(x,y)，它的地板只有 fp32 求和序误差（两列抽样的是**同一个**
+//  64 点多重集合、只是起点旋转了 17⁻¹ ≡ 49 片，所以连量化误差都相同）。
+//  DAXIS（lag (1,0)）是必需的对照：少了它，一个「Ā 恒为常数」的 bug
+//  会把 DDIAG 那条恒等式假通过 —— 而恒为常数正是「抖动整个失效」的样子。
+//
+//  ---- 一条要在报表上自己说出来的窄化 ----
+//  ⑱量的是 lag 1 的邻域相关，**不是**谱。一个 compute 探针里做 FFT 超出范围。
+//  可判的内容因此是**符号**（蓝噪声必须显著为负、程序化 ≈ 0），
+//  它看不见 lag ≥ 2 上的结构。画面级的残差谱与判据⑯一起放在 #27。
+// ============================================================================
+#define VISTA_JITTER_PROBE_DIM      64u
+
+// ⑳的门：对角恒等式的推导要求 z 跑满 (17z mod 64) 的整个周期。
+// 片数 ≠ 64 时那 64 个抽样点不再是完整的反对角线，恒等式**本来就不该成立** ——
+// 于是这一格宁可判成未覆盖，也不去判一条前提不成立的恒等式。
+#define VISTA_JITTER_AGG_SLICES     64u
+
+#define VISTA_JITTER_PROBE_SCALE    1.0e5   // 矩：逐线程 ≤ 1 ⇒ ×4096 = 4.1e8 < 4e9
+#define VISTA_JITTER_PROBE_D_SCALE  1.0e9   // 逐点差的 max：≤ 1 ⇒ 1e9 < 4e9
+
+// 定点累加/取最大的薄包装。核内**不算任何误差**，误差在 C# 侧算 ——
+// 与 FroxelIntegralVerify 同一条约定。
+void VistaJitterProbeAdd(uint slot, float v)
+{
+    InterlockedAdd(_VistaFroxelShadowProbeRW[slot],
+                   VistaProbeFixed(v, VISTA_JITTER_PROBE_SCALE));
+}
+
+void VistaJitterProbeMax(uint slot, float v)
+{
+    InterlockedMax(_VistaFroxelShadowProbeRW[slot],
+                   VistaProbeFixed(v, VISTA_JITTER_PROBE_D_SCALE));
+}
+
+// 动画后的偏移场 n' = frac(n + φ) ∈ [0,1)³，从**被测函数自己的返回值**反推出来：
+// j = u·amp、u = n' − 0.5 ⇒ n' = j/amp + 0.5。
+// 于是⑱⑲量的是线上那一份实现，而不是「在探针里再写一遍 frac(n + φ)」；
+// 而且读数与幅度无关，美术把幅度拖到 0.3 时判据的门不用跟着改。
+float3 VistaJitterProbeField(uint3 fid, uint latZStride, bool blueNoise,
+                             float3 phase, float2 rcpAmp)
+{
+    float3 j = VistaFroxelJitterOffsetIn(fid, phase, latZStride, blueNoise);
+    return float3(j.xy * rcpAmp.x, j.z * rcpAmp.y) + 0.5;
+}
+
+// 一列横向偏移的均值 Ā(p) ∈ [−0.5, 0.5)。只取 x 轴 —— ⑳判的是横向形态。
+// 源固定为蓝噪声：这一格要回答的就是「一张蓝噪声资产的收益被逐片独立抹掉了吗」，
+// 拿程序化源去问这个问题没有意义（它本来就是白的）。
+float VistaJitterProbeColumnMean(uint2 pixel, uint slices, uint latZStride,
+                                 float3 phase, float rcpAmpX)
+{
+    float acc = 0.0;
+    for (uint z = 0u; z < slices; z++)
+        acc += VistaFroxelJitterOffsetIn(uint3(pixel, z), phase, latZStride, true).x;
+    return acc * rcpAmpX / (float)slices;
+}
+
+// 一个源档的 11 个矩，写进 [base, base + 10]。
+// 组内顺序必须与 VISTA_PROBE_JIT_OFS_* 一致；写错的症状不静默，见槽位表那段注释。
+void VistaJitterProbeMoments(uint base, uint2 pixel, bool blueNoise,
+                             float3 phase, float2 rcpAmp)
+{
+    // 三个场都在 slice 0、latZStride = 0 上取：
+    // 那是**最难**的一档 —— 深度那一路的抽头此时退化成 x 抽头的一个固定像素偏移
+    // （id.z·17 = 0），三路解相关全靠抽头偏移本身。⑲要挡的正是抽头选重。
+    float3 n  = VistaJitterProbeField(uint3(pixel,                 0u), 0u, blueNoise, phase, rcpAmp);
+    float3 nX = VistaJitterProbeField(uint3(pixel + uint2(1u, 0u), 0u), 0u, blueNoise, phase, rcpAmp);
+    float3 nY = VistaJitterProbeField(uint3(pixel + uint2(0u, 1u), 0u), 0u, blueNoise, phase, rcpAmp);
+
+    VistaJitterProbeAdd(base + VISTA_PROBE_JIT_OFS_SUM,      n.x);
+    VistaJitterProbeAdd(base + VISTA_PROBE_JIT_OFS_SUM + 1u, n.y);
+    VistaJitterProbeAdd(base + VISTA_PROBE_JIT_OFS_SUM + 2u, n.z);
+    VistaJitterProbeAdd(base + VISTA_PROBE_JIT_OFS_SQ,       n.x * n.x);
+    VistaJitterProbeAdd(base + VISTA_PROBE_JIT_OFS_SQ  + 1u, n.y * n.y);
+    VistaJitterProbeAdd(base + VISTA_PROBE_JIT_OFS_SQ  + 2u, n.z * n.z);
+    VistaJitterProbeAdd(base + VISTA_PROBE_JIT_OFS_NB_X,     n.x * nX.x);
+    VistaJitterProbeAdd(base + VISTA_PROBE_JIT_OFS_NB_Y,     n.x * nY.x);
+    VistaJitterProbeAdd(base + VISTA_PROBE_JIT_OFS_XY,       n.x * n.y);
+    VistaJitterProbeAdd(base + VISTA_PROBE_JIT_OFS_XZ,       n.x * n.z);
+    VistaJitterProbeAdd(base + VISTA_PROBE_JIT_OFS_YZ,       n.y * n.z);
+}
+
+[numthreads(8, 8, 1)]
+void FroxelJitterProbe(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= VISTA_JITTER_PROBE_DIM))
+        return;
+
+    // 幅度为 0 时 n' 反推要除 0。CPU 侧的派发门本来就要求两个幅度都 > 0，
+    // 这里再挡一次是为了让那条保证**可判**而不是被假设：命中时三个计数槽全 0，
+    // 报表会点名「未覆盖」，而不是留下一堆 NaN 定点截断出来的 0。
+    if (any(_VistaFroxelJitter.xy <= 0.0))
+        return;
+
+    float3 phase  = _VistaFroxelJitterPhase.xyz;
+    float2 rcpAmp = 1.0 / _VistaFroxelJitter.xy;
+
+    // ---------------------------------------------------------------- ⑰ 源图
+    // 无条件读：即使线上档位是程序化，蓝噪声图也已经被 Editor 侧无条件绑上来了
+    // （见 RenderFroxelJitterProbe）—— 否则「线上选了程序化」会让⑰⑲的蓝噪声那半
+    // 变成空判据，而空判据在报表上和通过长得一样。
+    float v = VistaFroxelBlueNoiseAt(id.xy);
+    uint  bin = min((uint)(v * 8.0), 7u);
+    InterlockedAdd(_VistaFroxelShadowProbeRW[VISTA_PROBE_BN_HIST0 + bin], 1u);
+    VistaJitterProbeAdd(VISTA_PROBE_BN_SUM, v);
+    VistaJitterProbeAdd(VISTA_PROBE_BN_SQ,  v * v);
+    InterlockedAdd(_VistaFroxelShadowProbeRW[VISTA_PROBE_BN_COUNT], 1u);
+
+    // ⑰d：尺寸从**被测资源自己**问出来（判据⑥a 的同一条理由）。
+    // 未绑定时 D3D11 给出 0×0，于是「绑定没到达核」与「绑到了但内容是 0」
+    // 不再同形。每个线程写同一个值，InterlockedMax 只是省掉一次分支。
+    {
+        uint bnW, bnH;
+        _VistaFroxelBlueNoise.GetDimensions(bnW, bnH);
+        InterlockedMax(_VistaFroxelShadowProbeRW[VISTA_PROBE_BN_WIDTH],  bnW);
+        InterlockedMax(_VistaFroxelShadowProbeRW[VISTA_PROBE_BN_HEIGHT], bnH);
+    }
+
+    // ---------------------------------------------------------------- ⑱⑲ 两档并排
+    VistaJitterProbeMoments(VISTA_PROBE_JIT_PROC_BASE, id.xy, false, phase, rcpAmp);
+    VistaJitterProbeMoments(VISTA_PROBE_JIT_BLUE_BASE, id.xy, true,  phase, rcpAmp);
+    InterlockedAdd(_VistaFroxelShadowProbeRW[VISTA_PROBE_JIT_COUNT], 1u);
+
+    // ---------------------------------------------------------------- 档位接线（双向）
+    //  在 **slice 1** 上做，不是 slice 0：latZStride·0 = 0 让两个 z 步进档
+    //  逐位相同 ⇒ D_COL ≡ D_SLC ≡ 0 ⇒「恰好有一个为 0」会以**两个都为 0**
+    //  的方式假通过 —— 一个自己造不出失败的判据。
+    //
+    //  两对各只放开一个自由度：z 步进那一对的源取自 cbuffer、源那一对的 z 步进
+    //  取自 cbuffer。于是「恰好有一个为 0」在两个维度上分别可判，
+    //  而不是被另一个维度的差别掩盖。
+    {
+        uint3  kid      = uint3(id.xy, 1u);
+        float3 online   = VistaFroxelJitterOffset(kid);
+        uint   strideCB = VistaFroxelJitterZStride();
+        bool   blueCB   = VistaFroxelJitterUseBlueNoise();
+
+        float3 dCol  = abs(online - VistaFroxelJitterOffsetIn(kid, phase, 0u, blueCB));
+        float3 dSlc  = abs(online - VistaFroxelJitterOffsetIn(kid, phase, 1u, blueCB));
+        float3 dProc = abs(online - VistaFroxelJitterOffsetIn(kid, phase, strideCB, false));
+        float3 dBlue = abs(online - VistaFroxelJitterOffsetIn(kid, phase, strideCB, true));
+
+        VistaJitterProbeMax(VISTA_PROBE_JIT_D_COL,  max(max(dCol.x,  dCol.y),  dCol.z));
+        VistaJitterProbeMax(VISTA_PROBE_JIT_D_SLC,  max(max(dSlc.x,  dSlc.y),  dSlc.z));
+        VistaJitterProbeMax(VISTA_PROBE_JIT_D_PROC, max(max(dProc.x, dProc.y), dProc.z));
+        VistaJitterProbeMax(VISTA_PROBE_JIT_D_BLUE, max(max(dBlue.x, dBlue.y), dBlue.z));
+    }
+
+    // ---------------------------------------------------------------- ⑳ 聚合两档
+    uint slices = (uint)(VISTA_FROXEL_SLICES + 0.5);
+    if (slices != VISTA_JITTER_AGG_SLICES)
+        return;   // 计数槽留 0，报表点名未覆盖 + 原因
+
+    float aCol  = VistaJitterProbeColumnMean(id.xy,                 slices, 0u, phase, rcpAmp.x);
+    float aColX = VistaJitterProbeColumnMean(id.xy + uint2(1u, 0u), slices, 0u, phase, rcpAmp.x);
+    float aColD = VistaJitterProbeColumnMean(id.xy + uint2(1u, 1u), slices, 0u, phase, rcpAmp.x);
+    float aSlc  = VistaJitterProbeColumnMean(id.xy,                 slices, 1u, phase, rcpAmp.x);
+    float aSlcX = VistaJitterProbeColumnMean(id.xy + uint2(1u, 0u), slices, 1u, phase, rcpAmp.x);
+    float aSlcD = VistaJitterProbeColumnMean(id.xy + uint2(1u, 1u), slices, 1u, phase, rcpAmp.x);
+
+    // 存 Ā + 0.5 而不是 Ā：定点槽是 uint，负数会被 clamp 成 0
+    // ——「一个把负数压成 0 的格式化函数会让三种状态在报表上长得一样」。
+    // 编码与 n' 相同（都是 [0,1)），于是⑳的 COL 档矩可以直接与⑲的蓝噪声 x 通道
+    // 矩对账：逐列一致档下 Ā ≡ u.x(p,0)，两组独立累加的读数必须相等。
+    VistaJitterProbeAdd(VISTA_PROBE_AGG_COL_SUM, aCol + 0.5);
+    VistaJitterProbeAdd(VISTA_PROBE_AGG_COL_SQ,  (aCol + 0.5) * (aCol + 0.5));
+    VistaJitterProbeMax(VISTA_PROBE_AGG_COL_DAXIS, abs(aColX - aCol));
+    VistaJitterProbeMax(VISTA_PROBE_AGG_COL_DDIAG, abs(aColD - aCol));
+
+    VistaJitterProbeAdd(VISTA_PROBE_AGG_SLC_SUM, aSlc + 0.5);
+    VistaJitterProbeAdd(VISTA_PROBE_AGG_SLC_SQ,  (aSlc + 0.5) * (aSlc + 0.5));
+    VistaJitterProbeMax(VISTA_PROBE_AGG_SLC_DAXIS, abs(aSlcX - aSlc));
+    VistaJitterProbeMax(VISTA_PROBE_AGG_SLC_DDIAG, abs(aSlcD - aSlc));
+
+    InterlockedAdd(_VistaFroxelShadowProbeRW[VISTA_PROBE_AGG_COUNT], 1u);
 }

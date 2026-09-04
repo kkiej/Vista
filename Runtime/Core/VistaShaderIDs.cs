@@ -103,8 +103,23 @@ namespace Vista
         public static readonly int _VistaFroxelPrevCameraWS       = Shader.PropertyToID("_VistaFroxelPrevCameraWS");
         // xyz: R3 塑性常数 Kronecker 序列的本帧相位 frac(frameIndex · α) ∈ [0,1)³。
         public static readonly int _VistaFroxelJitterPhase        = Shader.PropertyToID("_VistaFroxelJitterPhase");
-        // x: 横向抖动幅度（单位 = 一格宽），y: 深度抖动幅度（单位 = 一片厚）。
+        // x: 横向抖动幅度（单位 = 一格宽），y: 深度抖动幅度（单位 = 一片厚），
+        // z: 抖动源（0 = 程序化 hash，1 = 蓝噪声瓦片），w: 横向偏移的 z 步进倍数
+        //    （0 = 逐列一致，1 = 逐片独立）。
+        // z/w 都是**运行时**档位而不是宏：宏会让「换了档位画面一模一样」变成
+        // 「变体没编」与「参数没生效」两件无法区分的事。
+        // 而 w 做成「倍数」而不是布尔，是因为它两个源都适用、且一个分支都不需要。
         public static readonly int _VistaFroxelJitter             = Shader.PropertyToID("_VistaFroxelJitter");
+        // 蓝噪声瓦片（URP 自带的 64×64 void-and-cluster，LDR_LLL1_0）。
+        //
+        // 为什么走 Shader.SetGlobalTexture 一次性绑定、而不是进 IVistaLutDispatcher：
+        // core 的 ComputeCommandBuffer 只有收 TextureHandle 的重载（SetComputeTextureParam
+        // 与 SetGlobalTexture 都是），把一张引擎自带的 Texture2D 喂进图就得每帧
+        // ImportTexture + UseTexture。而这张纹理**没有生产者、永远不被写**，
+        // 所以那条「只靠全局绑定被消费的资源在图里没有边 —— 顺序论证救得了执行次序、
+        // 救不了 UAV→SRV 的资源状态转换」的坑在这里不适用：没有状态转换要同步。
+        // 一个常量的「什么时候绑」也不可能绑错。
+        public static readonly int _VistaFroxelBlueNoise          = Shader.PropertyToID("_VistaFroxelBlueNoise");
         // x: 亮度死区下端，y: 1/(上端 − 下端)。宽度由 C# 保证 > 0（见 ResolveLuminanceReject）。
         public static readonly int _VistaFroxelReprojParams       = Shader.PropertyToID("_VistaFroxelReprojParams");
         // 自检专用：喂给探针核的合成上一帧相机位移 (xyz, 角色标志)。
