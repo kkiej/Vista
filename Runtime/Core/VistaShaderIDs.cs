@@ -122,6 +122,22 @@ namespace Vista
         // 16 位半在 fp32 里是精确可表示的整数，HLSL 侧 (uint)x | ((uint)y << 16) 复原。
         public static readonly int _VistaFroxelLocalLightMask     = Shader.PropertyToID("_VistaFroxelLocalLightMask");
 
+        // ---- Volumetrics: 局部雾体（#24，VistaFogVolumeSet 下发）----
+        // 布局与 FogVolumes.hlsl 的 VistaFogVolCB 一一对应（16 × 9 个 float4 + count）。
+        // 零态 = count 0 ⇒ shader 循环一次都不进，九个数组无论残留什么都不会被读；
+        // 所以 Bind 在 count 为 0 时**仍写 count**、跳过数组 —— 不写的话
+        // 上一个相机留下的 count 会让这台相机凭空长出别人的雾体。
+        public static readonly int _VistaFogVolCount              = Shader.PropertyToID("_VistaFogVolCount");
+        public static readonly int _VistaFogVolRow0               = Shader.PropertyToID("_VistaFogVolRow0");
+        public static readonly int _VistaFogVolRow1               = Shader.PropertyToID("_VistaFogVolRow1");
+        public static readonly int _VistaFogVolRow2               = Shader.PropertyToID("_VistaFogVolRow2");
+        public static readonly int _VistaFogVolBlend              = Shader.PropertyToID("_VistaFogVolBlend");
+        public static readonly int _VistaFogVolMedium             = Shader.PropertyToID("_VistaFogVolMedium");
+        public static readonly int _VistaFogVolNoise              = Shader.PropertyToID("_VistaFogVolNoise");
+        public static readonly int _VistaFogVolParams             = Shader.PropertyToID("_VistaFogVolParams");
+        public static readonly int _VistaFogVolProbeC             = Shader.PropertyToID("_VistaFogVolProbeC");
+        public static readonly int _VistaFogVolProbeO             = Shader.PropertyToID("_VistaFogVolProbeO");
+
         // ---- Volumetrics: 时间重投影与抖动（#22，VistaFroxelReprojection 下发）----
         // 整组的零态 = 失能：历史权重 0（纯本帧）、抖动幅度 0（恒在格心）、
         // 上一帧范围全零（logRatio = 0 ⇒ 解码距离恒 0，不是 NaN）。

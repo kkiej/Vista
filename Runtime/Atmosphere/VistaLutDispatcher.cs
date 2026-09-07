@@ -183,6 +183,16 @@ namespace Vista
         void SetGlobalVector(int nameID, Vector4 value);
 
         /// <summary>
+        /// 固定长度的 float4 数组（#24 局部雾体的 cbuffer 数组）。
+        /// 两条实现都在**调用时**把数组内容拷进命令流，所以调用方复用同一组
+        /// 托管数组是安全的 —— 前提是复用发生在上一条命令流执行之后
+        /// （VistaFogVolumeSet 的环形池就是为这条前提准备的）。
+        /// 注意 Unity 全局数组的长度按**首次调用**锁定：所有调用方必须恒传满长
+        /// （16），短传会让后续帧的下发静默截断。
+        /// </summary>
+        void SetGlobalVectorArray(int nameID, Vector4[] values);
+
+        /// <summary>
         /// 唯一的消费者是 #22 的时间重投影（上一帧的 viewProj）。
         ///
         /// 为什么是矩阵而不是拆成四个 Vector4 自己在 shader 里凑：把一个 4×4 拆成
@@ -219,6 +229,9 @@ namespace Vista
 
         public void SetGlobalVector(int nameID, Vector4 value)
             => m_Cmd.SetGlobalVector(nameID, value);
+
+        public void SetGlobalVectorArray(int nameID, Vector4[] values)
+            => m_Cmd.SetGlobalVectorArray(nameID, values);
 
         public void SetGlobalMatrix(int nameID, Matrix4x4 value)
             => m_Cmd.SetGlobalMatrix(nameID, value);
@@ -326,6 +339,9 @@ namespace Vista
 
         public void SetGlobalVector(int nameID, Vector4 value)
             => m_Cmd.SetGlobalVector(nameID, value);
+
+        public void SetGlobalVectorArray(int nameID, Vector4[] values)
+            => m_Cmd.SetGlobalVectorArray(nameID, values);
 
         public void SetGlobalMatrix(int nameID, Matrix4x4 value)
             => m_Cmd.SetGlobalMatrix(nameID, value);

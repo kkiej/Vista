@@ -1,4 +1,4 @@
-using UnityEngine;
+﻿using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.RenderGraphModule;
 using UnityEngine.Rendering.Universal;
@@ -100,6 +100,14 @@ namespace Vista
             /// 所以这个字段永远有合法值 —— 与 <see cref="froxelReproj"/> 同一条约定。
             /// </summary>
             public VistaFroxelLocalLightParams froxelLocalLights;
+
+            // ---- 局部雾体（#24）----
+            /// <summary>
+            /// 本帧本相机收集到的局部雾体集合。零态（<c>VistaFogVolumeSet.disabled</c>）
+            /// = 没有体。它持有的打包数组来自 VistaFogVolumeSet 的环形池 ——
+            /// 录制到执行之间不会被别的相机的 Gather 覆盖（那正是环形池存在的理由）。
+            /// </summary>
+            public VistaFogVolumeSet fogVolumes;
         }
 
         /// <summary>
@@ -631,6 +639,11 @@ namespace Vista
                     cameraData.camera, m_VolumetricFog,
                     urpLightData.supportsLightLayers, addShadowsBound);
 
+                // 局部雾体（#24）：收集 + 视锥剔除 + 打包。剔除用设置里的原始远边界
+                //（不是被阴影距离夹过的 desc 值）—— 保守超集，理由见 Gather 的参数说明。
+                var fogVolumes = VistaFogVolumeSet.Gather(
+                    cameraData.camera, m_VolumetricFog.farDistanceMeters);
+
                 using (var builder = renderGraph.AddComputePass<LutPassData>(
                            "Vista Froxel Injection", out var data))
                 {
@@ -648,6 +661,7 @@ namespace Vista
                     data.froxelReproj = froxelReproj;
                     data.froxelBlueNoise = froxelBlueNoise;
                     data.froxelLocalLights = froxelLocalLights;
+                    data.fogVolumes = fogVolumes;
 
                     builder.UseTexture(transmittance, AccessFlags.Read);
                     builder.UseTexture(multiScattering, AccessFlags.Read);
@@ -698,7 +712,7 @@ namespace Vista
                             new VistaGraphLutDispatcher(ctx.cmd, Handles(d)),
                             d.view, d.fogSettings, d.froxelDesc,
                             d.froxelCameraWS, d.froxelShadowmapBound, d.froxelReproj,
-                            d.froxelLocalLights));
+                            d.froxelLocalLights, d.fogVolumes));
                 }
 
                 // 深度积分（#21）。**必须是独立的一趟 pass**：它把注入表当 SRV 读，
@@ -886,7 +900,9 @@ namespace Vista
                                 d.froxelReproj));
                     }
 
-                    // 局部灯的探针（#23，判据(a)~(e)）。**第四趟独立 pass**，写 82~105 号槽位。
+                    // 局部灯的探针（#23，判据(a)~(e)）。**第四趟独立 pass**，写 82~105 号槽位；
+                    // #24 的局部雾体尺子也搭在这个核上（106~110 号）——
+                    // 它是唯一一个既求介质又有 all(id==0) 头部段的探针核。
                     //
                     // 为什么必须独立成一趟、而不能挂在抖动探针后面：这个核要读
                     // URP 的 Forward+ cluster cbuffer（urp_ZBins / urp_Tiles）与
@@ -918,6 +934,8 @@ namespace Vista
                         // 线上注入核吃进去的**同一份**。判据里「探针测的档位与线上跑的
                         // 档位是同一个」靠的就是这一行 —— 不是靠派发顺序。
                         data.froxelLocalLights = froxelLocalLights;
+                        // #24 的体集合同理。
+                        data.fogVolumes = fogVolumes;
 
                         builder.UseTexture(transmittance, AccessFlags.Read);
                         builder.UseTexture(multiScattering, AccessFlags.Read);
@@ -937,7 +955,7 @@ namespace Vista
                         builder.SetRenderFunc((LutPassData d, ComputeGraphContext ctx) =>
                             d.luts.RenderFroxelLocalLightProbe(
                                 new VistaGraphLutDispatcher(ctx.cmd, Handles(d)),
-                                d.view, d.fogSettings, d.froxelLocalLights));
+                                d.view, d.fogSettings, d.froxelLocalLights, d.fogVolumes));
                     }
                 }
 #endif

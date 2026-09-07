@@ -1,4 +1,4 @@
-using System.Text;
+﻿using System.Text;
 using UnityEditor;
 using UnityEngine;
 using UnityEngine.Rendering;
@@ -149,7 +149,15 @@ namespace Vista.EditorTools
         const int k_SlotLlRadianceMax  = 103;
         const int k_SlotLlShadowedN    = 104;
         const int k_SlotLlLayerSkipN   = 105;
-        const int k_SlotTotal         = 106;
+
+        // ---- #24 局部雾体（106~110）----
+        const int k_SlotVolCount       = 106;
+        const int k_SlotVolCenterWMin  = 107;   // InterlockedMin，初值 uint.MaxValue（已在 k_ShadowProbeMinSlots 登记）
+        const int k_SlotVolCenterMiss  = 108;
+        const int k_SlotVolOutsideLeak = 109;
+        const int k_SlotVolSigmaMax    = 110;
+
+        const int k_SlotTotal         = 111;
 
         const uint k_FlagCascade   = 1u;
         const uint k_FlagShadowmap = 2u;
@@ -345,6 +353,11 @@ namespace Vista.EditorTools
         const float k_LlRadianceScale = 1.0e6f;
         const float k_LlAbRelScale    = 1.0e9f;
 
+        // #24：中心权重 ×1e6（构造性精确 1 ⇒ 期望读数精确 1000000）；σ ×1e3
+        //（1/km 量级留三位小数；定点上限 4e9/1e3 = 4e6 /km，够任何雾）。
+        const float k_VolWScale       = 1.0e6f;
+        const float k_VolSigmaScale   = 1.0e3f;
+
         /// <summary>
         /// 探针点数的期望。与阴影探针同一张网格（32×32×16），
         /// 所以直接复用 <see cref="k_ProbeCountExpected"/> —— 这里不再写第二个 16384。
@@ -393,7 +406,7 @@ namespace Vista.EditorTools
         static void Run(StringBuilder sb)
         {
             sb.AppendLine("=== Vista 体积雾状态（#20 注入 + #21 积分 + #22a 时间重投影 + #22b 抖动源 "
-                        + "+ #23 局部灯 覆盖性判据）===");
+                        + "+ #23 局部灯 + #24 局部雾体 覆盖性判据）===");
 
             var cam = FindGameCamera();
             if (cam == null)
@@ -418,6 +431,11 @@ namespace Vista.EditorTools
             }
 
             var settings = feature.volumetricFog;
+
+            // 局部雾体（#24）：与线上同一份 Gather（同一个实现、同一台相机、同一个远边界）。
+            // ⓘ 口径差一帧：探针读数来自上一渲染帧，这里的 Gather 是现在 ——
+            // 体在两者之间被挪动/增删时判据(a) 会红一帧，静止布景下两者相同。
+            var fogVolumes = VistaFogVolumeSet.Gather(cam, settings != null ? settings.farDistanceMeters : 0f);
             if (settings == null)
             {
                 sb.AppendLine("✘ feature.volumetricFog 为 null。");
@@ -756,19 +774,32 @@ namespace Vista.EditorTools
                         + "所以它的作用域必须写出来 —— 下面那条上界是它的归因输入。");
 
             var fog = feature.fog;
-            if (fog != null && fog.enabled && volume.allocatedDesc.HasValue)
+            // #24：局部雾体也算介质。全局雾关着但体在场时，⑪c/⑪d 仍然可判 ——
+            // 「雾关着 = 空判据」这条老结论在 #24 之后只对「体也没有」成立。
+            float volSigmaSum = fogVolumes.sigmaSumPerKm;
+            bool globalFogOn = fog != null && fog.enabled;
+            if ((globalFogOn || volSigmaSum > 0f) && volume.allocatedDesc.HasValue)
             {
                 // 均匀介质上界：σ_t 是**地面**处的值（高度雾只会更淡），所以
                 // 1 − exp(−σ_t·d) 是 alpha 的一个真上界。σ_t 直接取 fog.extinctionPerKm，
                 // 不在这里重算 —— 「同一个量的第二份实现连 8 行的辅助函数也算」。
-                float sigmaT = fog.extinctionPerKm;
+                // 体的那一份取 Σσ（重叠相加语义下的安全上界）—— 有体时这道门变松，
+                // 松多少印在下一行，不让它悄悄变松。
+                float sigmaT = (globalFogOn ? fog.extinctionPerKm : 0f) + volSigmaSum;
                 float dKm = volume.allocatedDesc.Value.handoffMeters * 1.0e-3f;
                 float alphaBound = 1f - Mathf.Exp(-sigmaT * dKm);
                 bool boundOk = !probeRan || alphaMax <= alphaBound * 1.02f;
-                sb.AppendLine($"{Mark(boundOk)}判据⑪d 均匀介质上界：σ_t(地面) = {Sci(sigmaT)} /km，"
+                string sigmaDetail = volSigmaSum > 0f
+                    ? $"σ_t(地面) {Sci(globalFogOn ? fog.extinctionPerKm : 0f)} + 体 Σσ {Sci(volSigmaSum)} = {Sci(sigmaT)} /km"
+                    : $"σ_t(地面) = {Sci(sigmaT)} /km";
+                sb.AppendLine($"{Mark(boundOk)}判据⑪d 均匀介质上界：{sigmaDetail}，"
                             + $"d = {Sci(dKm)} km ⇒ 1 − exp(−σ_t·d) = {Sci(alphaBound)}，"
                             + $"实测 {Sci(alphaMax)}（比值 {Sci(alphaMax / Mathf.Max(alphaBound, 1e-30f))}，"
                             + "留 2% 定点/插值余量）");
+                if (volSigmaSum > 0f)
+                    sb.AppendLine("  ⓘ 体的 Σσ 让这道门按「所有体叠在 max 射线上」放宽 —— "
+                                + "上界仍然成立（体相加语义），但比值的「≈ 1 说明贴地」那条读法"
+                                + "在有体时不再适用。");
                 sb.AppendLine($"  ⓘ 比值 {Sci(alphaMax / Mathf.Max(alphaBound, 1e-30f))} 的读法："
                             + "> 1 是结构性错误（那就是上面这道门）；≈ 1 说明取到 max 的那条射线"
                             + "几乎全程贴着地面密度走 —— 探针网格里有朝下看的方向，所以这是正常的；"
@@ -779,8 +810,9 @@ namespace Vista.EditorTools
             else
             {
                 // 空判据的格子要在报表上点名。
-                sb.AppendLine("ⓘ 判据⑪d 未覆盖：雾是关着的（Fog ▸ Mode = Off 或 σ_t = 0），"
-                            + "没有可比的上界。此时判据⑪c 也失去了失败能力 —— 上面已经说明。");
+                sb.AppendLine("ⓘ 判据⑪d 未覆盖：全局雾关着（Fog ▸ Mode = Off 或 σ_t = 0）"
+                            + "**且**场景里没有局部雾体（#24），没有可比的上界。"
+                            + "此时判据⑪c 也失去了失败能力 —— 上面已经说明。");
             }
 
             sb.AppendLine($"  ⓘ 积分 rgb 的最大亮度分量 = {Sci(lumMax)}"
@@ -838,7 +870,7 @@ namespace Vista.EditorTools
             //
             // 最长段不假设是最后一段，直接扫一遍：切片 0 是 [0, d_0]，它不服从后面那个
             // 等比规律，「假设最后一段最长」是一条不需要的推导。
-            if (probeRan && fog != null && fog.enabled && volume.allocatedDesc.HasValue)
+            if (probeRan && (globalFogOn || volSigmaSum > 0f) && volume.allocatedDesc.HasValue)
             {
                 var d = volume.allocatedDesc.Value;
                 float longestMeters = 0f;
@@ -849,10 +881,15 @@ namespace Vista.EditorTools
                     if (len > longestMeters) { longestMeters = len; longestSlice = i; }
                 }
 
-                float xBound = fog.extinctionPerKm * longestMeters * 1.0e-3f;
+                // #24：体的 Σσ 同样进上界（与⑪d 同一条理由与同一句「变松点名」）。
+                float xSigma = (globalFogOn ? fog.extinctionPerKm : 0f) + volSigmaSum;
+                float xBound = xSigma * longestMeters * 1.0e-3f;
                 float xRatio = segXMax / Mathf.Max(xBound, 1e-30f);
                 bool xBoundOk = segXMax <= xBound;
-                sb.AppendLine($"{Mark(xBoundOk)}判据⑫b 段光学厚度紧上界：σ_t(地面) {Sci(fog.extinctionPerKm)} /km"
+                string xSigmaDetail = volSigmaSum > 0f
+                    ? $"(σ_t(地面) {Sci(globalFogOn ? fog.extinctionPerKm : 0f)} + 体 Σσ {Sci(volSigmaSum)})"
+                    : $"σ_t(地面) {Sci(xSigma)}";
+                sb.AppendLine($"{Mark(xBoundOk)}判据⑫b 段光学厚度紧上界：{xSigmaDetail} /km"
                             + $" × 最长段 {longestMeters:F3} m（切片 {longestSlice}）= {Sci(xBound)}，"
                             + $"实测 x_max = {Sci(segXMax)}（比值 {Sci(xRatio)}，必须 ≤ 1）");
                 sb.AppendLine($"  ⓘ 裕度 {Sci(1f - xRatio)}。比值还是一条归因，但只是**上界**："
@@ -864,7 +901,7 @@ namespace Vista.EditorTools
             }
             else if (probeRan)
             {
-                sb.AppendLine("ⓘ 判据⑫b 未覆盖：雾关着，σ_t(地面) = 0 会让紧上界退化成 0，"
+                sb.AppendLine("ⓘ 判据⑫b 未覆盖：全局雾关着且没有局部雾体，σ = 0 会让紧上界退化成 0，"
                             + "而空气的 σ_t 不由 VistaFogSettings 给 —— 那条上界要另外推。");
             }
 
@@ -1816,6 +1853,98 @@ namespace Vista.EditorTools
                             }
                         }
                     }
+                }
+            }
+
+            // ================================================================ #24 局部雾体
+            {
+                uint volCountGpu = raw[k_SlotVolCount];
+                int  volCountCpu = fogVolumes.count;
+                bool volProbeRan = feature.froxelLocalLightProbeDispatches > 0
+                                && (raw[k_SlotLlFlags] & k_LlFlagRan) != 0u;
+
+                sb.AppendLine("---- #24 局部雾体（内联枚举 · 盒/椭球 · 程序化 value noise）----");
+                sb.AppendLine($"状态：CPU 本次收集 {volCountCpu} 个可见体"
+                            + $"（超上限丢弃 {fogVolumes.dropped}），"
+                            + $"Σσ = {Sci(fogVolumes.sigmaSumPerKm)} /km，"
+                            + $"单体 σ 上界 {Sci(fogVolumes.sigmaMaxPerKm)} /km");
+                if (fogVolumes.dropped > 0)
+                    sb.AppendLine($"  ⚠ 有 {fogVolumes.dropped} 个可见体因超出 16 上限被丢弃"
+                                + "（按距离留最近的）——「无声截断读起来像全覆盖」，所以这里点名。"
+                                + "被丢的体**完全**不参与介质，不是变淡。");
+                sb.AppendLine("  ⓘ 口径差一帧：GPU 槽位来自上一渲染帧的探针，CPU 计数是此刻的 Gather。"
+                            + "静止布景下两者相同；刚挪过体的那一帧判据(a) 允许红一次，重跑即绿。");
+
+                if (!volProbeRan)
+                {
+                    sb.AppendLine("ⓘ 判据(a)~(e) **未覆盖**：宿主探针（FroxelLocalLightProbe，"
+                                + "#24 的尺子搭在它的 all(id==0) 头部段上）本帧没有跑。"
+                                + "这条寄生依赖在此点名 —— 体判据的覆盖以那一趟探针为前提，"
+                                + "它没跑时上面 #23 的判据(a) 已经红了，先修那个。");
+                }
+                else if (volCountCpu == 0 && volCountGpu == 0u)
+                {
+                    sb.AppendLine("ⓘ 判据(a)~(e) **未覆盖**：场景里没有可见的 VistaFogVolume。"
+                                + "空判据不是通过 —— 要跑：给场景加一个 Vista/Vista Fog Volume 组件，"
+                                + "摆进相机前方的 froxel 范围内（远边界见下面分配口径行），"
+                                + "L 按 10~150 m 填。");
+                }
+                else
+                {
+                    // (a) 数量守恒：CPU 上传的与 GPU 读到的必须一致。抓的是
+                    // 「count 下发丢了 / 数组下发了 count 没发 / 环形池串台」。
+                    bool volCountOk = volCountGpu == (uint)volCountCpu;
+                    sb.AppendLine($"{Mark(volCountOk)}判据(a) 数量守恒：GPU 读到 {volCountGpu} 个，"
+                                + $"CPU 上传 {volCountCpu} 个（必须相等；差一帧口径见上）");
+
+                    // (b) 中心权重：构造性精确 1（blendLocal 夹到 ≤ 1 ⇒ 中心
+                    // (1−0)·rcpBlend ≥ 1 ⇒ saturate 精确 1 ⇒ 定点精确 1e6）。
+                    // 不等式门在这里只会遮住「矩阵行序写反」这类把中心算到别处的错。
+                    uint wMin = raw[k_SlotVolCenterWMin];
+                    if (wMin == uint.MaxValue)
+                    {
+                        sb.AppendLine("✘ 判据(b) 中心权重：槽位还是初值 0xFFFFFFFF ⇒ "
+                                    + "逐体尺子循环一次都没执行（count 在核里读到 0？）——"
+                                    + "与判据(a) 的红同因，两格一起看。");
+                    }
+                    else
+                    {
+                        bool wOk = wMin == (uint)k_VolWScale;
+                        sb.AppendLine($"{Mark(wOk)}判据(b) 中心权重（构造性精确恒等）："
+                                    + $"min = {wMin} / 期望 {(uint)k_VolWScale}（×1e6 定点，"
+                                    + "全部体的中心权重都必须精确为 1）");
+                    }
+
+                    // (c) 中心 σ 区间：σ·(1−amt) ≤ 读数 ≤ σ。盖住整条
+                    // 变换→衰减→噪声→σ 链（噪声的值域错了这一格会红）。
+                    uint centerMiss = raw[k_SlotVolCenterMiss];
+                    sb.AppendLine($"{Mark(centerMiss == 0u)}判据(c) 中心密度区间："
+                                + $"落在 [σ(1−amt), σ] 之外的体 = {centerMiss}（必须 0）");
+
+                    // (d) 体外零泄漏：**单体**求值（重叠时「体外」只对自己成立），
+                    // 且权重 0 时不采噪声 ⇒ 恒零是构造性质不是数值巧合。
+                    uint leak = raw[k_SlotVolOutsideLeak];
+                    sb.AppendLine($"{Mark(leak == 0u)}判据(d) 体外零泄漏："
+                                + $"体外尺子点上单体 σ > 0 的体 = {leak}（必须 0；"
+                                + "尺子点 = 表面沿局部 +x 再向外 blend + 1 m）");
+
+                    // (e) 网格 σ 上界：w ≤ 1、n ≤ 1 ⇒ 任一点的体贡献 ≤ Σσ（定义性）。
+                    // 抓的是「σ 的单位制/打包槽位错了」——错 1000 倍会直接爆表。
+                    float sigmaMaxGpu = raw[k_SlotVolSigmaMax] / k_VolSigmaScale;
+                    float sigmaCap    = fogVolumes.sigmaSumPerKm;
+                    bool sigmaOk = sigmaMaxGpu <= sigmaCap * 1.0001f + 1f / k_VolSigmaScale;
+                    sb.AppendLine($"{Mark(sigmaOk)}判据(e) 网格 σ 上界：探针点上体贡献的"
+                                + $" max σ = {Sci(sigmaMaxGpu)} /km ≤ CPU Σσ {Sci(sigmaCap)} /km"
+                                + "（定义性 ≤，留一位定点刻度）");
+                    sb.AppendLine("  ⓘ max σ 读数同时是⑪d/⑫b 那两道被放宽的门的归因输入 —— "
+                                + "实测的体贡献离 Σσ 有多远，上面两道门就松了多少。");
+                    sb.AppendLine("  ⓘ 已推迟（写下理由，不是忘了）：①3D 遮罩纹理"
+                                + "（HDRP 那档 —— 要图集管理且违背零二进制资产，要配运行时生成器）；"
+                                + "②逐体相位 g（HDRP/UE5 都不做，业内答案是全局）；"
+                                + "③移动端数量/噪声档（归质量分级那个任务，上限 16 是编译期数组、"
+                                + "运行时砍的是上传数）。噪声无偏性（E[1−amt·v] = 1−amt/2）"
+                                + "没有单独的格：中心区间判据盖住值域，逐点均值要读回整张注入表，"
+                                + "归 #27 的收敛性一并。");
                 }
             }
 

@@ -36,7 +36,7 @@ namespace Vista
         /// <summary>
         /// 阴影覆盖性探针的槽位数（#20 起 19，#22a 追加重投影的 14 格到 33，
         /// #22b 追加抖动源统计的 47 格到 80【实为 82：另含 BN 尺寸两格】，
-        /// #23 追加局部灯的 24 格到 106）。必须与
+        /// #23 追加局部灯的 24 格到 106，#24 追加局部雾体的 5 格到 111）。必须与
         /// <c>VolumetricFog.compute</c> 里 <c>VISTA_PROBE_*</c> 那组下标的最大值 + 1 一致 ——
         /// 少一个的症状是最后一个槽位的 Interlocked 写越界，而 D3D11 上越界 UAV 写是**静默丢弃**，
         /// 判据会读到一个恒为初值的格子并把它当成「这一路没执行」。
@@ -45,7 +45,7 @@ namespace Vista
         /// 必须与这里逐位相等），所以三个数（这里、shader 的下标上限、Editor 的镜像）
         /// 里任意一个漏改都会在报表第一格红掉，而不是变成静默丢弃的写。
         /// </summary>
-        public const int k_ShadowProbeSlots = 106;
+        public const int k_ShadowProbeSlots = 111;
 
         // 探针里三个走 InterlockedMin 的槽位
         // （SHADOW_MIN = 0, SHADOWMAP_MIN = 8, SEG_X_MIN = 17）。
@@ -73,7 +73,11 @@ namespace Vista
         // 漏登记会印出一个明显不成立的 ⓘ 而不是伪造结论。它仍然登记，是因为这一格是
         // 判据(c)「钳位真的生效了」的**归因**行 —— 一个静默读 0 的 ⓘ 等于没有归因，
         // 而判据(c) 的门（LL_CAM_NEAR > 0）单独看不出「钳到哪儿了」。
-        static readonly int[] k_ShadowProbeMinSlots = { 0, 8, 17, 89, 96 };
+        // #24 追加：VOL_CENTER_W_MIN = 107（体中心权重的下界，判据(b) 要它精确
+        // == 1e6）。与 89 号同款理由必须登记：漏登记 ⇒ 初值 0 ⇒ 判据(b) 每帧红，
+        // 红的理由是尺子自己坏了。体数为 0 时它保持 0xFFFFFFFF —— 报表按
+        // 「未覆盖」处理，不把初值当读数印。
+        static readonly int[] k_ShadowProbeMinSlots = { 0, 8, 17, 89, 96, 107 };
 
         readonly ComputeShader m_Cs;
         readonly int m_KernelPlaceholderIdx = -1;
@@ -414,7 +418,8 @@ namespace Vista
         /// </summary>
         public void DispatchInjection<T>(in T dispatcher, in VistaFroxelVolumeDesc desc,
                                         Vector3 cameraWS, bool shadowmapBound,
-                                        in VistaFroxelLocalLightParams localLights)
+                                        in VistaFroxelLocalLightParams localLights,
+                                        in VistaFogVolumeSet fogVolumes)
             where T : IVistaLutDispatcher
         {
             if (!isValid || !isAllocated) return;
@@ -423,6 +428,9 @@ namespace Vista
                 new Vector4(cameraWS.x, cameraWS.y, cameraWS.z, shadowmapBound ? 1f : 0f));
 
             localLights.Bind(dispatcher);
+            // 局部雾体（#24）。与 localLights 同理放在唯一的消费者旁边；
+            // 零态（count 0）也要显式下发，理由见 VistaFogVolumeSet.Bind。
+            fogVolumes.Bind(dispatcher);
 
             // 两张静态大气表与 SH buffer **逐核显式绑**，不吃 Sky-View pass 用
             // SetGlobalTextureAfterPass 发布的那份全局。理由与
@@ -730,12 +738,16 @@ namespace Vista
         /// 派发口径与另两个探针核同一份：32×32×16 / numthreads(8,8,1)。
         /// </summary>
         public void DispatchLocalLightProbe<T>(in T dispatcher,
-                                               in VistaFroxelLocalLightParams localLights)
+                                               in VistaFroxelLocalLightParams localLights,
+                                               in VistaFogVolumeSet fogVolumes)
             where T : IVistaLutDispatcher
         {
             if (!isValid || m_ShadowProbe == null) return;
 
             localLights.Bind(dispatcher);
+            // #24 的体集合。探针核里的逐体尺子（判据 (a)~(e)）读的必须与线上
+            // 注入核同一份 —— 「探针测的体集合与线上跑的不是同一份」的防线在这里。
+            fogVolumes.Bind(dispatcher);
 
             dispatcher.SetTexture(m_Cs, m_KernelLocalLightProbeIdx,
                 VistaShaderIDs._VistaTransmittanceLut, VistaLutSlot.Transmittance);

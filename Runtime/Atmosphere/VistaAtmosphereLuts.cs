@@ -1092,7 +1092,8 @@ namespace Vista
             T d, in VistaAtmosphereViewData view, VistaFogSettings fog,
             in VistaFroxelVolumeDesc desc, Vector3 cameraWS, bool shadowmapBound,
             in VistaFroxelReprojection.Data reproj,
-            in VistaFroxelLocalLightParams localLights)
+            in VistaFroxelLocalLightParams localLights,
+            in VistaFogVolumeSet fogVolumes)
             where T : struct, IVistaLutDispatcher
         {
             if (m_FroxelVolume == null) return;
@@ -1110,7 +1111,7 @@ namespace Vista
             // 「不走这条路的路径看到的是零态」才是由代码保证的，不是靠记性。
             reproj.Bind(d);
 
-            m_FroxelVolume.DispatchInjection(d, desc, cameraWS, shadowmapBound, localLights);
+            m_FroxelVolume.DispatchInjection(d, desc, cameraWS, shadowmapBound, localLights, fogVolumes);
         }
 
         /// <summary>
@@ -1340,7 +1341,8 @@ namespace Vista
         /// </param>
         public void RenderFroxelLocalLightProbe<T>(
             T d, in VistaAtmosphereViewData view, VistaFogSettings fog,
-            in VistaFroxelLocalLightParams localLights)
+            in VistaFroxelLocalLightParams localLights,
+            in VistaFogVolumeSet fogVolumes)
             where T : struct, IVistaLutDispatcher
         {
             m_LocalLightProbeDispatches = 0;
@@ -1351,7 +1353,7 @@ namespace Vista
             view.BindFrustumRays(d);
             view.BindFog(d, fog);
 
-            m_FroxelVolume.DispatchLocalLightProbe(d, localLights);
+            m_FroxelVolume.DispatchLocalLightProbe(d, localLights, fogVolumes);
             m_LocalLightProbeDispatches++;
         }
 

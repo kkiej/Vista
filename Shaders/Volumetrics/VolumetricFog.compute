@@ -108,6 +108,8 @@
 #include "Packages/com.kkiej.vista/ShaderLibrary/FroxelVolume.hlsl"
 // 它自己会把 URP 的 RealtimeLights.hlsl（→ Clustering / Input / LightCookie）带进来。
 #include "Packages/com.kkiej.vista/ShaderLibrary/FroxelLocalLights.hlsl"
+// 局部雾体（#24）。挂载点在 VistaFroxelSampleAt 里（见那处注释）。
+#include "Packages/com.kkiej.vista/ShaderLibrary/FogVolumes.hlsl"
 
 RW_TEXTURE3D(float4, _VistaFroxelInjectionRW);
 
@@ -423,6 +425,12 @@ VistaFroxelSample VistaFroxelSampleAt(float2 pixelCenter, float slice)
     // 而我们自己取雾、自己调逐点函数。留在默认 false 上，避免读者以为它有作用。
 
     o.fog = VistaSampleFogAlongRay(o.tKm, o.rayDir.y);
+    // 局部雾体（#24）在这里合流：σ 在进能量计算**之前**加好，下游的太阳项、
+    // σ_s 分量、#23 逐灯的相位重算拿到的就是合成后的介质 —— 三条光路对
+    // 局部体的浓度自动一致，这正是「内联枚举而不是独立密度 RT」买下的性质。
+    // 体不喂 fog.density（太阳自遮蔽的无限平板闭式解装不进一个盒子，
+    // 已知近似，理由在 FogVolumes.hlsl 头注）。
+    VistaApplyFogVolumes(o.posWS, o.fog);
     o.smp = VistaEvaluateScatterSample(
         o.posKm, o.rayDir, _VistaSunDirection.xyz, o.fog, s, VistaFroxelSunShadow(o.posWS));
 
@@ -890,6 +898,23 @@ void FroxelIntegralVerify(uint3 id : SV_DispatchThreadID)
 #define VISTA_PROBE_LL_RADIANCE_MAX   103u   // max 局部灯源项亮度（预曝光前）×1e6
 #define VISTA_PROBE_LL_SHADOWED_N     104u   // 计数：shadowAttenuation < 0.999 的（灯,点）对
 #define VISTA_PROBE_LL_LAYER_SKIP_N   105u   // 计数：被渲染层遮罩挡掉的（灯,点）对
+
+// ---- #24 局部雾体（106~110）。写入点在 FroxelLocalLightProbe —— 它是唯一一个
+// 既求介质又能在 all(id==0) 里逐体跑尺子点的探针核，不为体单开第十一趟派发。
+#define VISTA_PROBE_VOL_COUNT         106u   // InterlockedMax：核里读到的体数（数量守恒判据）
+#define VISTA_PROBE_VOL_CENTER_W_MIN  107u   // InterlockedMin：体中心权重 ×1e6，必须 == 1e6
+#define VISTA_PROBE_VOL_CENTER_MISS   108u   // 计数：中心 σ 落在 [σ(1−amt), σ] 区间外的体，必须 0
+#define VISTA_PROBE_VOL_OUTSIDE_LEAK  109u   // 计数：体外尺子点上单体 σ > 0 的体，必须 0
+#define VISTA_PROBE_VOL_SIGMA_MAX     110u   // max 探针点上全部体贡献的 σ_t ×1e3（上界判据 + ⓘ）
+//
+// 为什么 VOL_CENTER_W_MIN 的门是「精确 == 1e6」而不是「≥ 某个阈」：
+// CPU 打包时把 blendLocal 夹到 ≤ 1，于是中心处 (1 − 0)·rcpBlend ≥ 1、
+// saturate 后**构造性地**精确等于 1 —— 定点 ×1e6 后没有任何舍入路径能给出
+// 999999。一个不等式门在这里只会遮住「变换矩阵行序写反」这类把中心
+// 算到别处去的错（那时权重多半仍 > 0.9）。
+// 107 号是 min 槽 ⇒ 必须在 VistaFroxelVolume.k_ShadowProbeMinSlots 登记初值
+// 0xFFFFFFFF —— 89 号那条坑的同款；且体数为 0 时它保持初值，报表要按
+// 「未覆盖」处理而不是把 4294967295 当读数印出来。
 
 // 为什么 LL_NEAR_PRE 的门是「必须 > 0」而不是「必须 == 0」：
 // froxel 片 0 的求值点是 0.5·d₀（metric midpoint，实测 ≈ 0.156 m），而
@@ -1596,6 +1621,43 @@ void FroxelLocalLightProbe(uint3 id : SV_DispatchThreadID)
         // 判据(c) 的门。camNear == 0 ⇒ 下发丢了 ⇒ max(viewZ, 0) 照样不越界，
         // 但 zbin 下标 0 不再落在相机近平面上，整条换算失去意义。
         VistaLlProbeMax(VISTA_PROBE_LL_CAM_NEAR, _VistaFroxelViewForward.w, 1.0e6);
+
+        // ---- #24 局部雾体的逐体尺子（判据 (a)(b)(c)(d) 的 GPU 侧）----
+        // 只在 (0,0,0) 线程跑：≤ 16 个体 × 2 个尺子点，一个线程的量。
+        // 尺子点（中心 / 体外）是 CPU 上传的独立参考 —— GPU 从 worldToLocal
+        // 反推中心得再实现一遍求逆，那就是「同一个量的第二份实现」。
+        {
+            uint volCount = min((uint)_VistaFogVolCount.x, (uint)VISTA_FOG_VOL_MAX);
+            VistaLlProbeMax(VISTA_PROBE_VOL_COUNT, (float)volCount, 1.0);
+
+            uint volMiss = 0u;
+            uint volLeak = 0u;
+            for (uint vi = 0u; vi < volCount; ++vi)
+            {
+                float3 pc = _VistaFogVolProbeC[vi].xyz;
+                float3 po = _VistaFogVolProbeO[vi].xyz;
+
+                // (b) 中心权重：构造性地精确 == 1（blendLocal 夹到 ≤ 1）。
+                VistaLlProbeMin(VISTA_PROBE_VOL_CENTER_W_MIN,
+                                VistaFogVolumeWeightAt(vi, pc), 1.0e6);
+
+                // (c) 中心 σ 区间：w == 1 时 σ·(1 − amt·v)，v ∈ [0,1]
+                //     ⇒ σ·(1 − amt) ≤ 读数 ≤ σ。eps 只兜 fp32 乘法的一位舍入。
+                float sigma = _VistaFogVolMedium[vi].w;
+                float amt   = _VistaFogVolParams[vi].x;
+                float sC    = VistaFogVolumeSigmaAt(vi, pc);
+                float eps   = sigma * 1.0e-5;
+                if (sC < sigma * (1.0 - amt) - eps || sC > sigma + eps)
+                    volMiss += 1u;
+
+                // (d) 体外零泄漏：**单体**求值（两个体重叠时「体外」只对
+                //     自己这个体成立），且权重为 0 时不采噪声 ⇒ 恒零是构造性质。
+                if (VistaFogVolumeSigmaAt(vi, po) > 0.0)
+                    volLeak += 1u;
+            }
+            VistaLlProbeAdd(VISTA_PROBE_VOL_CENTER_MISS,  volMiss);
+            VistaLlProbeAdd(VISTA_PROBE_VOL_OUTSIDE_LEAK, volLeak);
+        }
     }
 
     if (id.x >= VISTA_PROBE_DIM_XY || id.y >= VISTA_PROBE_DIM_XY || id.z >= VISTA_PROBE_DIM_Z)
@@ -1661,6 +1723,12 @@ void FroxelLocalLightProbe(uint3 id : SV_DispatchThreadID)
     // 第一个刻度上而不是被压成 0；上端 VISTA_PROBE_FIXED_MAX 4e9 对应 4e3 cd/m²/km，
     // 浓雾近距离强灯会顶到饱和 —— 那时这一格是**上界**，报表要如实说。
     VistaLlProbeMax(VISTA_PROBE_LL_RADIANCE_MAX, VistaFroxelLuminance(rb), 1.0e6);
+
+    // ---- #24 判据(e)：探针网格上体贡献的 σ_t 最大值 ----
+    // 调的是线上同一份逐体函数（VistaFogVolumesSigmaAt → VistaFogVolumeSigmaAt），
+    // 不是第二份实现。报表拿它对 CPU 侧的 Σσ 上界（w ≤ 1、n ≤ 1 ⇒ 读数 ≤ Σσ，
+    // 定义性不等式）；×1e3 让 1/km 量级的 σ 在定点上留三位小数。
+    VistaLlProbeMax(VISTA_PROBE_VOL_SIGMA_MAX, VistaFogVolumesSigmaAt(fs.posWS), 1.0e3);
 
     // 两档之差：只作归因，不设门（理由见槽位表「为什么 (d) 判集合而不判亮度」）。
     // 分母用暴力档 + 1e-9 兜底。两档灯集合相同时残差只剩 fp32 求和次序 ——
