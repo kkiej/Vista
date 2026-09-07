@@ -163,6 +163,14 @@ namespace Vista
         /// 同上：取不到 LUT 时返回 **−1**，不是 0。
         /// </summary>
         public int froxelJitterProbeDispatches => m_Luts != null ? m_Luts.jitterProbeDispatches : -1;
+
+        /// <summary>
+        /// 仅供 Editor 自检：#23 的局部灯探针（<c>FroxelLocalLightProbe</c>）派发了几趟。
+        /// 与上面那一格同一条理由 —— 分开「压根没派发」（feature 没挂 / 那趟 pass 没排进去）
+        /// 与「派发了但核内早退」（体积尺寸为 0）。取不到 LUT 时返回 **−1**。
+        /// </summary>
+        public int froxelLocalLightProbeDispatches =>
+            m_Luts != null ? m_Luts.localLightProbeDispatches : -1;
 #endif
 
         /// <summary>

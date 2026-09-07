@@ -162,6 +162,56 @@ namespace Vista
     }
 
     /// <summary>
+    /// 局部灯（点光 / 聚光 / 副平行光）参与介质散射的剔除档位（#23）。
+    ///
+    /// ------------------------------------------------------------------ 为什么两档都要
+    /// <see cref="Cluster"/> 是出货档，<see cref="BruteForceReference"/> 的身份是
+    /// **参考解**，不是「备用方案」也不是「省性能档」。它存在的唯一理由是让
+    /// 「URP 的 cluster 位图在 compute 里读对了吗」可被度量：cluster 给出的灯集合
+    /// 必须是「真正影响该 froxel 的灯集合」的**超集**。这是一条定义性的判据 ——
+    /// 两条路径的求和次序不同，fp32 下不可能逐位相同，拿辐亮度做门只会得到一个
+    /// 永远差一点的假失败。
+    ///
+    /// 为什么这不是编译期宏：与 <see cref="JitterMode"/> 同一条约定。档位走
+    /// <c>_VistaFroxelLocalLight.x</c> 这个 uniform，判据探针因此能在**同一趟
+    /// dispatch 里把两档都跑一遍**再比集合 —— 换成宏，那条超集判据就不存在了。
+    ///
+    /// ------------------------------------------------------------------ 两档都要 Forward+
+    /// <b>暴力档也依赖 <c>_CLUSTER_LIGHT_LOOP</c></b>：局部灯的**总数**在 compute 里
+    /// 只有 <c>URP_FP_PROBES_BEGIN</c> 这一个可靠来源。经典 Forward 的
+    /// <c>GetAdditionalLightsCount()</c> 读 <c>unity_LightData.y</c>（一个**逐 draw**
+    /// 的全局，compute 里不存在），而 <c>_AdditionalLightsCount.x</c> 是**逐物体上限**
+    /// 而不是场景灯数。所以 Forward+ 关掉时两档一起失效，且是**显式**失效 ——
+    /// Window/Vista/Log Volumetric Fog State 里有两层哨兵（跑的是哪个变体 +
+    /// <c>URP_FP_WORDS_PER_TILE</c> 是否为 0）。
+    ///
+    /// 经典 Forward（移动端那一档）的局部灯路径推到 #26，与屏幕空间光轴一起做：
+    /// 那里是 CPU 挑 N 盏最近的灯、逐灯解析注入，与本枚举的两档都不是同一个算法。
+    ///
+    /// <see cref="Off"/> 必须是 0：cbuffer 未绑定时读到全零，而全零必须恰好等于
+    /// 「一盏局部灯都不算」，逐位等于 #23 落地之前的画面。
+    /// </summary>
+    public enum LocalLightMode
+    {
+        /// <summary>不算局部灯。零态，也是 #23 之前的行为。</summary>
+        Off = 0,
+
+        /// <summary>
+        /// 复用 URP Forward+ 的 zbin/tile 位图剔除（<c>ClusterInit</c>/<c>ClusterNext</c>）。
+        /// 出货档。URP 每帧已经把位图算好并通过 <c>cmd.SetGlobal*</c> 下发（**进命令流**，
+        /// 所以 compute 读得到），自己再写一套剔除就是「同一个量的第二份实现」，
+        /// 而它的失败模式是「某些灯在雾里少了」—— 在低频的雾上几乎看不出来。
+        /// </summary>
+        Cluster = 1,
+
+        /// <summary>
+        /// 遍历全部局部灯，不做任何剔除。**参考解**，只在自检/对照时用。
+        /// 开销随场景灯数线性增长（207 万 froxel × 灯数），不要在出货配置里选它。
+        /// </summary>
+        BruteForceReference = 2,
+    }
+
+    /// <summary>
     /// 近层体积雾 froxel 体的配置。
     ///
     /// 本类只做两件事：把「屏幕比例 + 远边界」换成一份**分配口径**
@@ -282,6 +332,56 @@ namespace Vista
                + "一半累积一半不累积，症状是运动物体边缘出现一条抖动的亮边。")]
         [Range(0f, 1f)] public float luminanceRejectFull = 0.9f;
 
+        [Header("局部灯参与介质（#23）")]
+        [Tooltip("点光 / 聚光 / 副平行光是否在雾里留下光锥。\n\n"
+               + "Cluster 是出货档（复用 URP Forward+ 的 zbin/tile 剔除）；"
+               + "BruteForceReference 是**参考解**，遍历全部局部灯不做剔除，"
+               + "只在 Window/Vista/Log Volumetric Fog State 里做对照用，不要出货。\n\n"
+               + "两档都要求渲染管线资产的 Rendering Path 是 **Forward+**："
+               + "局部灯的总数在 compute 里只有 cluster 那一路能拿到"
+               + "（经典 Forward 的灯数是逐 draw 的，compute 里根本不存在）。"
+               + "Forward+ 关掉时这两档一起失效，状态日志里会明确报出来。\n\n"
+               + "移动端那一档（经典 Forward、CPU 挑 N 盏最近的灯）是 #26 的事。")]
+        public LocalLightMode localLightMode = LocalLightMode.Cluster;
+
+        [Tooltip("局部灯的光锥是否查 URP 的 additional shadow atlas（每盏灯 1 tap）。\n\n"
+               + "关掉之后光锥会**穿墙** —— 一个屋里的灯会把光柱透到街上。"
+               + "这不是省性能的档位，是归因用的：光锥位置不对时先关掉它，"
+               + "能区分「灯的位置/衰减算错了」与「阴影切片索引取错了」。\n\n"
+               + "为什么是 1 tap 而不是软阴影：207 万个 froxel × 灯数，"
+               + "4/9 tap 的 tent 摊不起；而体积雾本身是低频的，"
+               + "HDRP 的 VBufferLighting 也是 1 tap。主光那一路同理。")]
+        public bool localLightShadows = true;
+
+        [Tooltip("局部灯强度的全局缩放。默认 1 —— 这是一个**逃生口**，不是一个观感旋钮。\n\n"
+               + "URP **没有**点光/聚光的物理单位（那是 HDRP 才有的）。URP 侧只有"
+               + "`color.linear × intensity`，而着色时乘的是 1/d²·角衰减，"
+               + "所以 intensity 在量纲上就是**坎德拉**，只是没有标定过。\n"
+               + "Vista 直接把它当 cd 用，与 HDRP 的做法一致。\n\n"
+               + "直接后果，也是**物理正确**而不是 bug：Vista 的太阳是 120000 lux、"
+               + "曝光 EV100 15，Unity 默认强度 1 的点光在白天完全看不见，"
+               + "要到夜景 EV100 ≈ 5 才浮出来。\n"
+               + "美术请按真实值填：60 W 白炽灯 ≈ 800 lm ≈ 64 cd，路灯 ≈ 1e4 cd。\n\n"
+               + "把这个值拧大来「让灯在白天也发光」会同时破坏夜景，"
+               + "它存在的目的是应对整套场景的灯光已经按别的口径做完了这种情况。")]
+        [Min(0f)] public float localLightIntensityScale = 1f;
+
+        [Tooltip("哪些**渲染层**（Rendering Layers）上的灯参与体积散射。\n\n"
+               + "这是逐灯关掉体积贡献的办法：把不想留光锥的灯移出这里选中的层。\n\n"
+               + "为什么是二值开关而不是 UE5 那种逐灯的连续 VolumetricScatteringIntensity："
+               + "连续旋钮要一个逐灯的数组，而下标必须与 URP 内部 `_AdditionalLights*` 的"
+               + "打包序对齐 —— 在 C# 侧复现那个序就是「同一个引擎内部不变量的第二份实现」，"
+               + "失败模式是**旋钮作用到了别的灯上**，静默且几乎无法归因。"
+               + "而渲染层遮罩是 URP **自己**按同一个下标下发的，零映射零漂移。"
+               + "连续调光因此推迟，理由就是这一段。\n\n"
+               + "要生效必须在管线资产上打开 **Rendering Layers**（URP 的 _LIGHT_LAYERS）。"
+               + "没打开时这个遮罩整段被编译掉、所有局部灯都参与，"
+               + "状态日志会把这一档标成「未覆盖」。\n\n"
+               + "一个都不选等于全选（见 ResolveLocalLightLayerMask）："
+               + "「一盏灯都不参与」应该用上面的档位 Off 表达，"
+               + "否则「遮罩忘了填」与「功能坏了」在画面上长得一样。")]
+        public RenderingLayerMask localLightLayerMask = default;
+
         [Header("调试视图")]
         [Tooltip("把 froxel 表直接画到屏幕上（整屏替换，不叠加）。\n\n"
                + "Off 之外的档位都会**盖掉整个画面** —— 这是故意的：叠加会让"
@@ -335,6 +435,47 @@ namespace Vista
 
         /// <summary>死区过渡区的最小宽度。见 <see cref="ResolveLuminanceReject"/>。</summary>
         public const float k_MinRejectWidth = 1e-3f;
+
+        /// <summary>
+        /// 局部灯的渲染层遮罩，**0 视为全选**。
+        ///
+        /// 为什么要这条替换，而不是让 0 老老实实表示「一层都不选」：
+        ///  · Unity 给一个**新加的**序列化字段的值是 0，而不是字段初始化器里的值。
+        ///    也就是说已经存在的配置资产在升级到 #23 之后会拿到 0 ——
+        ///    若 0 表示「一层都不选」，那些场景一打开就是「局部灯功能整段静默失效」，
+        ///    而画面上它与「Forward+ 没开」「关键字漏设」完全无法区分。
+        ///  · 「一盏局部灯都不参与」本来就有一个更明确的表达：
+        ///    <see cref="LocalLightMode.Off"/>。让同一个意图有两种表达法，
+        ///    只会让报表上多一种需要交叉排除的状态。
+        /// 代价是「全都不选」变成不可表达 —— 这正是想要的（让非法状态无法表示）。
+        ///
+        /// 抽成静态函数的理由与 <see cref="ResolveDebugSlice"/> 相同：渲染路径与状态日志
+        /// 必须共用同一份规则，否则日志会印出一个 GPU 上根本没用过的遮罩。
+        /// </summary>
+        public static uint ResolveLocalLightLayerMask(uint requested)
+            => requested == 0u ? uint.MaxValue : requested;
+
+        /// <summary>
+        /// 上一条的实例入口。
+        /// </summary>
+        public uint ResolveLocalLightLayerMask()
+            => ResolveLocalLightLayerMask(localLightLayerMask.value);
+
+        /// <summary>
+        /// 32 位遮罩拆成两个 16 位半，供 <c>SetGlobalVector</c> 下发。
+        ///
+        /// 为什么不像 URP 那样 <c>math.asfloat(mask)</c> 一把塞进去：URP 那边走的是
+        /// <c>SetGlobalFloatArray</c>，Unity 不会去动数组元素的位。而这里要走
+        /// <c>SetGlobalVector</c>（一个 <see cref="Vector4"/>）——
+        /// <c>asfloat(1)</c> 是**非正规数** 1.4e-45（可能被 flush 到 0），
+        /// <c>asfloat(0xFFFFFFFF)</c> 是 **NaN**（在任何一次比较里都是雷）。
+        /// 16 位一半在 float 里是精确整数，HLSL 侧拼回去逐位无损。
+        /// </summary>
+        public static void SplitLayerMask(uint mask, out float lo, out float hi)
+        {
+            lo = mask & 0xFFFFu;
+            hi = (mask >> 16) & 0xFFFFu;
+        }
 
         // --------------------------------------------------------------------
         //  切片分布：纯指数

@@ -260,7 +260,21 @@ struct VistaScatteringResult
 struct VistaScatterSample
 {
     float3 scattered;   // 该点的散射源项（已含相位、到太阳的透射率、星球阴影、多次散射、雾）
-    float3 msAs1;       // 入射亮度恒为 1 时的散射系数和（建 MS LUT 用，**不含雾**）
+
+    // 大气两个组分的散射系数 σ_s（1/km），**不含雾**（雾的那一份在调用方手里的
+    // VistaFogSample.scattering 上）。两个消费者：
+    //   · MS LUT 要的是两者之和（入射亮度恒为 1 时的散射传递量，见 :637 那一次累加）；
+    //   · #23 的局部灯要**分开**的两份 —— 每盏灯的相位角 cosθ_i = dot(rayDir, L_i)
+    //     与太阳的不同，所以 σ_s,R·P_R(cosθ_i) + σ_s,Mie·P_HG(g, cosθ_i) 必须逐灯重算。
+    //
+    // ---- 为什么不是原来那个 msAs1（= 两者之和）+ 局部灯自己再取一次介质 ----
+    // 再取一次就是在同一个采样点上跑第二次 VistaSampleMedium：既多一次 exp/exp/tent，
+    // 又让「这一点的 σ_s 是多少」有了两份来源。分叉的症状是**局部灯的光锥浓度
+    // 与太阳的雾浓度对不上**，而那看起来像相位或强度写错了。
+    // 拆成两个字段后 MS LUT 那一处只多一次加法（编译器会把它折进已有的累加）。
+    float3 scatteringRayleigh;
+    float3 scatteringMie;
+
     float3 extinction;  // 已兜底 >= 1e-9，可直接作除数
 };
 
@@ -389,7 +403,9 @@ VistaScatterSample VistaEvaluateScatterSample(
         s.sunIlluminance, s.fogAmbientRadiance, s.applyPhase);
 
     // 不含雾：MS LUT 是静态的、球对称参数化的大气量，见 FogMedium.hlsl。
-    o.msAs1 = medium.scatteringRayleigh + medium.scatteringMie;
+    // 逐组分转出去（而不是在这里求和）的理由见结构体那里 —— #23 的局部灯要分开的两份。
+    o.scatteringRayleigh = medium.scatteringRayleigh;
+    o.scatteringMie      = medium.scatteringMie;
     // 大气顶附近密度指数衰减到接近 0，除法要兜底
     o.extinction = max(medium.extinction + fog.extinction, 1e-9);
     return o;
@@ -633,8 +649,10 @@ VistaScatteringResult VistaIntegrateScatteredLuminance(
         // 短步段的相消问题在 VistaSegmentIntegral 里处理，别在这儿照公式直写。
         result.luminance    += throughput * VistaSegmentIntegral(smp.scattered, smp.extinction, dt);
 
-        // MS LUT 的输入项：入射亮度恒为 1、无相位、无遮挡时的散射传递量
-        result.multiScatAs1 += throughput * VistaSegmentIntegral(smp.msAs1, smp.extinction, dt);
+        // MS LUT 的输入项：入射亮度恒为 1、无相位、无遮挡时的散射传递量。
+        // 这里的求和是 msAs1 唯一的消费点（拆成两个字段之前它是结构体里的一个成员）。
+        result.multiScatAs1 += throughput * VistaSegmentIntegral(
+            smp.scatteringRayleigh + smp.scatteringMie, smp.extinction, dt);
 
         throughput *= sampleTransmittance;
     }

@@ -1085,10 +1085,14 @@ namespace Vista
         /// 也就是「有雾、没有光柱」而不是「一片漆黑」。</param>
         /// <param name="reproj">#22a 的时间重投影与抖动状态。零态（<c>Data.disabled</c>）
         /// 表示纯本帧、无抖动 —— 所以调用方永远有一份合法的值可传，不需要一个「要不要下发」的开关。</param>
+        /// <param name="localLights">#23 的局部灯档位与相机前向。零态
+        /// （<c>VistaFroxelLocalLightParams.disabled</c>）表示一盏局部灯都不参与 ——
+        /// 与 <paramref name="reproj"/> 同一条「永远有一份合法值可传」的约定。</param>
         public void RenderFroxelInjection<T>(
             T d, in VistaAtmosphereViewData view, VistaFogSettings fog,
             in VistaFroxelVolumeDesc desc, Vector3 cameraWS, bool shadowmapBound,
-            in VistaFroxelReprojection.Data reproj)
+            in VistaFroxelReprojection.Data reproj,
+            in VistaFroxelLocalLightParams localLights)
             where T : struct, IVistaLutDispatcher
         {
             if (m_FroxelVolume == null) return;
@@ -1106,7 +1110,7 @@ namespace Vista
             // 「不走这条路的路径看到的是零态」才是由代码保证的，不是靠记性。
             reproj.Bind(d);
 
-            m_FroxelVolume.DispatchInjection(d, desc, cameraWS, shadowmapBound);
+            m_FroxelVolume.DispatchInjection(d, desc, cameraWS, shadowmapBound, localLights);
         }
 
         /// <summary>
@@ -1298,6 +1302,66 @@ namespace Vista
 
         /// <summary>上一次 <see cref="RenderFroxelJitterProbe{T}"/> 派发了几趟（0 或 1）。</summary>
         public int jitterProbeDispatches => m_JitterProbeDispatches;
+
+        /// <summary>
+        /// 仅供 Editor 自检：#23 的局部灯探针（判据(a)~(e)）。
+        /// 结果写进阴影探针缓冲的 82~105 号槽位，与 #20/#21/#22a/#22b 完全不重叠。
+        ///
+        /// ---------------------------------------------------------------- 为什么要推逐视图常量与雾
+        /// 核内走的是 <c>VistaFroxelSampleAt</c> —— 也就是线上注入那一份采样点与介质映射
+        /// （抽出这个函数就是为了让判据(d) 的两档在**同一个点**上比较）。
+        /// 它要视锥四角（射线重建）与雾剖面（局部灯的 σ_s 里雾那一项占 2000 倍权重，
+        /// 不推雾的话 LL_RADIANCE_MAX 会掉到清空气的 1e-6 量级，
+        /// 看起来像「灯没接上」而不是「布景没有雾」）。
+        ///
+        /// ---------------------------------------------------------------- 为什么不重推相机位置
+        /// 照 <see cref="RenderFroxelShadowProbe{T}"/> 的规矩：<c>_VistaFroxelCameraWS</c>
+        /// 由注入那一趟下发，探针要读的就是**注入实际用过的那一份**（含它的 w 位 ——
+        /// 主光阴影贴图这一帧有没有内容）。在这里重推等于让判据自带一份布景。
+        /// 判据(b) 里那格 LL_CAM_DRIFT_MM 量的正是这一份与引擎全局
+        /// <c>_WorldSpaceCameraPos</c> 的偏差，重推会把它抹成 0。
+        ///
+        /// ---------------------------------------------------------------- 为什么 localLights 要显式传
+        /// 与 <see cref="RenderFroxelJitterProbe{T}"/> 同一条理由，但这里更硬：
+        /// <c>VistaFroxelLocalLightCB</c> 在本帧只有注入那一趟写过，看似可以继承 ——
+        /// 但「我是紧跟注入的那一趟所以继承线上 uniform」这条顺序性论证本项目已经证伪过
+        /// （前一趟覆写过同一组 cbuffer 时它是假的），而这里的调用点排在
+        /// 重投影探针**之后**，那七趟里没有一趟碰局部灯 cbuffer —— 也就是说
+        /// 论证今天成立、明天加一趟就悄悄失效。传同一份 params 并由
+        /// <c>DispatchLocalLightProbe</c> 自己 Bind，是让「探针测的档位与线上跑的档位
+        /// 是同一份」由代码保证。
+        ///
+        /// 注意核内**不读**档位：判据(d) 要 cluster 档与暴力档在同一趟里各跑一遍。
+        /// 传 params 是为了强度缩放 / 阴影位 / 层遮罩三样与线上一致 ——
+        /// 否则 LL_SHADOWED_N 与 LL_LAYER_SKIP_N 测的是另一套配置。
+        /// </summary>
+        /// <param name="localLights">
+        /// 线上那一帧的 <c>VistaFroxelLocalLightParams</c>（注入核吃进去的那一份）。
+        /// </param>
+        public void RenderFroxelLocalLightProbe<T>(
+            T d, in VistaAtmosphereViewData view, VistaFogSettings fog,
+            in VistaFroxelLocalLightParams localLights)
+            where T : struct, IVistaLutDispatcher
+        {
+            m_LocalLightProbeDispatches = 0;
+
+            if (m_FroxelVolume == null) return;
+
+            view.Bind(d, m_SkyViewWidth, m_SkyViewHeight);
+            view.BindFrustumRays(d);
+            view.BindFog(d, fog);
+
+            m_FroxelVolume.DispatchLocalLightProbe(d, localLights);
+            m_LocalLightProbeDispatches++;
+        }
+
+        // 局部灯探针派发了几趟（0 或 1）。与抖动探针同一条理由：
+        // 「压根没派发」与「派发了但核内早退（体积尺寸为 0）」的 LL_COUNT 都是 0，
+        // 而前者是接线问题、后者是布景问题。
+        int m_LocalLightProbeDispatches;
+
+        /// <summary>上一次 <see cref="RenderFroxelLocalLightProbe{T}"/> 派发了几趟（0 或 1）。</summary>
+        public int localLightProbeDispatches => m_LocalLightProbeDispatches;
 
         /// <summary>
         /// 仅供 Editor 自检：深度分布正反映射 round-trip。

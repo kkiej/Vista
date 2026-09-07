@@ -83,6 +83,44 @@ namespace Vista
         // uniform 可以被判据直接读出来点名。零态（全零）= 无阴影 = 恒为 1，与其余
         // cbuffer 同一条「关掉 = 零态」的约定。
         public static readonly int _VistaFroxelCameraWS           = Shader.PropertyToID("_VistaFroxelCameraWS");
+        // xyz: 相机前向**单位**向量（世界空间），w: 相机近裁剪面（m）。
+        //
+        // 为什么要它：局部灯要走 URP 的 cluster 查询，而 ClusterInit 里的 z 分箱写的是
+        //   viewZ = dot(GetViewForwardDir(), positionWS - GetCameraPositionWS())
+        // 两个都是引擎**内建**全局（unity_MatrixV / _WorldSpaceCameraPos）。
+        // grep 过 URP 与 core 两个包的全部 .compute：**没有一个**碰这两个全局，
+        // 所以「compute 里它们是否被绑定」这件事没有先例可依，只能由判据实测。
+        // Vista 自己下发一份前向向量，就能用「代理位置」把 viewZ 换算回 URP 的公式
+        // （见 FroxelLocalLights.hlsl 的推导），正确性条件收缩成 dot(gFwd,gFwd) == 1。
+        //
+        // 为什么 w 是**相机**近裁剪面而不是 froxel 体的 near：URP 的 zbin 下标 0 恰好落在
+        // camera.nearClipPlane 上（ForwardLights.cs:259-260 的 zBinOffset 就是拿它算的），
+        // 而 froxel 片 0 的求值点是 0.5·d₀ ≈ 0.156 m，**恒小于** near 0.30 m ⇒
+        // 每帧都会算出负下标，(uint) 转换后被 min() 钳到**最后**一个分箱 —— 症状是
+        // 最近那一片的局部灯全丢，且看起来像「近处雾本来就淡」。所以要在这里钳。
+        //
+        // 为什么放在 VistaFroxelCB 而不是局部灯那个 cbuffer：这两个量描述的是**相机**，
+        // 塞进局部灯的 cbuffer 意味着「把局部灯关掉」同时把相机前向清零。
+        public static readonly int _VistaFroxelViewForward        = Shader.PropertyToID("_VistaFroxelViewForward");
+
+        // ---- Volumetrics: 局部灯参与介质（#23，VistaFroxelLocalLightParams 下发）----
+        // x: 剔除档位（LocalLightMode：0 关 / 1 cluster / 2 暴力参考解），
+        // y: 全局强度缩放（candela 逃生口），z: 是否查 additional shadow atlas（1 = 是），
+        // w: 相机远裁剪面（m），只作远端 ⓘ 诊断 —— 超出远裁剪面的 zbin 钳位是 URP
+        //    自己的既定行为（无害），所以那一格不设门。
+        //
+        // 零态 = 档位 0 = 一盏局部灯都不参与，与 VistaFogCB / VistaFroxelCB 同一条约定。
+        // 档位做成运行时 uniform 而不是 shader keyword：cluster 档与暴力参考档必须
+        // **同一个二进制**都在，判据(d) 才能在一次派发里比较两个集合。
+        public static readonly int _VistaFroxelLocalLight         = Shader.PropertyToID("_VistaFroxelLocalLight");
+        // x: 渲染层遮罩低 16 位，y: 高 16 位，zw 保留。
+        //
+        // 为什么拆两半而不像 URP 那样 math.asfloat(mask) 一把塞进去：URP 走的是
+        // SetGlobalFloatArray（逐 float 拷贝），而这里要走 SetGlobalVector（走 Vector4）。
+        // asfloat(1) 是**非正规数** 1.4e-45（驱动可能 flush 到 0），
+        // asfloat(0xFFFFFFFF) 是 **NaN** —— 两者在 Vector4 那条路上都不保证原样到达。
+        // 16 位半在 fp32 里是精确可表示的整数，HLSL 侧 (uint)x | ((uint)y << 16) 复原。
+        public static readonly int _VistaFroxelLocalLightMask     = Shader.PropertyToID("_VistaFroxelLocalLightMask");
 
         // ---- Volumetrics: 时间重投影与抖动（#22，VistaFroxelReprojection 下发）----
         // 整组的零态 = 失能：历史权重 0（纯本帧）、抖动幅度 0（恒在格心）、

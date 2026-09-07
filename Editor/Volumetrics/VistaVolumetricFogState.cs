@@ -118,7 +118,38 @@ namespace Vista.EditorTools
         const int k_SlotJitDBlue    = 79;
         const int k_SlotBnWidth     = 80;   // ⑰d：核里 GetDimensions 问出来的尺寸
         const int k_SlotBnHeight    = 81;
-        const int k_SlotTotal         = 82;
+
+        // ================================================================ #23 局部灯（82~105）
+        // 这一批全部由第十个核 FroxelLocalLightProbe 写。与 VolumetricFog.compute 里的
+        // VISTA_PROBE_LL_* 逐一对应 —— 两份表里任何一处对不上，症状是某一格读到
+        // 邻格的数（比如把「层遮罩跳过数」读成「阴影命中数」），而两个数都是合法的
+        // 非负整数 ⇒ 报表全绿。⓿ 那道容量门（k_SlotTotal 双向对账）只能抓总数错，
+        // 抓不到顺序错，所以这里的注释里保留了每一格的物理含义。
+        const int k_SlotLlFlags        = 82;
+        const int k_SlotLlCount        = 83;
+        const int k_SlotLlWordsPerTile = 84;
+        const int k_SlotLlTileCountX   = 85;
+        const int k_SlotLlZBinCount    = 86;
+        const int k_SlotLlDirCount     = 87;
+        const int k_SlotLlProbesBegin  = 88;   // == 局部灯数
+        const int k_SlotLlFwdLenMin    = 89;
+        const int k_SlotLlFwdLenMax    = 90;
+        const int k_SlotLlOrthoW       = 91;
+        const int k_SlotLlCamDriftMm   = 92;
+        const int k_SlotLlViewZNonPos  = 93;
+        const int k_SlotLlNearPre      = 94;
+        const int k_SlotLlCamNear      = 95;
+        const int k_SlotLlViewZMin     = 96;
+        const int k_SlotLlViewZMax     = 97;
+        const int k_SlotLlFarOver      = 98;
+        const int k_SlotLlClusterN     = 99;
+        const int k_SlotLlBruteN       = 100;
+        const int k_SlotLlCullMiss     = 101;
+        const int k_SlotLlAbRelDiff    = 102;
+        const int k_SlotLlRadianceMax  = 103;
+        const int k_SlotLlShadowedN    = 104;
+        const int k_SlotLlLayerSkipN   = 105;
+        const int k_SlotTotal         = 106;
 
         const uint k_FlagCascade   = 1u;
         const uint k_FlagShadowmap = 2u;
@@ -299,6 +330,56 @@ namespace Vista.EditorTools
         /// </summary>
         const float k_AggCrossGate = 1.0e-3f;
 
+        // ================================================================ #23 局部灯
+        // 与 VolumetricFog.compute 里的 VISTA_LL_FLAG_* 逐一对应。
+        const uint k_LlFlagRan            = 1u;
+        const uint k_LlFlagClusterVariant = 2u;
+        const uint k_LlFlagAddlShadowKw   = 4u;
+        const uint k_LlFlagLightLayersKw  = 8u;
+
+        // 定点缩放，与核里的 VistaLlProbeMin/Max 调用一一对应。
+        const float k_LlFwdLenScale   = 1.0e6f;
+        const float k_LlOrthoScale    = 1.0e6f;
+        const float k_LlNearScale     = 1.0e6f;
+        const float k_LlViewZMmScale  = 1.0e3f;   // 毫米
+        const float k_LlRadianceScale = 1.0e6f;
+        const float k_LlAbRelScale    = 1.0e9f;
+
+        /// <summary>
+        /// 探针点数的期望。与阴影探针同一张网格（32×32×16），
+        /// 所以直接复用 <see cref="k_ProbeCountExpected"/> —— 这里不再写第二个 16384。
+        /// </summary>
+        const int k_LlCountExpected = k_ProbeCountExpected;
+
+        /// <summary>
+        /// 相机前向长度必须夹住 1.0 的门。
+        ///
+        /// 这一格问的是**引擎的内置逐相机全局在 compute 里到底有没有绑**：
+        /// <c>GetViewForwardDir()</c> 展开成 <c>-UNITY_MATRIX_V[2].xyz</c>，
+        /// 也就是 <c>unity_MatrixV</c>。全 URP + core 包里一个 .compute 都没碰过它
+        /// （grep 过），Vista 是第一个 —— 所以这件事只能**实测**，不能假定。
+        ///
+        /// 为什么门摆在长度上、而不是摆在「与 _VistaFroxelViewForward 逐分量相等」上：
+        /// 代理点技巧（见 FroxelLocalLights.hlsl）把 zbin 的正确性条件收缩成了
+        /// <c>dot(gFwd, gFwd) == 1</c> 这一条 —— 前向**指向哪儿**不影响结果，
+        /// 只要它是单位向量。摆一道逐分量相等的门会拒绝一批实际正确的配置。
+        ///
+        /// 地板：视图矩阵第三行是正交化过的，fp32 上 |len − 1| 应在几个 ulp（1e-7）内；
+        /// 定点分辨率 1e-6。要拒绝的最小错答案是 len == 0（全局没绑）。
+        /// 门取 1e-3 —— 远在地板之上，也远在 0 之下。
+        /// </summary>
+        const float k_LlFwdLenTol = 1.0e-3f;
+
+        /// <summary>
+        /// <c>unity_OrthoParams.w</c> 必须为 0（透视）。
+        /// 非 0 会让 <c>ClusterInit</c> 走**线性** z-binning 而不是 log ——
+        /// 那时 zbin 下标会整体错位，症状是「灯在某些深度上突然不参与雾」。
+        /// 这一格是「一个只在另一种相机类型下才被下发的引擎全局，
+        /// 在你的档位下读到的是别的相机留下的脏值」这条坑的具体实例。
+        /// 门给一个定点格子的余量，不给 0。
+        /// </summary>
+        const float k_LlOrthoGate = 1.0e-6f;
+
         [MenuItem("Window/Vista/Log Volumetric Fog State", priority = 142)]
         static void RunFromMenu()
         {
@@ -311,7 +392,8 @@ namespace Vista.EditorTools
 
         static void Run(StringBuilder sb)
         {
-            sb.AppendLine("=== Vista 体积雾状态（#20 注入 + #21 积分 + #22a 时间重投影 + #22b 抖动源 覆盖性判据）===");
+            sb.AppendLine("=== Vista 体积雾状态（#20 注入 + #21 积分 + #22a 时间重投影 + #22b 抖动源 "
+                        + "+ #23 局部灯 覆盖性判据）===");
 
             var cam = FindGameCamera();
             if (cam == null)
@@ -361,7 +443,7 @@ namespace Vista.EditorTools
                 sb.AppendLine("✘ froxelVolume 不可用：VolumetricFog.compute 缺失，或九个核里有编译不出来的"
                             + "（FroxelPlaceholder / FroxelSliceVerify / FroxelInjection / FroxelShadowProbe / "
                             + "FroxelIntegration / FroxelSynthMedium / FroxelIntegralVerify / FroxelReprojProbe / "
-                            + "FroxelJitterProbe）。isValid 会 AND 掉全部九个下标 ≥ 0 —— "
+                            + "FroxelJitterProbe / FroxelLocalLightProbe）。isValid 会 AND 掉全部十个下标 ≥ 0 —— "
                             + "少一个核的症状是整个近层雾不生效，而不是那一个核静默失效。");
                 return;
             }
@@ -1373,6 +1455,366 @@ namespace Vista.EditorTools
                         sb.AppendLine("  ⓘ 「另一个 > 0」这一半是必需的：只判「选中的那个为 0」时，"
                                     + "一个把两档实现成同一件事的 bug（比如 zStride 根本没被读）会全绿 ——"
                                     + "而那正是本节要抓的东西。");
+                    }
+                }
+            }
+
+            // ================================================================ #23 局部灯参与介质
+            {
+                int  llDispatches   = feature.froxelLocalLightProbeDispatches;
+                uint llFlags        = raw[k_SlotLlFlags];
+                uint llCount        = raw[k_SlotLlCount];
+                bool llRan          = (llFlags & k_LlFlagRan) != 0u;
+                bool clusterVariant = (llFlags & k_LlFlagClusterVariant) != 0u;
+                bool addlShadowKw   = (llFlags & k_LlFlagAddlShadowKw) != 0u;
+                bool lightLayersKw  = (llFlags & k_LlFlagLightLayersKw) != 0u;
+                bool llOff          = settings.localLightMode == LocalLightMode.Off;
+
+                sb.AppendLine("---- #23 局部灯参与介质（A1 复用 URP cluster + A3 暴力参考解 + B2 阴影 1 tap）----");
+                sb.AppendLine($"状态：档位 = {settings.localLightMode}"
+                            + $"，逐灯阴影旋钮 = {settings.localLightShadows}"
+                            + $"，强度缩放 = {settings.localLightIntensityScale:F3}"
+                            + $"，收敛后的层遮罩 = 0x{settings.ResolveLocalLightLayerMask():X8}"
+                            + $"（美术填的原值 0x{settings.localLightLayerMask.value:X8}"
+                            + (settings.localLightLayerMask.value == 0u
+                                ? "，已按「新加的序列化字段默认为 0」那条坑解释成全 1）" : "）"));
+                sb.AppendLine("  ⓘ 光度单位约定：URP 的 punctual light **没有**物理单位"
+                            + "（grep 过 UniversalAdditionalLightData，LightUnit/Candela 一个都没有 —— 那是 HDRP 的）。"
+                            + "Vista 把 intensity **当 candela 解释**（URP 的着色数学本来就乘 ≈1/d²，"
+                            + "量纲上就是 candela，只是没标定），默认全局缩放 1.0，"
+                            + "上面那个 intensityScale 是唯一的逃生口 —— 这与 HDRP 的答案一致。"
+                            + "推论（是物理，不是 bug）：60 W 灯泡 ≈ 800 lm ≈ 64 cd，在 EV100 15 的白天看不见，"
+                            + "夜里 EV100 ≈ 5 才亮起来；想让白天也见光锥，就得按路灯的量级（≈10⁴ cd）填。");
+
+                if (llOff)
+                {
+                    // 「一个默认关闭、又没有判据覆盖的开关，等于一段永远不会被发现写错的代码」。
+                    // 这一段不是装饰：下面每一格在 Off 档下都会以 0 == 0 全绿。
+                    sb.AppendLine("ⓘ 判据(a)~(e) **未覆盖**：档位是 Off ⇒ VistaFroxelLocalLightParams.Resolve "
+                                + "返回失能态、核里一盏灯都不枚举。下面每一格在这一档下都会以 0 == 0 全绿，"
+                                + "所以本节印的是「空判据」而不是「通过」。");
+                    sb.AppendLine("  要跑：Vista Atmosphere ▸ Volumetric Fog 里把 Local Light Mode 选成 Cluster，"
+                                + "并保证管线资产的 Rendering Path 是 Forward+。");
+                }
+                else if (llDispatches <= 0 || !llRan || llCount == 0u)
+                {
+                    sb.AppendLine($"✘ 判据(a) 探针执行性：派发 {llDispatches} 趟，RAN 位 {llRan}，"
+                                + $"探针点数 {llCount}（期望 {k_LlCountExpected}）。");
+                    sb.AppendLine("  归因（三种读数长得一样但成因不同）："
+                                + "派发数 **−1** ⇒ 取不到 m_Luts（feature 没挂 / compute 缺失）；"
+                                + "派发数 **0** ⇒ 那趟 pass 排进图了但 m_FroxelVolume 为 null；"
+                                + "派发了而 RAN 为 0 ⇒ 核没真正执行（编译失败会先被 isValid 拦住，"
+                                + "所以更可能是 UAV 没绑上 —— 那正是 #22b 的坑）；"
+                                + "RAN 为 1 而点数 0 ⇒ 核内早退（_VistaFroxelSize 没下发）。");
+                }
+                else
+                {
+                    bool llCountOk = llCount == (uint)k_LlCountExpected;
+                    sb.AppendLine($"{Mark(llCountOk)}判据(a1) 探针覆盖：派发 {llDispatches} 趟，"
+                                + $"点数 {llCount} / {k_LlCountExpected}（32×32×16）");
+
+                    // -------------------------------------------------------- 判据(a) 结构在位
+                    // 两层，缺一层就留一条静默路径：
+                    //   ① 变体层：_CLUSTER_LIGHT_LOOP 没被选中 ⇒ Clustering.hlsl 整段编译掉，
+                    //      FroxelLocalLights.hlsl 走 #else 的桩 ⇒ 一盏灯都不参与，**不报错**。
+                    //   ② 数据层：变体选中了，但 Forward+ 关着 ⇒ urp_ZBins / urp_Tiles 这两个
+                    //      cbuffer 从来没被写过 ⇒ 读到全 0 ⇒ 同样「一盏灯都没有」，同样不报错。
+                    //      URP_FP_WORDS_PER_TILE（_FPParams1.w）为 0 就是这一层的哨兵。
+                    // CPU 侧读不到这件事 —— UniversalRenderer.usesClusterLightLoop 是 internal ——
+                    // 所以只能 GPU 自证，这也是 VistaFroxelLocalLightParams 那条
+                    //「CPU 一个字都不猜档位」的另一半。
+                    uint wordsPerTile = raw[k_SlotLlWordsPerTile];
+
+                    sb.AppendLine($"{Mark(clusterVariant)}判据(a2) 变体层：编译进来的是 "
+                                + $"USE_CLUSTER_LIGHT_LOOP {(clusterVariant ? "变体" : "的 **#else 桩**")}"
+                                + $"（flags = 0x{llFlags:X}）");
+                    if (!clusterVariant)
+                        sb.AppendLine("  ⚠ 走的是桩 ⇒ **一盏局部灯都不参与介质，而且不报错**。"
+                                    + "成因：管线资产的 Rendering Path 不是 Forward+"
+                                    + "（ForwardLights.cs:512 是 _CLUSTER_LIGHT_LOOP 的唯一下发点）。"
+                                    + "下面 (c)(d)(e) 的读数全部来自被清零的 diag ⇒ **不可信**。");
+
+                    bool dataOk = clusterVariant && wordsPerTile > 0u;
+                    sb.AppendLine($"{(clusterVariant ? Mark(dataOk) : "ⓘ ")}判据(a3) 数据层："
+                                + $"URP_FP_WORDS_PER_TILE = {wordsPerTile}"
+                                + $"，TILE_COUNT_X = {raw[k_SlotLlTileCountX]}"
+                                + $"，ZBIN_COUNT = {raw[k_SlotLlZBinCount]}"
+                                + $"，DIRECTIONAL_LIGHTS_COUNT = {raw[k_SlotLlDirCount]}"
+                                + $"，PROBES_BEGIN（= 局部灯数）= {raw[k_SlotLlProbesBegin]}");
+                    if (clusterVariant && !dataOk)
+                        sb.AppendLine("  ⚠ 变体选中了但 cluster cbuffer 是空的 ⇒ urp_ZBins/urp_Tiles 从没被写过。"
+                                    + "cbuffer 越界/未初始化在 D3D11 上都返回 0，于是"
+                                    + "「一盏灯都没有」与「灯都被剔掉了」在画面上完全一样。");
+                    sb.AppendLine("  ⓘ PROBES_BEGIN 是 compute 里**唯一**可用的局部灯数"
+                                + "（Clustering.hlsl:84 与 GlobalIllumination.hlsl:297 两处交叉证明）。"
+                                + "_AdditionalLightsCount **不是** —— ForwardLights.cs:731 上传的是"
+                                + " maxPerObjectAdditionalLightsCount，读端还要与逐 draw 的 unity_LightData.y 取 min。"
+                                + "所以连 A3 暴力档也必须挂在 USE_CLUSTER_LIGHT_LOOP 下面："
+                                + "没有 cluster 结构时，连「一共有几盏局部灯」都问不出来。");
+
+                    // -------------------------------------------------------- 判据(b) 引擎逐相机全局
+                    // ClusterInit 依赖三个 Unity **内置**逐相机全局：
+                    //   GetCameraPositionWS()     = _WorldSpaceCameraPos
+                    //   GetViewForwardDir()       = -UNITY_MATRIX_V[2].xyz（unity_MatrixV）
+                    //   IsPerspectiveProjection() = unity_OrthoParams.w == 0
+                    // 整个 URP + core 包里没有任何 .compute 碰过这三个（grep 过），Vista 是第一个 ——
+                    // 「compute 里到底绑不绑」这件事只能实测，不能推理。
+                    //
+                    // 代理点技巧（FroxelLocalLights.hlsl）把正确性条件收缩成 dot(gFwd, gFwd) == 1：
+                    // 前向**指向哪儿**不影响 zbin 结果，相机位置的偏差也变成无害。
+                    // 所以这里只有两道门（长度、ortho），相机漂移那一格明确标 ⓘ 不设门。
+                    {
+                        bool  fwdMinInit = raw[k_SlotLlFwdLenMin] == uint.MaxValue;
+                        float fwdMin = fwdMinInit ? 0f : raw[k_SlotLlFwdLenMin] / k_LlFwdLenScale;
+                        float fwdMax = raw[k_SlotLlFwdLenMax] / k_LlFwdLenScale;
+                        float orthoW = raw[k_SlotLlOrthoW] / k_LlOrthoScale;
+
+                        bool fwdOk = !fwdMinInit
+                                   && Mathf.Abs(fwdMin - 1f) <= k_LlFwdLenTol
+                                   && Mathf.Abs(fwdMax - 1f) <= k_LlFwdLenTol;
+                        bool orthoOk = orthoW <= k_LlOrthoGate;
+
+                        sb.AppendLine($"{Mark(fwdOk && orthoOk)}判据(b) 引擎逐相机全局在 compute 里可用："
+                                    + $"|GetViewForwardDir()| ∈ [{(fwdMinInit ? "未写" : Sci(fwdMin))}, {Sci(fwdMax)}]"
+                                    + $"，门 |len − 1| ≤ {Sci(k_LlFwdLenTol)}"
+                                    + $"；|unity_OrthoParams.w| = {Sci(orthoW)}，门 ≤ {Sci(k_LlOrthoGate)}");
+                        sb.AppendLine("  ⓘ 为什么判**长度**而不是逐分量对 _VistaFroxelViewForward："
+                                    + "代理点技巧把正确性条件收缩成 dot(gFwd,gFwd) == 1 —— "
+                                    + "代理点 = 引擎自己的相机位置 + viewZ × 引擎自己的前向，"
+                                    + "URP 的公式再算一遍恰好还原 viewZ × |gFwd|²。"
+                                    + "逐分量门会把一堆**正确**的配置判红（两个前向本来允许不同），"
+                                    + "而这条路径一点 URP 的 zbin 算术都没有复刻。");
+                        if (fwdMinInit)
+                            sb.AppendLine("  ⚠ MIN 槽仍是初值 ⇒ 那次 InterlockedMin 一次都没落地。"
+                                        + "**先查** VistaFroxelVolume.k_ShadowProbeMinSlots 里有没有登记 89 号："
+                                        + "漏登记时这一格恒读 0，而 0 **正好**是本格要抓的那个红"
+                                        + "（前向长度 0 = 全局没绑）⇒ 尺子会自己伪造一个失败。");
+                        else if (!fwdOk)
+                            sb.AppendLine("  ⚠ 前向不是单位向量 ⇒ 代理点技巧的唯一前提破了，"
+                                        + "ClusterInit 算出的 viewZ 整体缩放 ⇒ zbin 下标错位。"
+                                        + "读到 ≈ 0 就是「unity_MatrixV 在 compute 里没绑」——"
+                                        + "那意味着 A1 这条路在 URP 里走不通，要退到自己重算 tile/zbin"
+                                        + "（那会引入 URP 内部公式的第二份实现，代价必须写进 CHANGELOG）。");
+                        if (!orthoOk)
+                            sb.AppendLine("  ⚠ unity_OrthoParams.w 非 0 ⇒ ClusterInit 走**线性** z-binning "
+                                        + "而不是 log ⇒ 下标整体错位，症状是「灯在某些深度上突然不贡献了」。"
+                                        + "这是「一个只在另一种配置下才被下发的引擎全局，"
+                                        + "在你的档位下读到的是别的相机留下的脏值」的实例。");
+
+                        sb.AppendLine($"  ⓘ 不设门（纯归因）：|_WorldSpaceCameraPos − _VistaFroxelCameraWS| = "
+                                    + $"{raw[k_SlotLlCamDriftMm]} mm。代理点技巧让它变得无害，"
+                                    + "所以它**不该**是一道门；留着是因为真出问题时它会是米级的。");
+                    }
+
+                    if (!clusterVariant)
+                    {
+                        sb.AppendLine("ⓘ 判据(c)(d)(e) **未覆盖**：(a2) 是红的 ⇒ diag 全部来自 #else 的桩（恒零），"
+                                    + "拿它们判定只会全绿。「把『这一格依赖另一格才能给出正确因果』在报表里点名」。");
+                    }
+                    else
+                    {
+                        // ---------------------------------------------------- 判据(c) zbin 近端钳位
+                        // 推导（ForwardLights.cs:199-271 / 358 / 429-430，逐字复核过）：
+                        //   zBinScale  = (maxZBinWords/viewCount) /
+                        //                ((log2(far) − log2(near))·(2 + wordsPerTile))
+                        //   zBinOffset = −log2(near)·zBinScale
+                        // 且调用方传的是 camera.nearClipPlane / farClipPlane ⇒
+                        // **zbin 下标 0 正好落在 camera.nearClipPlane 上**。
+                        // viewZ < cameraNear ⇒ 负下标 ⇒ (uint) 转换 + min() 会落到**最后**一个 bin
+                        // ⇒ 近处的灯被静默丢掉。
+                        //
+                        // 这条在本布景里是**每帧都被踩到**的：froxel 切片 0 的求值点是度量中点
+                        // 0.5·d₀ ≈ 0.156 m < camNear 0.30 m。所以 NEAR_PRE 的门是**反的** ——
+                        // 它必须 > 0；读到 0 说明尺子没执行（或切片分布被改过），
+                        // 而不是说明「没有问题」。
+                        //
+                        // 对称的「钳后计数」被**故意删掉**了：验证 max(x, camNear) ≥ camNear
+                        // 是拿一个函数自己的输出证明它自己，那道门造不出失败。
+                        // 能失败的是 camNear 本身为 0（全局没下发）。
+                        //
+                        // 同样被故意删掉的是「URP zbin 下标镜像」：算那个下标要复刻
+                        // log2(viewZ)·ZBIN_SCALE + ZBIN_OFFSET，那是同一个量的第二份实现，
+                        // 会在 URP 改公式的那天静默变陈旧。换成钳后 viewZ（毫米）。
+                        {
+                            uint  nearPre = raw[k_SlotLlNearPre];
+                            uint  nonPos  = raw[k_SlotLlViewZNonPos];
+                            float camNear = raw[k_SlotLlCamNear] / k_LlNearScale;
+                            bool  vzMinInit = raw[k_SlotLlViewZMin] == uint.MaxValue;
+
+                            bool nearOk = nearPre > 0u && camNear > 0f && nonPos == 0u;
+                            sb.AppendLine($"{Mark(nearOk)}判据(c) zbin 近端钳位："
+                                        + $"**钳前** viewZ < camNear 的点数 = {nearPre}"
+                                        + $"（门是**反的**：必须 > 0）"
+                                        + $"；下发的 camNear = {camNear:F4} m（门 > 0）"
+                                        + $"；viewZ ≤ 0 的点数 = {nonPos}（门 == 0）");
+                            sb.AppendLine("  ⓘ 反门的推导：切片 0 的求值点是度量中点 0.5·d₀ = "
+                                        + (volume.allocatedDesc.HasValue
+                                            ? $"{volume.allocatedDesc.Value.SampleDistance(0):F3} m"
+                                            : "?")
+                                        + $"，而相机近裁剪面 = {cam.nearClipPlane:F3} m"
+                                        + " ⇒ 这条钳位路径**每帧都被走到**。读到 0 不是「没问题」，"
+                                        + "是「尺子没执行」或「切片分布被改过」——"
+                                        + "「读数接近 0 的档位无法自证自己执行过」。");
+                            sb.AppendLine("  ⓘ 钳位方式是**保守放宽** max(viewZ, camNear)：zbin 0 里装的灯"
+                                        + "是「真正影响 0.156 m 处的灯」的**超集**，只会多枚举、不会漏 —— "
+                                        + "而多枚举由判据(d) 兜住（它判的是 miss，不是 count 相等）。");
+                            sb.AppendLine($"  ⓘ 不设门（归因）：**钳后** viewZ ∈ ["
+                                        + (vzMinInit ? "未写"
+                                                     : $"{raw[k_SlotLlViewZMin] / k_LlViewZMmScale:F3}")
+                                        + $", {raw[k_SlotLlViewZMax] / k_LlViewZMmScale:F3}] m"
+                                        + $"；viewZ > cameraFar 的点数 = {raw[k_SlotLlFarOver]}"
+                                        + "（远端夹到最后一个 bin 是 URP 自己的设计意图，无害，所以不设门）。");
+                            if (vzMinInit)
+                                sb.AppendLine("  ⚠ 钳后 viewZ 的 MIN 槽仍是初值。这一格与 89 号**不同**："
+                                            + "钳后 viewZ 恒 ≥ camNear > 0，所以 0 不是合法读数，"
+                                            + "漏登记只会印出一个明显不成立的 ⓘ，不会伪造结论。"
+                                            + "但仍要修 —— 一个静默读 0 的 ⓘ 等于没有归因。");
+                        }
+
+                        // ---------------------------------------------------- 判据(d) 超集性
+                        // #23 的**定义性**判据，也是 A3 暴力档存在的全部理由：
+                        // cluster 给出的灯集合必须是「真正影响该 froxel 的灯集合」的**超集**。
+                        //
+                        // 为什么比**集合**而不是比辐亮度：一道辐亮度阈值会同时吸收
+                        // ①fp32 求和次序差异（无害）与 ②一盏暗灯被真的漏掉（有害），
+                        // 而两者的量级可以重叠 ——「拿两个上界做相对比较」的近亲。
+                        // 集合比较没有阈值：CULL_MISS 必须**恰好** 0。
+                        //
+                        // 两档跑在**同一个** VistaFroxelSampleAt 点上（那个函数被抽出来就是为了这个）：
+                        // 若采样点有第二份实现，CULL_MISS 会因为一个与剔除无关的理由变非零。
+                        {
+                            uint localLights = raw[k_SlotLlProbesBegin];
+                            uint cullMiss = raw[k_SlotLlCullMiss];
+                            uint clusterN = raw[k_SlotLlClusterN];
+                            uint bruteN   = raw[k_SlotLlBruteN];
+
+                            if (localLights == 0u)
+                            {
+                                sb.AppendLine("ⓘ 判据(d)(e) **未覆盖**：场景里一盏局部灯都没有"
+                                            + "（URP_FP_PROBES_BEGIN = 0）⇒ 两档都枚举 0 盏，"
+                                            + "CULL_MISS 会以 0 == 0 全绿。这是空判据，不是通过。");
+                                sb.AppendLine("  要跑：往相机前方 5~20 m 放一盏 Point 或 Spot 灯，"
+                                            + "强度按 candela 量级填（路灯 ≈ 10⁴），Range 伸进雾里；"
+                                            + "要覆盖 (e1) 还得让它 Cast Shadows、并在灯与相机之间放一块遮挡物。");
+                            }
+                            else
+                            {
+                                bool supersetOk = cullMiss == 0u;
+                                sb.AppendLine($"{Mark(supersetOk)}判据(d) 超集性（**定义性**，无阈值）："
+                                            + "暴力档判定「影响本 froxel」而 cluster 档没枚举到的灯次数 = "
+                                            + $"{cullMiss}，门 == 0");
+                                sb.AppendLine($"  ⓘ 不设门：枚举总次数 cluster {clusterN} / 暴力 {bruteN}"
+                                            + $"（{llCount} 个探针点 × {localLights} 盏灯 ⇒ 暴力上限 "
+                                            + $"{(ulong)llCount * localLights}）。"
+                                            + "cluster < 暴力是**正常的**（剔除在干活）；"
+                                            + "cluster > 暴力也正常（zbin 近端保守放宽）。"
+                                            + "所以这两个数**不能**用来判定，只能归因。");
+                                sb.AppendLine($"  ⓘ 不设门：两档辐亮度的最大相对差 = "
+                                            + $"{Sci(raw[k_SlotLlAbRelDiff] / k_LlAbRelScale)}。"
+                                            + "它**不是**判据 —— 求和次序不同时 fp32 就会给出不同的末几位"
+                                            + "（「同一个多重集合、旋转求和次序，不等于逐位相同」），"
+                                            + "摆一道门就会把「次序差异」与「漏了一盏暗灯」混成一格。"
+                                            + "留它是为了在 (d) 红掉之后知道漏的那盏有多亮。");
+                                if (!supersetOk)
+                                    sb.AppendLine("  ⚠ 超集性破了 ⇒ cluster 剔除在漏灯。归因顺序："
+                                                + "①(b) 的前向长度（代理点的唯一前提）；"
+                                                + "②(c) 的钳前计数（近端有没有真的走到钳位路径）；"
+                                                + "③屏幕 uv 的 clamp（VISTA_LL_UV_EPS）—— "
+                                                + "ClusterInit 里 uint2(uv * TILE_SCALE) 遇到负 uv 会绕成天文数字下标，"
+                                                + "而 D3D11 上越界 cbuffer 读返回 0 ⇒ 画面边缘静默无灯。");
+
+                                // ------------------------------------------ 判据(e) 两个开关的覆盖
+                                uint  shadowedN  = raw[k_SlotLlShadowedN];
+                                uint  layerSkipN = raw[k_SlotLlLayerSkipN];
+                                float radMax     = raw[k_SlotLlRadianceMax] / k_LlRadianceScale;
+
+                                // 阴影这一档的**期望**来自 settings + 关键字两者的合成，
+                                // **读数**来自核里实际调了哪个 GetAdditionalLight 重载 ⇒ 不是自证。
+                                bool shadowExpected = settings.localLightShadows && addlShadowKw;
+                                bool shadowOk = !shadowExpected || shadowedN > 0u;
+                                sb.AppendLine($"{(shadowExpected ? Mark(shadowOk) : "ⓘ ")}判据(e1) 局部灯阴影"
+                                            + $"（B2，1 tap）：旋钮 = {settings.localLightShadows}"
+                                            + $"，_ADDITIONAL_LIGHT_SHADOWS = {addlShadowKw}"
+                                            + $"，实测被遮挡（shadowAttenuation < 1）的灯次数 = {shadowedN}");
+                                if (!shadowExpected)
+                                    sb.AppendLine("  ⓘ 未覆盖：旋钮关着，或关键字没开 —— 后者由 "
+                                                + "AdditionalLightsShadowCasterPass.cs:828 决定，"
+                                                + "场景里没有投影的点/聚光灯时它就是关的。"
+                                                + "此时核里一次阴影采样都不发，shadowedN 恒 0，"
+                                                + "**不是**「阴影算错了」。");
+                                else if (!shadowOk)
+                                    sb.AppendLine("  ⚠ 关键字与旋钮都开着，却一次遮挡都没量到。两种成因："
+                                                + "①布景里灯与探针点之间没有遮挡物（改布景）；"
+                                                + "②_AdditionalShadowParams.w（perLightFirstShadowSliceIndex）恒为 −1"
+                                                + " ⇒ AdditionalLightRealtimeShadow 直接 return 1.0（Shadows.hlsl:396）。");
+                                sb.AppendLine("  ⓘ 复用而非重写：B2 直接调 3 参数的 "
+                                            + "GetAdditionalLight(i, posWS, shadowMask)（RealtimeLights.hlsl:234），"
+                                            + "shadowMask 填 half4(1,1,1,1) —— 没声明 CALCULATE_BAKED_SHADOWS 时 "
+                                            + "MixRealtimeAndBakedShadows 退化成 lerp(rt, 1, fade)，那正是想要的。"
+                                            + "不声明任何 _SHADOWS_SOFT* ⇒ SampleShadowmap 落到裸 "
+                                            + "SAMPLE_TEXTURE2D_SHADOW 分支，字面就是「1 tap」。"
+                                            + "旋钮关掉这一档只是换调 2 参数重载，不是另写一条路。");
+                                sb.AppendLine("  ⓘ 已知不可靠、故意不读：_AdditionalShadowmapSize 只在 "
+                                            + "if (softShadows) 里上传（AdditionalLightsShadowCasterPass.cs:875）"
+                                            + " —— 与 _MainLightShadowmapSize 同一个坑。硬阴影档下它是脏值。");
+
+                                var llParams = VistaFroxelLocalLightParams.Resolve(
+                                    cam, settings, lightLayersKw, addlShadowKw);
+                                bool layerExpected = lightLayersKw
+                                                  && settings.ResolveLocalLightLayerMask() != uint.MaxValue;
+                                bool layerOk = !layerExpected || layerSkipN > 0u;
+                                sb.AppendLine($"{(layerExpected ? Mark(layerOk) : "ⓘ ")}判据(e2) 逐灯开关"
+                                            + $"（渲染层遮罩）：_LIGHT_LAYERS = {lightLayersKw}"
+                                            + $"，收敛后遮罩 = 0x{llParams.layerMask:X8}"
+                                            + $"，实测被遮罩跳过的灯次数 = {layerSkipN}");
+                                if (llParams.layerMaskIgnored)
+                                    sb.AppendLine("  ⚠ 美术填的遮罩被**忽略**了：_LIGHT_LAYERS 关着 ⇒ "
+                                                + "过滤整段编译掉。这不是偷懒 —— "
+                                                + "GetAdditionalPerObjectLight 无条件读 _AdditionalLightsLayerMasks"
+                                                + "（RealtimeLights.hlsl:148-232），而 URP 只在 supportsLightLayers 时"
+                                                + "才上传那个数组 ⇒ 关掉时 light.layerMask 里是别的相机留下的脏 cbuffer 字节，"
+                                                + "拿它过滤等于随机丢灯。要开：管线资产 ▸ Rendering ▸ Rendering Layers。"
+                                                + "不开就是「一个选了什么都不发生的枚举值」。");
+                                else if (!layerExpected && layerSkipN == 0u)
+                                    sb.AppendLine("  ⓘ 未覆盖：遮罩是全 1（所有灯都参与）且没有一盏灯的 "
+                                                + "Rendering Layers 是 Nothing ⇒ 跳过分支没被走到。这是空判据，不是通过。"
+                                                + "要覆盖：把某盏灯的 Rendering Layers 移出上面那个遮罩"
+                                                + "（或干脆设成 Nothing —— 0 与任何遮罩相交都是空）。");
+                                else if (!layerExpected)
+                                    sb.AppendLine("  ⓘ 跳过分支**执行过**：Vista 侧遮罩虽是全 1，但有灯自己的 "
+                                                + "Rendering Layers 是 Nothing（0 与任何遮罩相交都是空）。"
+                                                + "IsMatchingLightLayer 的两个操作数各有一条归零路，"
+                                                + "这条读数覆盖的是灯那一侧。");
+                                else if (!layerOk)
+                                    sb.AppendLine("  ⚠ 遮罩不是全 1、关键字也开着，却一盏灯都没被跳过 ⇒ 过滤没生效。"
+                                                + "查 IsMatchingLightLayer（CommonLighting.hlsl:550）的两个操作数："
+                                                + "light.layerMask 来自 URP 的 asfloat 位模式；"
+                                                + "Vista 这一侧走 16 位对半拆分再重组"
+                                                + "（asfloat(1) 是非规格化数、asfloat(0xFFFFFFFF) 是 NaN，"
+                                                + "整个塞进 SetGlobalVector 不安全）。");
+
+                                sb.AppendLine($"  ⓘ 不设门：局部灯源项的最大亮度 = {Sci(radMax)} cd/m²/km"
+                                            + "（预曝光**前**）。定点上限 4e9 / 1e6 = 4e3 ⇒ "
+                                            + "浓雾里这是一个**上界**而不是实测值（照「把 sub-resolution 读数报成上界」那条）。"
+                                            + "晴空里它会掉到 1e-6 量级，那是**物理正确**的："
+                                            + "σ_s,Rayleigh ≈ 5.8e-3/km、σ_s,Mie ≈ 4.0e-3/km，"
+                                            + "而能见度 200 m 的雾是 σ_t = 3912/200 = 19.56/km —— 差约 2000 倍，"
+                                            + "64 m 上的晴空光学厚度只有 ~6.4e-4。"
+                                            + "UE5/HDRP 干脆只让 punctual light 与雾介质散射；"
+                                            + "Vista 三个介质都算，是因为系数本来就在手里，"
+                                            + "而「晴空里看不见光锥」应该是物理的**结果**，不是一行 if。");
+                                sb.AppendLine("  ⓘ 已推迟（写下理由，不是忘了）："
+                                            + "①UE5 那种逐灯**连续**的 VolumetricScatteringIntensity —— "
+                                            + "它要 CPU 复刻 URP 的 additional-light 打包次序"
+                                            + "（ForwardLights.cs:697-724：主光剔掉之后的第 k 盏），"
+                                            + "那是引擎内部不变量的第二份实现，失败模式是"
+                                            + "「旋钮作用在了另一盏灯上」；而层遮罩这条路的下标是 URP "
+                                            + "**同一个**下标给的 ⇒ 零映射、零新组件、零漂移。"
+                                            + "②light cookie（不声明 _LIGHT_COOKIES 就是零成本编译掉）。"
+                                            + "③移动端那条经典 Forward（没有 cluster 结构）⇒ 推到 #26，"
+                                            + "与屏幕空间光轴一起。");
+                            }
+                        }
                     }
                 }
             }

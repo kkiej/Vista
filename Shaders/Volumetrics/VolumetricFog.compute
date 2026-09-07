@@ -2,8 +2,9 @@
 //  近层体积雾（Step 3 档 A）
 //
 //  #19 交付「资源 + 分布 + 判据」，#20 交付逐 froxel 的光照注入，#21 交付深度积分，
-//  #22a 交付抖动 + 时间重投影，#22b 交付蓝噪声源与横向形态的两档对照。
-//  九个核：
+//  #22a 交付抖动 + 时间重投影，#22b 交付蓝噪声源与横向形态的两档对照，
+//  #23 交付局部灯（点光/聚光/副平行光）参与介质散射。
+//  十个核：
 //    FroxelPlaceholder   把切片几何写进注入表 —— 它**不是**雾，是一份能被读回来对账的
 //                        已知内容。存在的理由是「RWTexture3D 绑定失败」这个坑：
 //                        RTHandle 的 2D 便捷重载会静默建成 Tex2D，症状只有 Editor.log
@@ -23,6 +24,10 @@
 //    FroxelJitterProbe   #22b 判据的探针：抖动源的直方图/矩/邻域相关，以及
 //                        「逐列聚合偏移」在两个横向形态档下的对照。它**一张表都不读**，
 //                        因为抖动偏移是下标的纯函数。
+//    FroxelLocalLightProbe #23 判据的探针：在**同一个采样点**上把 cluster 档与暴力参考档
+//                        各跑一遍再比灯集合位图（超集判据），并把 URP 的 cluster 元数据、
+//                        三个引擎内建全局的哨兵、以及近/远端钳位的命中次数搬进探针 buffer。
+//                        「同一个点」是那条超集判据成立的全部前提，所以它不能拆成两次派发。
 //
 //  #22a 之后 VistaFogSettings.Mode 里**仍然没有** Froxel 档 ——
 //  一个选了什么都不发生的枚举值等于把哑档位摆给美术，而把积分结果贴到画面上是 #25。
@@ -39,6 +44,7 @@
 #pragma kernel FroxelIntegralVerify
 #pragma kernel FroxelReprojProbe
 #pragma kernel FroxelJitterProbe
+#pragma kernel FroxelLocalLightProbe
 
 // 与大气那批核同一条排除线：GLES 没有 RWTexture3D，编译只会产出一堆噪声。
 #pragma only_renderers d3d11 vulkan metal playstation xboxone xboxseries switch
@@ -60,6 +66,39 @@
 //    这两条都由 FroxelShadowProbe 把编译期状态读回来点名。
 #pragma multi_compile _ _MAIN_LIGHT_SHADOWS_CASCADE
 
+// ---------------------------------------------------------------- 局部灯关键字（#23）
+//  三个，全部是 URP 的 **GlobalKeyword**（不是 shader keyword），所以 compute 也吃得到 ——
+//  与上面那个级联关键字同一条路。
+//
+//  · _CLUSTER_LIGHT_LOOP —— Forward+ 的总闸。URP 侧 `ShaderGlobalKeywords.ClusterLightLoop`
+//    （UniversalRenderPipelineCore.cs:1120）在 ForwardLights.cs:512 按 m_UseForwardPlus 下发。
+//    Clustering.hlsl **整个文件**都包在 `#if USE_CLUSTER_LIGHT_LOOP` 里
+//    （Core.hlsl:13-17 由这个关键字定义那个宏），Input.hlsl 里的 `_FPParams*` 与全部
+//    `URP_FP_*` 解码宏也一样。漏声明的降级是**编译期**就没有 ClusterInit 可调，
+//    所以 FroxelLocalLights.hlsl 的 #else 分支恒返回 0 —— 症状是「雾里一盏局部灯都没有」。
+//    这条**必须**由探针把「当前跑的是哪个变体」读回来点名（判据(a) 第一层），
+//    否则它与「场景里真的没灯」长得一样。
+//  · _ADDITIONAL_LIGHT_SHADOWS —— `Shadows.hlsl:22-24` 用它定义
+//    ADDITIONAL_LIGHT_CALCULATE_SHADOWS，缺了 AdditionalLightRealtimeShadow 直接 return 1.0。
+//    在 AdditionalLightsShadowCasterPass.cs:828 下发。
+//    漏声明的降级是「局部灯的光锥穿墙」—— 可归因，但探针照样点名（判据(a) 第三层）。
+//  · _LIGHT_LAYERS —— 逐灯的体积散射开关靠渲染层遮罩实现，而
+//    `_AdditionalLightsLayerMasks` 只在 lightData.supportsLightLayers 时才被下发
+//    （ForwardLights.cs:624/654/727）。关键字关掉时 light.layerMask 里装的是脏值，
+//    所以过滤必须跟着关键字一起在编译期消失。判据(e) 会把这一档标成**未覆盖**。
+//
+//  **不**声明的两个，理由与上面那段同构：
+//  · _SHADOWS_SOFT* —— 不声明时 SampleShadowmap 落到裸的
+//    SAMPLE_TEXTURE2D_SHADOW，也就是 1 tap，与主光那一档一致。
+//    顺带避开一个坑：`_AdditionalShadowmapSize` **只在软阴影档才被下发**
+//    （AdditionalLightsShadowCasterPass.cs:875，与 `_MainLightShadowmapSize` 同一个毛病），
+//    1 tap 用不到它，也**不要**去读它 —— 读到的会是别的相机留下的脏值。
+//  · _LIGHT_COOKIES —— 不声明时 GetAdditionalLight 里那一段 cookie 采样整段编译掉，
+//    零代价。灯罩投影到体积雾上推迟（见 FroxelLocalLights.hlsl 的取舍段）。
+#pragma multi_compile _ _CLUSTER_LIGHT_LOOP
+#pragma multi_compile _ _ADDITIONAL_LIGHT_SHADOWS
+#pragma multi_compile _ _LIGHT_LAYERS
+
 // Shadows.hlsl 自己 include 了 Core.hlsl 与 core 的 Common.hlsl，所以放在最前面。
 #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Shadows.hlsl"
 #include "Packages/com.kkiej.vista/ShaderLibrary/AtmosphereDef.hlsl"
@@ -67,6 +106,8 @@
 #include "Packages/com.kkiej.vista/ShaderLibrary/AerialPerspective.hlsl"
 #include "Packages/com.kkiej.vista/ShaderLibrary/SphericalHarmonics.hlsl"
 #include "Packages/com.kkiej.vista/ShaderLibrary/FroxelVolume.hlsl"
+// 它自己会把 URP 的 RealtimeLights.hlsl（→ Clustering / Input / LightCookie）带进来。
+#include "Packages/com.kkiej.vista/ShaderLibrary/FroxelLocalLights.hlsl"
 
 RW_TEXTURE3D(float4, _VistaFroxelInjectionRW);
 
@@ -327,19 +368,47 @@ float3 VistaFroxelCentreWS(uint3 id)
 //  给出一条视锥外半格的合法射线 —— 那正好是那个 froxel 真正覆盖的范围。
 //  夹紧反而会把边缘那一列的期望往画面内侧拉，症状是画面四边一圈雾偏浓。
 // ----------------------------------------------------------------------------
-float4 VistaFroxelInject(float2 pixelCenter, float slice)
+// ----------------------------------------------------------------------------
+//  一个 froxel 的采样点 + 该点的介质（#23 从 VistaFroxelInject 里切出来的）
+//
+//  ---- 为什么要切这一刀 ----
+//  局部灯的判据(d) 要在**同一个点**上把 cluster 档与暴力参考档跑一遍再比集合，
+//  所以判据核必须能拿到「(id) → (uv, rayDir, posWS, σ_s, g)」这一整条映射。
+//  不切的话判据核得自己再写一遍那六行 —— 而这正是「同一个量的第二份实现」：
+//  两边只要有一处（比如 posWS 用了 km 那一支反算，或者 fog 采样传错 rayDir.y）
+//  对不上，判据比较的就是两个不同点上的灯集合，症状是 LL_CULL_MISS 无缘无故非零，
+//  而真正的 cluster 逻辑是对的。
+//
+//  代价点名：结构体里 posKm / tKm / dMeters 三个字段线上路径只在本函数内用到，
+//  返回出去是白搬。它们留着是因为判据要 posKm（重算大气位置就又是一份实现），
+//  而 HLSL 侧一个从不被读的字段会被编译器整段消掉 —— 线上没有代价。
+// ----------------------------------------------------------------------------
+struct VistaFroxelSample
 {
-    float2 uv     = VistaFroxelPixelToUv(pixelCenter);
-    float3 rayDir = VistaApFroxelRayDirection(uv);
+    float2 uv;          // 屏幕 uv（含横向抖动）
+    float3 rayDir;      // 世界空间射线方向（单位）
+    float3 posWS;       // 世界空间位置（m）—— 阴影与 cluster 都用这一支
+    float3 posKm;       // 大气空间位置（km）—— 介质剖面用这一支
+    float  dMeters;     // 沿射线的距离（m）
+    float  tKm;         // 同一个距离的 km 版本
+    VistaFogSample     fog;
+    VistaScatterSample smp;   // 含太阳那一项、σ_s 分量与 σ_t
+};
 
-    float dMeters = VistaFroxelSampleDistance(slice);
-    float tKm     = dMeters * _VistaGround.w;   // 0.001，与 AP 同一个 CPU 下发的缩放
+VistaFroxelSample VistaFroxelSampleAt(float2 pixelCenter, float slice)
+{
+    VistaFroxelSample o;
+
+    o.uv      = VistaFroxelPixelToUv(pixelCenter);
+    o.rayDir  = VistaApFroxelRayDirection(o.uv);
+    o.dMeters = VistaFroxelSampleDistance(slice);
+    o.tKm     = o.dMeters * _VistaGround.w;   // 0.001，与 AP 同一个 CPU 下发的缩放
 
     // 大气空间的位置用 km（介质剖面按 r − bottomRadius 取），世界空间的位置用 m
     // （阴影矩阵是世界空间的）。两者不能互推：km 那一支在 6360 km 量级上 ulp 0.49 m，
     // 拿它反算世界位置会让阴影坐标按半米量化，症状是光柱边缘随相机移动跳格。
-    float3 posKm = _VistaViewPosKm.xyz            + tKm     * rayDir;
-    float3 posWS = _VistaFroxelCameraWS.xyz       + dMeters * rayDir;
+    o.posKm = _VistaViewPosKm.xyz      + o.tKm     * o.rayDir;
+    o.posWS = _VistaFroxelCameraWS.xyz + o.dMeters * o.rayDir;
 
     VistaRaymarchSettings s = VistaDefaultRaymarchSettings();
     s.applyPhase          = true;
@@ -353,10 +422,31 @@ float4 VistaFroxelInject(float2 pixelCenter, float slice)
     // includeFog 与本核无关：它只门住 VistaIntegrateScatteredLuminance 内部的取雾，
     // 而我们自己取雾、自己调逐点函数。留在默认 false 上，避免读者以为它有作用。
 
-    VistaFogSample fog = VistaSampleFogAlongRay(tKm, rayDir.y);
+    o.fog = VistaSampleFogAlongRay(o.tKm, o.rayDir.y);
+    o.smp = VistaEvaluateScatterSample(
+        o.posKm, o.rayDir, _VistaSunDirection.xyz, o.fog, s, VistaFroxelSunShadow(o.posWS));
 
-    VistaScatterSample smp = VistaEvaluateScatterSample(
-        posKm, rayDir, _VistaSunDirection.xyz, fog, s, VistaFroxelSunShadow(posWS));
+    return o;
+}
+
+float4 VistaFroxelInject(float2 pixelCenter, float slice)
+{
+    VistaFroxelSample fs = VistaFroxelSampleAt(pixelCenter, slice);
+
+    // ---- 局部灯（#23）----
+    // 加在**曝光之前**，与太阳那一项走同一次 × VISTA_EXPOSURE：
+    // 两项都是 σ_s·J（cd/m²/km 量纲），分开乘曝光就是同一个常数的第二份实现，
+    // 而它的失败模式是「局部灯的亮度与太阳差一个曝光系数」—— 在夜景里看起来像
+    // 一个调错了的强度值，不像接线错。
+    //
+    // 介质从已有的两次采样装配（见 VistaLocalLightMediumFrom）：这一点的
+    // σ_s / g 在整个核里只有一份真相。
+    //
+    // diag 在这里是丢掉的：所有的写都是死代码，编译器会连位图的八个选择一起消掉。
+    // 判据探针（FroxelLocalLightProbe）拿的是同一个函数，只是把 diag 读出来。
+    VistaLocalLightDiag llDiag = VistaLocalLightDiagInit();
+    float3 scattered = fs.smp.scattered + VistaAccumulateLocalLights(
+        fs.uv, fs.posWS, fs.rayDir, VistaLocalLightMediumFrom(fs.smp, fs.fog), llDiag);
 
     // ---- 存什么 ----
     //  rgb: 散射源项 σ_s·J，**预曝光**（× VISTA_EXPOSURE）。与 AP LUT 同一条约定，
@@ -378,8 +468,8 @@ float4 VistaFroxelInject(float2 pixelCenter, float slice)
     //  注意：这里的 σ_t **含大气**（Rayleigh + Mie + 臭氧），不只有雾。
     //  D = 500 m 时蓝光的大气 τ 是 16.6e-3 = 1.66%，已经越过 1% 的门 ——
     //  近层体只算雾、把大气整段留给 AP 是不成立的。
-    float greyExtinction = dot(smp.extinction, (1.0 / 3.0).xxx);
-    return float4(smp.scattered * VISTA_EXPOSURE, greyExtinction);
+    float greyExtinction = dot(fs.smp.extinction, (1.0 / 3.0).xxx);
+    return float4(scattered * VISTA_EXPOSURE, greyExtinction);
 }
 
 // ----------------------------------------------------------------------------
@@ -735,6 +825,94 @@ void FroxelIntegralVerify(uint3 id : SV_DispatchThreadID)
 #define VISTA_PROBE_BN_WIDTH       80u
 #define VISTA_PROBE_BN_HEIGHT      81u
 
+// ============================================================================
+//  #23 局部灯参与介质：槽位 82~105（24 格）
+//
+//  ---- 这一组要回答的五个问题 ----
+//  (a) URP 的 Forward+（cluster）光照循环在**这个 compute 核里**到底成不成立？
+//      两层：① 编译期选中的变体带不带 _CLUSTER_LIGHT_LOOP（LL_FLAGS 的位 1）；
+//            ② 选中了也不代表 cbuffer 里有数据 —— Forward+ 关掉时
+//               urp_ZBins/urp_Tiles **从不被写**，读到全 0，症状是静默
+//               「一盏局部灯都没有」，与「这个场景里本来就没有点光」同貌。
+//               URP_FP_WORDS_PER_TILE（_FPParams1.w）为 0 就是「没有 cluster 数据」。
+//  (b) ClusterInit 依赖的三个**引擎内建**全局在 compute 里到底绑了没有？
+//      grep 过 URP 与 core 两个包的全部 .compute：没有一个碰
+//      _WorldSpaceCameraPos / unity_MatrixV / unity_OrthoParams ——
+//      Vista 是第一个，所以这件事只能实测，不能推。
+//      哨兵取 |GetViewForwardDir()|：代理位置那套换算的正确性条件恰好收缩成
+//      dot(gFwd,gFwd) == 1（推导见 FroxelLocalLights.hlsl），所以 min 与 max
+//      必须把 1.0 夹住。相机位置对不上则是**无害**的（代理位置把它消掉了），
+//      所以 LL_CAM_DRIFT_MM 只印，不设门。
+//  (c) froxel 片 0 的求值点恒小于相机近裁剪面这件事，钳位真的生效了没有？
+//  (d) cluster 给出的灯集合，是不是「真正影响该点的灯集合」的**超集**？
+//  (e) 逐灯开关（渲染层遮罩）这一档有没有被覆盖到？
+//
+//  ---- 为什么 (d) 判集合而不判亮度 ----
+//  剔除结构的正确性是**定义性**的：cluster 只允许多给灯（多给的那盏
+//  distanceAttenuation 会自己趋零），不允许少给。拿辐亮度之差做门就要先定一个
+//  「多小算相等」的阈值，而 fp32 求和次序不同本身就有残差 ——
+//  那个阈值会同时吸收掉「求和次序」和「真的漏了一盏很暗的灯」。
+//  集合比较没有阈值：LL_CULL_MISS 必须**恰好** 0。
+//  辐亮度之差仍然印（LL_AB_REL_DIFF），但只作归因，不设门。
+// ============================================================================
+#define VISTA_PROBE_LL_FLAGS           82u   // InterlockedOr，见 VISTA_LL_FLAG_*
+#define VISTA_PROBE_LL_COUNT           83u   // 参与统计的探针点数（判据的样本量）
+
+// URP 的 cluster 元数据。全部只在 USE_CLUSTER_LIGHT_LOOP 成立时才写 ——
+// 那些 URP_FP_* 宏本身就声明在 Input.hlsl 的 #if USE_CLUSTER_LIGHT_LOOP 里面。
+#define VISTA_PROBE_LL_WORDS_PER_TILE  84u   // 0 ⇒ 没有 cluster 数据（判据(a) 第二层）
+#define VISTA_PROBE_LL_TILE_COUNT_X    85u
+#define VISTA_PROBE_LL_ZBIN_COUNT      86u
+#define VISTA_PROBE_LL_DIR_COUNT       87u   // URP_FP_DIRECTIONAL_LIGHTS_COUNT
+#define VISTA_PROBE_LL_PROBES_BEGIN    88u   // == 局部灯数（Clustering.hlsl:84 / GI.hlsl:297）
+
+// 引擎内建全局的哨兵。×1e6。
+// LL_FWD_LEN_MIN 走 InterlockedMin（已在 VistaFroxelVolume.k_ShadowProbeMinSlots 登记）。
+#define VISTA_PROBE_LL_FWD_LEN_MIN     89u
+#define VISTA_PROBE_LL_FWD_LEN_MAX     90u
+#define VISTA_PROBE_LL_ORTHO_W         91u   // |unity_OrthoParams.w|，必须 0（否则 z 分箱走线性）
+#define VISTA_PROBE_LL_CAM_DRIFT_MM    92u   // |_WorldSpaceCameraPos − _VistaFroxelCameraWS|，ⓘ
+
+// 近/远端归因。
+#define VISTA_PROBE_LL_VIEWZ_NONPOS    93u   // 计数：viewZ ≤ 0（相机背后，log2 会给 −inf）
+#define VISTA_PROBE_LL_NEAR_PRE        94u   // 计数：**钳前** viewZ < camNear，必须 > 0（见下）
+#define VISTA_PROBE_LL_CAM_NEAR        95u   // _VistaFroxelViewForward.w ×1e6，必须 > 0
+#define VISTA_PROBE_LL_VIEWZ_MIN       96u   // **钳后** viewZ (mm)，InterlockedMin，ⓘ
+#define VISTA_PROBE_LL_VIEWZ_MAX       97u   // **钳后** viewZ (mm)，ⓘ
+#define VISTA_PROBE_LL_FAR_OVER        98u   // 计数：viewZ > cameraFar，ⓘ（URP 自己也钳，无害）
+
+// 判据(d) 的两个集合与它们的差。
+#define VISTA_PROBE_LL_CLUSTER_N       99u   // Σ cluster 档枚举到的灯数
+#define VISTA_PROBE_LL_BRUTE_N        100u   // Σ 暴力档判定「影响该点」的灯数
+#define VISTA_PROBE_LL_CULL_MISS      101u   // Σ 「暴力档有、cluster 档没有」的灯数，必须 0
+#define VISTA_PROBE_LL_AB_REL_DIFF    102u   // max 相对辐亮度差 ×1e9，ⓘ
+
+#define VISTA_PROBE_LL_RADIANCE_MAX   103u   // max 局部灯源项亮度（预曝光前）×1e6
+#define VISTA_PROBE_LL_SHADOWED_N     104u   // 计数：shadowAttenuation < 0.999 的（灯,点）对
+#define VISTA_PROBE_LL_LAYER_SKIP_N   105u   // 计数：被渲染层遮罩挡掉的（灯,点）对
+
+// 为什么 LL_NEAR_PRE 的门是「必须 > 0」而不是「必须 == 0」：
+// froxel 片 0 的求值点是 0.5·d₀（metric midpoint，实测 ≈ 0.156 m），而
+// 相机近裁剪面是 0.30 m —— 也就是说**每一帧、每一列**的最近那一片都落在
+// 相机近平面之内，钳位这条路径是**恒被走到**的。若这一格读 0，说明
+// 「钳位从没被触发」，那要么是探针没采到片 0（网格映射错了），
+// 要么是 camNear 读成了 0（下发丢了）—— 两种都是尺子坏了，不是被测量变好了。
+// 这是「一个本轮无法失败的守卫」的反面：这一格反而是「本轮必须被触发」。
+//
+// 对称的那一半（钳**后**再也不越界）没有做成计数：钳位就是一句
+// max(viewZraw, camNear)，拿它自己的输出去验它自己恒真 ——
+// 「一个自己造不出失败的判据」。真正能失败的是 camNear 本身是否 > 0
+// （LL_CAM_NEAR）：camNear 若为 0，max(x,0) 照样不越界，但 zbin 下标 0
+// 就不再落在相机近平面上，整条换算失去意义。所以门设在 LL_CAM_NEAR。
+
+// LL_FLAGS 的位。位 0「跑过」与阴影探针那组同一条理由：
+// 只靠其余三位的话，一个从未派发的核留下的全零与
+// 「Forward+ 关 + 附加阴影关 + 渲染层关」这个合法组合长得一样。
+#define VISTA_LL_FLAG_RAN              1u
+#define VISTA_LL_FLAG_CLUSTER_VARIANT  2u   // 编译期：USE_CLUSTER_LIGHT_LOOP
+#define VISTA_LL_FLAG_ADDL_SHADOW_KW   4u   // 编译期：_ADDITIONAL_LIGHT_SHADOWS
+#define VISTA_LL_FLAG_LIGHT_LAYERS_KW  8u   // 编译期：_LIGHT_LAYERS
+
 // 位 4「跑过」是必需的：只靠位 0~3 的话，一个从未派发的核留下的全零
 // 与「级联关 + 阴影图未绑 + 屏幕空间关 + 软阴影关」这个**完全合法**的组合
 // 在报表上长得一模一样。
@@ -754,8 +932,8 @@ uint VistaProbeFixed(float v, float scale)
 }
 
 // 探针网格 -> froxel 索引。取每格中心，避免只采到边界那一列。
-// 两个探针核共用这一份：网格映射写两遍的话，「换档后读数变了」会分不清是
-// 被测量变了还是两个核采到了不同的 froxel。
+// 三个探针核共用这一份（阴影 / 重投影 / 局部灯）：网格映射写两遍的话，
+// 「换档后读数变了」会分不清是被测量变了还是两个核采到了不同的 froxel。
 uint3 VistaProbeFroxelIndex(uint3 id, uint3 size)
 {
     uint3 fid = uint3(
@@ -1306,4 +1484,188 @@ void FroxelJitterProbe(uint3 id : SV_DispatchThreadID)
     VistaJitterProbeMax(VISTA_PROBE_AGG_SLC_DDIAG, abs(aSlcD - aSlc));
 
     InterlockedAdd(_VistaFroxelShadowProbeRW[VISTA_PROBE_AGG_COUNT], 1u);
+}
+
+// ============================================================================
+//  #23 局部灯判据探针（第十个核）
+//
+//  ---- 为什么要一个独立的核，而不是在注入核里顺手写几个 Interlocked ----
+//  判据(d) 的内容是「cluster 给出的灯集合 ⊇ 真正影响该点的灯集合」。
+//  线上注入核**只跑一档**（美术选的那一档），所以它拿不到另一档的集合。
+//  这个核在**同一个线程、同一个采样点**上把两档各跑一遍再比位图 ——
+//  「同一个点」这三个字是这条判据成立的全部前提，把它拆到两次派发里
+//  （或者拆到两帧里）就会引入「相机动了一点」这个第二解释。
+//
+//  ---- 为什么它是 Editor-only 的额外开销 ----
+//  暴力档要遍历全部局部灯，探针格 32×32×16 = 16384 个点 ×（灯数）次
+//  GetAdditionalLight —— 与线上一帧 138×74×64 = 653k 个 froxel 相比样本量小两个
+//  数量级，但它照样不该进出货路径。派发点在 VistaAtmospherePass 的 #if UNITY_EDITOR 里。
+//
+//  ---- 与其余两个探针核共用的东西 ----
+//  · VistaProbeFroxelIndex（网格 → froxel 下标）
+//  · VistaProbeFixed（定点编码）
+//  · _VistaFroxelShadowProbeRW（同一个报表 buffer）
+//  · VistaFroxelSampleAt（采样点 + 介质）—— 见它自己的注释：这一刀就是为本核切的。
+// ============================================================================
+
+// 定点写的两个薄封装。与⑳那两个（VistaJitterProbe*）分开写是因为缩放不同，
+// 但**不**各自再实现一遍 clamp：都过 VistaProbeFixed。
+void VistaLlProbeMax(uint slot, float v, float scale)
+{
+    uint prev;
+    InterlockedMax(_VistaFroxelShadowProbeRW[slot], VistaProbeFixed(v, scale), prev);
+}
+
+void VistaLlProbeMin(uint slot, float v, float scale)
+{
+    uint prev;
+    InterlockedMin(_VistaFroxelShadowProbeRW[slot], VistaProbeFixed(v, scale), prev);
+}
+
+void VistaLlProbeAdd(uint slot, uint v)
+{
+    if (v == 0u)
+        return;   // 省掉绝大多数线程的原子写；读数不变
+    uint prev;
+    InterlockedAdd(_VistaFroxelShadowProbeRW[slot], v, prev);
+}
+
+[numthreads(8, 8, 1)]
+void FroxelLocalLightProbe(uint3 id : SV_DispatchThreadID)
+{
+    // ---- 头部：关键字 + cluster 元数据 + 引擎内建全局。放在任何 return 之前 ----
+    // 「跑过」位必须在 return 前写：一个从未派发的核留下的全零与
+    // 「Forward+ 关 + 附加阴影关 + 渲染层关」这个**合法**组合读数完全一致。
+    if (all(id == 0u))
+    {
+        uint flags = VISTA_LL_FLAG_RAN;
+        #if USE_CLUSTER_LIGHT_LOOP
+            flags |= VISTA_LL_FLAG_CLUSTER_VARIANT;
+        #endif
+        #ifdef _ADDITIONAL_LIGHT_SHADOWS
+            flags |= VISTA_LL_FLAG_ADDL_SHADOW_KW;
+        #endif
+        #ifdef _LIGHT_LAYERS
+            flags |= VISTA_LL_FLAG_LIGHT_LAYERS_KW;
+        #endif
+        uint prevFlags;
+        InterlockedOr(_VistaFroxelShadowProbeRW[VISTA_PROBE_LL_FLAGS], flags, prevFlags);
+
+        // URP_FP_* 那组宏声明在 Input.hlsl 的 #if USE_CLUSTER_LIGHT_LOOP 里面，
+        // 所以这一段必须跟着关。关掉时这五格留 0 —— 而「留 0」正是判据(a) 的红。
+        #if USE_CLUSTER_LIGHT_LOOP
+            uint prev;
+            InterlockedMax(_VistaFroxelShadowProbeRW[VISTA_PROBE_LL_WORDS_PER_TILE],
+                           URP_FP_WORDS_PER_TILE, prev);
+            InterlockedMax(_VistaFroxelShadowProbeRW[VISTA_PROBE_LL_TILE_COUNT_X],
+                           URP_FP_TILE_COUNT_X, prev);
+            InterlockedMax(_VistaFroxelShadowProbeRW[VISTA_PROBE_LL_ZBIN_COUNT],
+                           URP_FP_ZBIN_COUNT, prev);
+            InterlockedMax(_VistaFroxelShadowProbeRW[VISTA_PROBE_LL_DIR_COUNT],
+                           URP_FP_DIRECTIONAL_LIGHTS_COUNT, prev);
+            InterlockedMax(_VistaFroxelShadowProbeRW[VISTA_PROBE_LL_PROBES_BEGIN],
+                           URP_FP_PROBES_BEGIN, prev);
+        #endif
+
+        // 判据(b)：三个**引擎内建**全局在 compute 核里到底绑没绑。
+        // grep 过 URP + core 两个包的全部 .compute，没有一个碰它们 —— 没有先例，
+        // 所以这三格是整条局部灯路径唯一的「地基是否存在」的证明。
+        //
+        // 前向向量取长度而不是逐分量：代理位置那套换算的正确性条件恰好是
+        // dot(gFwd, gFwd) == 1（推导见 FroxelLocalLights.hlsl 文件头），
+        // 也就是说「长度为 1」是**充分**条件，不需要知道它指向哪儿。
+        // min 与 max 两格一起才能夹住 1.0：只有 max 的话一个恒为 0 的读数
+        // 与「核没跑」同貌；只有 min 的话一个 1e30 的脏值读不出来。
+        float3 gFwd = GetViewForwardDir();
+        float  gLen = length(gFwd);
+        VistaLlProbeMin(VISTA_PROBE_LL_FWD_LEN_MIN, gLen, 1.0e6);
+        VistaLlProbeMax(VISTA_PROBE_LL_FWD_LEN_MAX, gLen, 1.0e6);
+
+        // unity_OrthoParams.w != 0 ⇒ ClusterInit 会走**线性** z 分箱，
+        // 而 URP 的 CPU 侧是按透视（log2）算的 zBinScale/Offset ⇒ 整条分箱错位。
+        // 这一格抓的是「上一个正交相机（比如某个 Editor 预览窗）留下的脏 cbuffer」。
+        VistaLlProbeMax(VISTA_PROBE_LL_ORTHO_W, abs(unity_OrthoParams.w), 1.0e6);
+
+        // 相机位置漂移：只印，**不设门**。代理位置那套换算把它消掉了 ——
+        // proxyPos = gCam + viewZ·gFwd 之后，URP 自己的公式给出
+        // dot(gFwd, proxyPos − gCam) = viewZ·|gFwd|²，gCam 被减掉了。
+        // 「不设门」这句话本身要印在报表里，否则读者会以为这一格红了才叫坏。
+        VistaLlProbeMax(VISTA_PROBE_LL_CAM_DRIFT_MM,
+                        length(GetCameraPositionWS() - _VistaFroxelCameraWS.xyz), 1000.0);
+
+        // 判据(c) 的门。camNear == 0 ⇒ 下发丢了 ⇒ max(viewZ, 0) 照样不越界，
+        // 但 zbin 下标 0 不再落在相机近平面上，整条换算失去意义。
+        VistaLlProbeMax(VISTA_PROBE_LL_CAM_NEAR, _VistaFroxelViewForward.w, 1.0e6);
+    }
+
+    if (id.x >= VISTA_PROBE_DIM_XY || id.y >= VISTA_PROBE_DIM_XY || id.z >= VISTA_PROBE_DIM_Z)
+        return;
+
+    uint3 size = (uint3)_VistaFroxelSize.xyz;
+    if (any(size == 0u))
+        return;
+
+    uint3 fid = VistaProbeFroxelIndex(id, size);
+
+    // 判据(c) 的反门要求本核采到**切片 0** —— 唯一一个求值点（0.5·d₀ ≈ 0.156 m）
+    // 落在相机近平面之前的切片。共享映射取的是格心，z 格 0 落在切片 2
+    // （(0+0.5)·64/16 = 2），切片 0 和 1 永远采不到。第一次实测（Forward+ 首跑）
+    // 反门如设计地红了：NEAR_PRE = 0、VIEWZ_MIN = 0.316 m = 切片 2 的采样距离
+    // ×视角余弦 —— 抓住的正是「尺子没执行」。
+    // 修法**不动共享映射**：阴影/重投影两个探针核的全部已测基线（⑤b 的遮挡数、
+    // ⑬ 的 1.0e-5 实测地板…）都挂在那份映射上，挪格心等于把它们全部重量一遍。
+    // 只把本核 z 格 0 的代表点钉到切片 0 —— 判据(d) 在哪个切片上比都成立，
+    // 所以这 1024 个点换切片不改变 (d) 的语义，只给 (c) 补上它缺的那个样本。
+    if (id.z == 0u)
+        fid.z = 0u;
+
+    // 采样点与介质走线上那一份（VistaFroxelSampleAt）。抖动**不加**：
+    // 这一条判据比的是两档剔除结构，抖动只会让两档在同一个随机点上跑，
+    // 既不增加区分力，又让「换一帧读数变了」多一个解释。
+    VistaFroxelSample     fs  = VistaFroxelSampleAt((float2)fid.xy + 0.5, (float)fid.z);
+    VistaLocalLightMedium med = VistaLocalLightMediumFrom(fs.smp, fs.fog);
+
+    // ---- 判据(d)：同一个点上把两档各跑一遍 ----
+    VistaLocalLightDiag dc = VistaLocalLightDiagInit();
+    VistaLocalLightDiag db = VistaLocalLightDiagInit();
+    float3 rc = VistaAccumulateLocalLightsMode(
+        VISTA_LL_MODE_CLUSTER, fs.uv, fs.posWS, fs.rayDir, med, dc);
+    float3 rb = VistaAccumulateLocalLightsMode(
+        VISTA_LL_MODE_BRUTE,   fs.uv, fs.posWS, fs.rayDir, med, db);
+
+    VistaLlProbeAdd(VISTA_PROBE_LL_COUNT, 1u);
+    VistaLlProbeAdd(VISTA_PROBE_LL_CLUSTER_N, dc.enumerated);
+    VistaLlProbeAdd(VISTA_PROBE_LL_BRUTE_N,   db.enumerated);
+    VistaLlProbeAdd(VISTA_PROBE_LL_CULL_MISS, VistaLocalLightCullMisses(dc, db));
+
+    // 两档的阴影/层遮罩计数取**暴力**那一档：它是参考解，且集合是超集的下界，
+    // 所以这两格的读数与「cluster 有没有多给灯」无关 —— 换句话说它们衡量的是
+    // B2（阴影）与逐灯开关（层遮罩）这两条路走没走到，不是剔除对不对。
+    VistaLlProbeAdd(VISTA_PROBE_LL_SHADOWED_N,   db.shadowed);
+    VistaLlProbeAdd(VISTA_PROBE_LL_LAYER_SKIP_N, db.layerSkipped);
+
+    // ---- 判据(c) 的归因：近/远端 ----
+    // nearClamped 恒被触发（片 0 的求值点 0.5·d₀ ≈ 0.156 m < camNear 0.30 m），
+    // 所以这一格的门是「必须 > 0」。见槽位表里那一段。
+    // 【括注】「恒被触发」成立的前提是上面那个 id.z == 0 的钉扎 —— 共享映射
+    // 自己永远走不到切片 0，这句话曾经因此是错的（首跑实测 NEAR_PRE = 0）。
+    VistaLlProbeAdd(VISTA_PROBE_LL_NEAR_PRE,     db.nearClamped);
+    VistaLlProbeAdd(VISTA_PROBE_LL_FAR_OVER,     db.farClamped);
+    VistaLlProbeAdd(VISTA_PROBE_LL_VIEWZ_NONPOS, (db.viewZraw <= 0.0) ? 1u : 0u);
+    VistaLlProbeMin(VISTA_PROBE_LL_VIEWZ_MIN, db.viewZ, 1000.0);
+    VistaLlProbeMax(VISTA_PROBE_LL_VIEWZ_MAX, db.viewZ, 1000.0);
+
+    // ---- ⓘ：量级与两档之差 ----
+    // 源项亮度取暴力档（参考解）。缩放 1e6：clear air 里局部灯的源项能低到
+    // 1e-6 量级（σ_s,Rayleigh 5.8e-3/km × 相位 × 照度），1e6 刚好让它落在
+    // 第一个刻度上而不是被压成 0；上端 VISTA_PROBE_FIXED_MAX 4e9 对应 4e3 cd/m²/km，
+    // 浓雾近距离强灯会顶到饱和 —— 那时这一格是**上界**，报表要如实说。
+    VistaLlProbeMax(VISTA_PROBE_LL_RADIANCE_MAX, VistaFroxelLuminance(rb), 1.0e6);
+
+    // 两档之差：只作归因，不设门（理由见槽位表「为什么 (d) 判集合而不判亮度」）。
+    // 分母用暴力档 + 1e-9 兜底。两档灯集合相同时残差只剩 fp32 求和次序 ——
+    // cluster 按 tile 位图的位序遍历，暴力按数组序，次序本来就不同。
+    float lb  = VistaFroxelLuminance(rb);
+    float lc  = VistaFroxelLuminance(rc);
+    VistaLlProbeMax(VISTA_PROBE_LL_AB_REL_DIFF, abs(lc - lb) / max(lb, 1.0e-9), 1.0e9);
 }

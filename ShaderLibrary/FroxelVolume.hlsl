@@ -75,6 +75,23 @@ CBUFFER_START(VistaFroxelCB)
     // xyz: 相机世界位置 (m)，w: 阴影贴图是否已绑定（1 = 是，0 = 否 ⇒ 阴影恒为 1）。
     // 为什么不复用 _VistaViewPosKm 或 URP 的 _WorldSpaceCameraPos，见 VistaShaderIDs 的注释。
     float4 _VistaFroxelCameraWS;
+    // xyz: 相机前向（单位向量），w: 相机**近裁剪面**(m)。
+    //
+    // 只有 #23 的局部灯用它，而那里两件事都要：
+    //   · viewZ = dot(fwd, posWS − camWS) —— 喂给 URP cluster 的代理位置，
+    //     见 FroxelLocalLights.hlsl 的「代理位置」一段。为什么不去读引擎的
+    //     UNITY_MATRIX_V：那是**逐相机**下发的，而 compute dispatch 时它属于谁
+    //     从来没有人验证过（URP 自己没有任何 .compute 碰过它）。
+    //   · w = 相机近裁剪面 —— URP 的 zbin 从 log2(near) 起编号，比 near 更近的
+    //     采样点下标为负，(uint) 转换会把它静默送到**最后一个** bin。
+    //     而 froxel 第 0 片的求值点（0.5·d_0 ≈ 0.156 m）**恒**比 near 更近，
+    //     所以这不是保险丝，是每帧都要生效的一次保守钳位。
+    //
+    // 放在这个 cbuffer 而不是 VistaFroxelLocalLightCB：这两个量描述的是**相机**，
+    // 与「局部灯开不开、哪一档」无关。放到那边去，一旦局部灯关掉（那个 cbuffer
+    // 走失能零态），相机前向也会跟着变成零向量 —— 一个开关顺带清掉了一份
+    // 与它无关的几何真相。
+    float4 _VistaFroxelViewForward;
 CBUFFER_END
 
 // ----------------------------------------------------------------------------

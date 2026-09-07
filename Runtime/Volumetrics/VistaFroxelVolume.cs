@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using UnityEngine;
 using UnityEngine.Experimental.Rendering;
 using UnityEngine.Rendering;
@@ -35,7 +35,8 @@ namespace Vista
 
         /// <summary>
         /// 阴影覆盖性探针的槽位数（#20 起 19，#22a 追加重投影的 14 格到 33，
-        /// #22b 追加抖动源统计的 47 格到 80）。必须与
+        /// #22b 追加抖动源统计的 47 格到 80【实为 82：另含 BN 尺寸两格】，
+        /// #23 追加局部灯的 24 格到 106）。必须与
         /// <c>VolumetricFog.compute</c> 里 <c>VISTA_PROBE_*</c> 那组下标的最大值 + 1 一致 ——
         /// 少一个的症状是最后一个槽位的 Interlocked 写越界，而 D3D11 上越界 UAV 写是**静默丢弃**，
         /// 判据会读到一个恒为初值的格子并把它当成「这一路没执行」。
@@ -44,7 +45,7 @@ namespace Vista
         /// 必须与这里逐位相等），所以三个数（这里、shader 的下标上限、Editor 的镜像）
         /// 里任意一个漏改都会在报表第一格红掉，而不是变成静默丢弃的写。
         /// </summary>
-        public const int k_ShadowProbeSlots = 82;
+        public const int k_ShadowProbeSlots = 106;
 
         // 探针里三个走 InterlockedMin 的槽位
         // （SHADOW_MIN = 0, SHADOWMAP_MIN = 8, SEG_X_MIN = 17）。
@@ -59,7 +60,20 @@ namespace Vista
         // 「档位接线」的槽位（76~79）走的是 InterlockedMax 而不是 Min：
         // 判据要的是「max|online − 某一档| 恰好为 0」，用 Min 的话初值 0 会让
         // 每一格都是 0，「恰好有一个为 0」变成四个都为 0 —— 一个自己造不出失败的判据。
-        static readonly int[] k_ShadowProbeMinSlots = { 0, 8, 17 };
+        //
+        // #23 追加的 24 格（82~105）里**有两个** min：
+        //   LL_FWD_LEN_MIN = 89（相机前向长度的下界，判据(b) 要 min 与 max 夹住 1.0）
+        //   LL_VIEWZ_MIN   = 96（钳后 viewZ 的下界，mm）
+        //
+        // 89 漏登记的症状正是本注释上面那句话说的：读数恒为 0，而 0 在这一格里是
+        // **合法**读数 —— 前向长度 0 就是「引擎全局在 compute 里没绑」，也就是判据(b)
+        // 要抓的那个红。漏登记 ⇒ 判据(b) 每一帧都红，而红的理由是尺子自己坏了。
+        //
+        // 96 不一样，这里要如实说：钳后 viewZ 恒 ≥ camNear > 0，所以 0 **不是**合法读数，
+        // 漏登记会印出一个明显不成立的 ⓘ 而不是伪造结论。它仍然登记，是因为这一格是
+        // 判据(c)「钳位真的生效了」的**归因**行 —— 一个静默读 0 的 ⓘ 等于没有归因，
+        // 而判据(c) 的门（LL_CAM_NEAR > 0）单独看不出「钳到哪儿了」。
+        static readonly int[] k_ShadowProbeMinSlots = { 0, 8, 17, 89, 96 };
 
         readonly ComputeShader m_Cs;
         readonly int m_KernelPlaceholderIdx = -1;
@@ -71,6 +85,7 @@ namespace Vista
         readonly int m_KernelIntegralVerifyIdx = -1;
         readonly int m_KernelReprojProbeIdx = -1;
         readonly int m_KernelJitterProbeIdx = -1;
+        readonly int m_KernelLocalLightProbeIdx = -1;
 
         // 注入表是**双缓冲**（#22）：本帧写一张、读另一张做时间重投影。
         //
@@ -129,20 +144,23 @@ namespace Vista
                 m_KernelReprojProbeIdx = m_Cs.FindKernel("FroxelReprojProbe");
             if (m_Cs.HasKernel("FroxelJitterProbe"))
                 m_KernelJitterProbeIdx = m_Cs.FindKernel("FroxelJitterProbe");
+            if (m_Cs.HasKernel("FroxelLocalLightProbe"))
+                m_KernelLocalLightProbeIdx = m_Cs.FindKernel("FroxelLocalLightProbe");
         }
 
         /// <summary>
-        /// 九个核都在。分开判「资源在不在」（<see cref="isAllocated"/>）与「核在不在」，
+        /// 十个核都在。分开判「资源在不在」（<see cref="isAllocated"/>）与「核在不在」，
         /// 理由与 <c>VistaAtmosphereLuts</c> 那四个独立的 valid 属性相同：
         /// 前者是每帧可变的状态，后者在构造之后就是常量，混成一个属性
         /// 会让「shader 编译坏了」与「这一帧还没分配」在日志上长得一样。
         ///
-        /// 要求**全部都在**而不是按核分成九个属性：它们在同一个 .compute 文件里，
-        /// 一个编译失败就是九个都没有。真正会出现的「部分缺失」只有一种 ——
+        /// 要求**全部都在**而不是按核分成十个属性：它们在同一个 .compute 文件里，
+        /// 一个编译失败就是十个都没有。真正会出现的「部分缺失」只有一种 ——
         /// #pragma kernel 那行写错了名字 —— 那时按整体判会让整条近层雾路径退出，
-        /// 比让八个核继续跑、第九个安静地什么都不做要好归因。
+        /// 比让九个核继续跑、第十个安静地什么都不做要好归因。
         ///
-        /// 四个自检核（SynthMedium / IntegralVerify / ReprojProbe / JitterProbe）也算进来，
+        /// 五个自检核（SynthMedium / IntegralVerify / ReprojProbe / JitterProbe /
+        /// LocalLightProbe）也算进来，
         /// 尽管线上路径不派发它们：
         /// 「一个默认关闭、又没有判据覆盖的开关，等于一段永远不会被发现写错的代码」——
         /// 把它们纳入 isValid，核名写错就会在**第一次真实渲染**时报出来，
@@ -153,7 +171,7 @@ namespace Vista
             && m_KernelInjectionIdx >= 0 && m_KernelShadowProbeIdx >= 0
             && m_KernelIntegrationIdx >= 0 && m_KernelSynthMediumIdx >= 0
             && m_KernelIntegralVerifyIdx >= 0 && m_KernelReprojProbeIdx >= 0
-            && m_KernelJitterProbeIdx >= 0;
+            && m_KernelJitterProbeIdx >= 0 && m_KernelLocalLightProbeIdx >= 0;
 
         public bool isAllocated => m_InjectionBuffers[0] != null && m_InjectionBuffers[1] != null
             && m_Integral != null;
@@ -384,18 +402,27 @@ namespace Vista
         /// 放进 Prepare 会让自检路径拿到一个上一帧主相机的位置，
         /// 而那正是 <c>_WorldSpaceCameraPos</c> 被绕开的理由。
         ///
+        /// <paramref name="localLights"/>（#23）同理放在这里：它带的三个 uniform
+        /// （相机前向 + 档位 + 层遮罩）只有局部灯那段在读，而它的零态
+        /// （<see cref="VistaFroxelLocalLightParams.disabled"/>）就是「一盏局部灯都不参与」。
+        /// 传结构体而不是再加五个参数，是为了让**判据探针核**能调同一个 Bind ——
+        /// 「探针测的档位与线上跑的档位是同一份」在代码里读得出来。
+        ///
         /// 派发形状是满 3D（一个线程一个 froxel），理由见 shader 里 FroxelInjection 的注释：
         /// 注入是逐 froxel 独立的，按柱只有 3.24 万个线程，在 28 个 SM 上隐藏不住
         /// 阴影贴图的访存延迟。#21 的积分是累积量，那个必须按柱。
         /// </summary>
         public void DispatchInjection<T>(in T dispatcher, in VistaFroxelVolumeDesc desc,
-                                        Vector3 cameraWS, bool shadowmapBound)
+                                        Vector3 cameraWS, bool shadowmapBound,
+                                        in VistaFroxelLocalLightParams localLights)
             where T : IVistaLutDispatcher
         {
             if (!isValid || !isAllocated) return;
 
             dispatcher.SetGlobalVector(VistaShaderIDs._VistaFroxelCameraWS,
                 new Vector4(cameraWS.x, cameraWS.y, cameraWS.z, shadowmapBound ? 1f : 0f));
+
+            localLights.Bind(dispatcher);
 
             // 两张静态大气表与 SH buffer **逐核显式绑**，不吃 Sky-View pass 用
             // SetGlobalTextureAfterPass 发布的那份全局。理由与
@@ -672,6 +699,55 @@ namespace Vista
             BindBlueNoise(dispatcher, m_KernelJitterProbeIdx);
             // 64×64 / numthreads(8,8,1)
             dispatcher.Dispatch(m_Cs, m_KernelJitterProbeIdx, 8, 8, 1);
+        }
+
+        /// <summary>
+        /// #23 的局部灯判据探针（判据(a)~(e)）。**必须自己调
+        /// <see cref="VistaFroxelLocalLightParams.Bind{T}"/>**，不能靠「注入核先派发，
+        /// 所以这一趟继承线上的 uniform」——本项目已经吃过这个亏：
+        /// 前一趟已经覆写过同一组 cbuffer 时，那条顺序性论证是假的。
+        /// 参数里那个 <paramref name="localLights"/> 就是线上注入核吃进去的**同一份**，
+        /// 由调用点传下来，于是「探针测的档位与线上跑的档位是同一个」在代码里读得出来。
+        ///
+        /// 注意核内**不读** <c>_VistaFroxelLocalLight.x</c> 那个档位：判据(d) 要在
+        /// 同一趟里把 cluster 档与暴力档各跑一遍，档位是显式参数
+        /// （<c>VistaAccumulateLocalLightsMode</c>）。下发它仍然必要 ——
+        /// 强度缩放、阴影位、层遮罩三样都在同一个 float4 里，而那三样必须与线上一致，
+        /// 否则 LL_SHADOWED_N / LL_LAYER_SKIP_N 测的是另一套配置。
+        ///
+        /// 绑的表与注入核**完全同一组**（两张静态大气表 + SH buffer）：核内走的是
+        /// <c>VistaFroxelSampleAt</c>，也就是线上那一份采样点与介质。少绑一张的症状是
+        /// 介质里少一个分量 ⇒ LL_RADIANCE_MAX 偏小，而那看起来像「灯本来就不亮」。
+        ///
+        /// **不**绑注入表：这一趟一个纹素都不写、也不读注入结果。
+        /// 相应地也**不**挂 <see cref="isAllocated"/> 这道门 ——
+        /// 挂上去的代价是判据在「体积还没分配」的那一帧变成空判据，
+        /// 而它本来能在那一帧就把「Forward+ 关着」报出来。
+        ///
+        /// 蓝噪声也不绑：探针刻意**不加抖动**（理由写在核里）。
+        /// 「刻意不声明一个用不到的资源」——多绑一张会让这一格的依赖变模糊。
+        ///
+        /// 派发口径与另两个探针核同一份：32×32×16 / numthreads(8,8,1)。
+        /// </summary>
+        public void DispatchLocalLightProbe<T>(in T dispatcher,
+                                               in VistaFroxelLocalLightParams localLights)
+            where T : IVistaLutDispatcher
+        {
+            if (!isValid || m_ShadowProbe == null) return;
+
+            localLights.Bind(dispatcher);
+
+            dispatcher.SetTexture(m_Cs, m_KernelLocalLightProbeIdx,
+                VistaShaderIDs._VistaTransmittanceLut, VistaLutSlot.Transmittance);
+            dispatcher.SetTexture(m_Cs, m_KernelLocalLightProbeIdx,
+                VistaShaderIDs._VistaMultiScatteringLut, VistaLutSlot.MultiScattering);
+            dispatcher.SetBuffer(m_Cs, m_KernelLocalLightProbeIdx,
+                VistaShaderIDs._VistaSkyAmbientSh, VistaLutBufferSlot.SkyAmbientSh);
+            dispatcher.SetBuffer(m_Cs, m_KernelLocalLightProbeIdx,
+                VistaShaderIDs._VistaFroxelShadowProbeRW, VistaLutBufferSlot.FroxelShadowProbe);
+
+            // 32×32×16 / numthreads(8,8,1)
+            dispatcher.Dispatch(m_Cs, m_KernelLocalLightProbeIdx, 4, 4, 16);
         }
 
         void Allocate(in VistaFroxelVolumeDesc desc)

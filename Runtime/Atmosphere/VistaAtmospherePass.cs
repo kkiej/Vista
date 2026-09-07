@@ -92,6 +92,14 @@ namespace Vista
             /// （见 <c>RenderFroxelReprojProbe</c>）。
             /// </summary>
             public Camera froxelReprojCamera;
+
+            // ---- 局部灯参与介质（#23）----
+            /// <summary>
+            /// 本帧下发给注入核的那一组局部灯 uniform。零态
+            /// （<c>VistaFroxelLocalLightParams.disabled</c>）= 一盏局部灯都不参与，
+            /// 所以这个字段永远有合法值 —— 与 <see cref="froxelReproj"/> 同一条约定。
+            /// </summary>
+            public VistaFroxelLocalLightParams froxelLocalLights;
         }
 
         /// <summary>
@@ -600,6 +608,29 @@ namespace Vista
                 bool shadowmapBound = mainShadows.IsValid();
                 var froxelCameraWS = cameraData.camera.transform.position;
 
+                // 局部灯的 additional shadow atlas（#23）。同一条 grep 过的顺序：
+                //   OnBeforeRendering(:733) 在 :756
+                //     resourceData.additionalShadowsTexture = m_AdditionalLightsShadowCasterPass.Render(...)
+                //   —— 与主光那张（:750）在同一个方法里，紧挨着，都严格早于 :1009 的
+                //   RecordCustomRenderGraphPasses(BeforeRenderingPrePasses)。
+                //
+                // URP 线上路径**永远**会绑这张纹理（没有投影灯时绑
+                // graph.defaultResources.defaultShadowTexture，AdditionalLightsShadowCasterPass.cs:934/944），
+                // 所以 IsValid() 为 false 只会出现在「这一帧压根没跑 additional shadow pass」
+                // 的场合。此时不能读它 —— 全局里装的是别的相机留下的脏值。
+                var addShadows = resourceData.additionalShadowsTexture;
+                bool addShadowsBound = addShadows.IsValid();
+
+                // 渲染层遮罩要读 URP 自己那个开关（不是渲染管线资产上的 useRenderingLayers）——
+                // 理由见 VistaFroxelLocalLightParams.Resolve 的参数说明：这是同一件事的
+                // 唯一来源，也正是 _LIGHT_LAYERS 关键字的下发条件（ForwardLights.cs:550）。
+                // 名字不叫 lightData：外层作用域里已经有一个同名局部量（CS0136）。
+                // 加前缀而不是改外层那个 —— 外层那个被更多行消费，改名的 diff 会掩盖这次改动。
+                var urpLightData = frameData.Get<UniversalLightData>();
+                var froxelLocalLights = VistaFroxelLocalLightParams.Resolve(
+                    cameraData.camera, m_VolumetricFog,
+                    urpLightData.supportsLightLayers, addShadowsBound);
+
                 using (var builder = renderGraph.AddComputePass<LutPassData>(
                            "Vista Froxel Injection", out var data))
                 {
@@ -616,6 +647,7 @@ namespace Vista
                     data.froxelShadowmapBound = shadowmapBound;
                     data.froxelReproj = froxelReproj;
                     data.froxelBlueNoise = froxelBlueNoise;
+                    data.froxelLocalLights = froxelLocalLights;
 
                     builder.UseTexture(transmittance, AccessFlags.Read);
                     builder.UseTexture(multiScattering, AccessFlags.Read);
@@ -643,6 +675,17 @@ namespace Vista
                     if (shadowmapBound)
                         builder.UseTexture(mainShadows, AccessFlags.Read);
 
+                    // 局部灯的 additional shadow atlas（#23）。同上：URP 用
+                    // SetGlobalTextureAfterPass 把 _AdditionalLightsShadowmapTexture 发成全局
+                    // （AdditionalLightsShadowCasterPass.cs:944），我们不自己绑；
+                    // 这条声明要的是**执行顺序**—— _ADDITIONAL_LIGHT_SHADOWS 是那个 pass 在
+                    // 执行期用 cmd.SetKeyword 设的（:828），记录顺序在后并不保证执行顺序在后。
+                    // 判空同主光：false 表示这一帧根本没跑那趟 pass，
+                    // 此时 VistaFroxelLocalLightParams.Resolve 已经把「查阴影」这一位强制关了，
+                    // 所以核里一次采样都不发 —— 声明与下发的状态是自洽的。
+                    if (addShadowsBound)
+                        builder.UseTexture(addShadows, AccessFlags.Read);
+
                     // _VistaFroxelCameraWS 与 view/雾的 cbuffer 都是全局
                     builder.AllowGlobalStateModification(true);
                     // 唯一的消费者（#21 的积分 pass）走 UAV/SRV 混绑，图能看见那条边；
@@ -654,7 +697,8 @@ namespace Vista
                         d.luts.RenderFroxelInjection(
                             new VistaGraphLutDispatcher(ctx.cmd, Handles(d)),
                             d.view, d.fogSettings, d.froxelDesc,
-                            d.froxelCameraWS, d.froxelShadowmapBound, d.froxelReproj));
+                            d.froxelCameraWS, d.froxelShadowmapBound, d.froxelReproj,
+                            d.froxelLocalLights));
                 }
 
                 // 深度积分（#21）。**必须是独立的一趟 pass**：它把注入表当 SRV 读，
@@ -840,6 +884,60 @@ namespace Vista
                             d.luts.RenderFroxelJitterProbe(
                                 new VistaGraphLutDispatcher(ctx.cmd, Handles(d)),
                                 d.froxelReproj));
+                    }
+
+                    // 局部灯的探针（#23，判据(a)~(e)）。**第四趟独立 pass**，写 82~105 号槽位。
+                    //
+                    // 为什么必须独立成一趟、而不能挂在抖动探针后面：这个核要读
+                    // URP 的 Forward+ cluster cbuffer（urp_ZBins / urp_Tiles）与
+                    // additional shadow atlas，而上一趟一个都不声明。把两者合并会让
+                    // 「本趟依赖 URP 的哪些状态」在代码里读不出来 ——
+                    // 而 #23 的全部风险恰恰在于那些状态是不是真的到位了。
+                    //
+                    // 声明的资源：探针缓冲 + 两张大气表 + 天光 SH + 两张阴影图。
+                    // 前四个是因为核走 VistaFroxelSampleAt（线上注入那一份介质映射）；
+                    // 后两个是**执行顺序**声明，理由与注入那一趟逐字相同 ——
+                    // _MAIN_LIGHT_SHADOWS_CASCADE 与 _ADDITIONAL_LIGHT_SHADOWS 都是
+                    // 各自的 shadow pass 在执行期用 cmd.SetKeyword 设的全局关键字，
+                    // 记录顺序在后并不保证执行顺序在后。
+                    //
+                    // 刻意**不**声明蓝噪声：探针不加抖动（理由写在核里）。
+                    // 刻意**不**声明注入表与积分表：这个核一格都不读、一格都不写它们。
+                    // 「顺手多声明一张」的代价不是性能，是让这一趟的依赖变模糊。
+                    using (var builder = renderGraph.AddComputePass<LutPassData>(
+                               "Vista Froxel Local Light Probe", out var data))
+                    {
+                        data.luts = m_Luts;
+                        data.view = view;
+                        data.fogSettings = m_FogSettings;
+                        data.transmittance = transmittance;
+                        data.multiScattering = multiScattering;
+                        data.skyAmbientSh = skyAmbientSh;
+                        data.froxelShadowProbe = froxelShadowProbe;
+                        data.froxelProbeRequested = true;
+                        // 线上注入核吃进去的**同一份**。判据里「探针测的档位与线上跑的
+                        // 档位是同一个」靠的就是这一行 —— 不是靠派发顺序。
+                        data.froxelLocalLights = froxelLocalLights;
+
+                        builder.UseTexture(transmittance, AccessFlags.Read);
+                        builder.UseTexture(multiScattering, AccessFlags.Read);
+                        if (skyAmbientSh.IsValid())
+                            builder.UseBuffer(skyAmbientSh, AccessFlags.Read);
+                        builder.UseBuffer(froxelShadowProbe, AccessFlags.ReadWrite);
+                        if (shadowmapBound)
+                            builder.UseTexture(mainShadows, AccessFlags.Read);
+                        if (addShadowsBound)
+                            builder.UseTexture(addShadows, AccessFlags.Read);
+
+                        // 它要推逐视图常量与雾（VistaFroxelSampleAt 的输入），
+                        // 以及局部灯那一组 cbuffer。
+                        builder.AllowGlobalStateModification(true);
+                        builder.AllowPassCulling(false);
+
+                        builder.SetRenderFunc((LutPassData d, ComputeGraphContext ctx) =>
+                            d.luts.RenderFroxelLocalLightProbe(
+                                new VistaGraphLutDispatcher(ctx.cmd, Handles(d)),
+                                d.view, d.fogSettings, d.froxelLocalLights));
                     }
                 }
 #endif

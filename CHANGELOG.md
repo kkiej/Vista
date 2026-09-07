@@ -730,7 +730,8 @@
     不影响兼容性，而 `Shader.SetGlobalVector` 照样写得进去。
   - 未覆盖清单（自检自己印出来，不当成通过）：UniversalGBuffer / 延迟（B 在延迟下
     不存在挂载点，那条路由 A 负责）；`USE_CLUSTER_LIGHT_LOOP`（要把 Rendering Path
-    切到 Forward+ 再跑一遍）；`LIGHTMAP_ON` / `DIRLIGHTMAP_COMBINED` /
+    切到 Forward+ 再跑一遍）【#23 括注：工程已随 #23 切到 Forward+，这条从
+    「切过去才能跑」变成「现在就能跑」，重跑本自检仍欠着】；`LIGHTMAP_ON` / `DIRLIGHTMAP_COMBINED` /
     `DYNAMICLIGHTMAP_ON` / `SHADOWS_SHADOWMASK`（布景是运行时搭的，拿不到烘焙数据，
     于是 `MixRealtimeAndBakedGI` 的 subtractive 分支未覆盖 ——
     **而 #12 要动的正是它前后的位置，那一步必须补一个带烘焙数据的场景**）；
@@ -1471,6 +1472,82 @@
     `VistaBlueNoise.Invalidate()` 挂在 `VistaAtmosphereFeature.Dispose`——
     那一趟正好覆盖换 URP 资产 / 改全局设置 / shader 重编译三件事，
     于是不必再单独挂 `RenderPipelineManager.activeRenderPipelineDisposed`。
+
+- **局部灯（点光/聚光）参与介质散射（#23）：A1 复用 URP cluster + A3 暴力参考解
+  + B2 复用 additional shadow atlas（1 tap）。**
+  `ShaderLibrary/FroxelLocalLights.hlsl`（新）+ `LocalLightMode`（`Off` 必须是 0：
+  cbuffer 未绑定时读到全零 = 失能态）+ `VistaFroxelLocalLightParams`（新，
+  `Runtime/Volumetrics/VistaFroxelLocalLights.cs`）+ 第十个探针核
+  `FroxelLocalLightProbe` + 报表判据 (a1)(a2)(a3)(b)(c)(d)(e1)(e2)。
+  源项 `J_local = Σᵢ [σ_s,R·P_R + σ_s,Mie·P_HG(g_mie) + σ_s,fog·P_HG(g_fog)] · Eᵢ`，
+  三个介质组分**都**参与（UE5/HDRP 只让 punctual 灯散射在雾上）：系数本来就在
+  `VistaScatterSample` 手里、零额外介质采样，而「晴空里看不见光锥」应当是物理的
+  **结果**（64 m 晴空光学厚度 ~6.4e-4，雾比大气组分强 ~2000 倍），不是一行 if。
+  - **剔除结构不自建，直接吃 URP Forward+ 的 cluster**（`ClusterInit/ClusterNext`，
+    `#include RealtimeLights.hlsl` 一行带全）。这是 UE5（froxel 光表）/ HDRP
+    （BigTile+cluster）同款问题的同款答案 —— 引擎已经为不透明着色建好了
+    逐 tile×zbin 的灯列表，体积雾在同一视锥里问同样的问题。
+    自建的代价不只是重复：两份剔除会在灯的边界上**不一致**，症状是
+    「雾里的光锥比物体上的光斑大/小一圈」。
+  - **A3 暴力参考档也必须挂在 `USE_CLUSTER_LIGHT_LOOP` 下面** —— 不是偷懒：
+    `URP_FP_PROBES_BEGIN` 是 compute 里**唯一**可用的局部灯总数
+    （`Clustering.hlsl:84` 与 `GlobalIllumination.hlsl:297` 交叉证明）；
+    `_AdditionalLightsCount` 装的是 `maxPerObjectAdditionalLightsCount`
+    （`ForwardLights.cs:731`），读端还要与逐 draw 的 `unity_LightData.y` 取 min，
+    在 compute 里是错的那个数。经典 Forward 的移动端档推到 #26。
+  - **代理点技巧**：`ClusterInit` 要吃 `_WorldSpaceCameraPos`/`unity_MatrixV`/
+    `unity_OrthoParams` 三个引擎逐相机全局，而 URP+core 的全部 `.compute` **零**先例
+    （grep 过）。不重刻 zbin 算术，构造
+    `proxyPos = GetCameraPositionWS() + viewZ·GetViewForwardDir()` 喂给 URP 自己的
+    公式，正确性条件收缩成 `dot(gFwd,gFwd)==1` 一条 —— 然后**实测**它：
+    `|GetViewForwardDir()| = 1.000000`（定点 1e6 下逐位相等）、`orthoParams.w = 0`、
+    相机位漂移 0 mm。**这三个全局在 compute 里是被绑定的** —— 第一次有人量。
+  - **zbin 近端**：切片 0 的求值点（度量中点 0.5·d₀ ≈ 0.156 m）在相机近平面
+    （0.30 m）之前，而 URP 的 zbin 0 恰好压在 `nearClipPlane` 上
+    （`zBinOffset = −log2(near)·scale`，`ForwardLights.cs:199-271`）——
+    负下标经 `(uint)` + `min` 落到**最后一个** bin，近处的灯被静默丢掉。
+    修法是**保守放宽** `max(viewZ, cameraNear)`：zbin 0 的灯集是「真正影响
+    0.156 m 处的灯」的超集，多枚举由判据(d) 兜住（它判 miss，不判 count 相等）。
+    远端不动：夹到最后一个 bin 是 URP 自己的设计意图。
+  - **B2 阴影**：3 参数 `GetAdditionalLight(i, posWS, half4(1,1,1,1))` 一行复用
+    C1 逐灯衰减 + B2 阴影。不声明 `CALCULATE_BAKED_SHADOWS` ⇒
+    `MixRealtimeAndBakedShadows` 退化成 `lerp(rt, 1, fade)`；不声明 `_SHADOWS_SOFT*`
+    ⇒ 字面 1 tap，顺带避开 `_AdditionalShadowmapSize` 只在软阴影档才上传的坑
+    （`AdditionalLightsShadowCasterPass.cs:875`，与 `_MainLightShadowmapSize` 同病）。
+    atlas 句柄从 `resourceData.additionalShadowsTexture` 拿（与主光那张同一个方法、
+    同早于注入 pass），`IsValid()==false` 时不绑 —— 全局槽里是别的相机的脏值。
+  - **逐灯旋钮 = 渲染层遮罩的二值 opt-out，不做 UE5 那种连续
+    `VolumetricScatteringIntensity`**：连续版要 CPU 复刻 URP 的 additional-light
+    打包次序（`ForwardLights.cs:697-724`：主光剔掉后的第 k 盏），是引擎内部
+    不变量的第二份实现，失败模式是「旋钮作用在了另一盏灯上」且无报错；
+    层遮罩的下标是 URP **同一个**下标给的，零映射零漂移。cookie 同批推迟
+    （不声明 `_LIGHT_COOKIES` 即零成本编译掉）。
+    层过滤必须包在 `#ifdef _LIGHT_LAYERS` 里：`GetAdditionalPerObjectLight`
+    **无条件**读 `_AdditionalLightsLayerMasks`，而 URP 只在 `supportsLightLayers`
+    时上传 —— 关键字关着时 `light.layerMask` 是脏 cbuffer 字节。
+    开关的**唯一来源**取 `UniversalLightData.supportsLightLayers`（public、
+    正是 `_LIGHT_LAYERS` 的下发条件 `ForwardLights.cs:550`），不读管线资产上
+    同一件事的第二份。
+  - **遮罩下发走 16 位对半拆分**（`SplitLayerMask`）：`asfloat(1)` 是非规格化数、
+    `asfloat(0xFFFFFFFF)` 是 NaN，整只 uint 塞 `SetGlobalVector` 不安全
+    （URP 能用 `asfloat` 是因为它走 `SetGlobalFloatArray`）。
+    序列化默认 0 按「新加字段默认为 0」那条坑解释成全 1（`0 ⇒ uint.MaxValue`），
+    报表印收敛后遮罩 + 美术原值。cluster uv 先 `clamp(uv, 0, 1−1e-6)`：
+    负 uv 经无符号转换会变成天文下标，越界 cbuffer 读 0 ⇒ 屏幕边缘静默无灯。
+  - **光度单位约定**：URP punctual 灯**没有**物理单位（grep 过
+    `UniversalAdditionalLightData`，无 LightUnit/Candela —— 那是 HDRP 的）。
+    Vista 把 intensity **当 candela 解释**（URP 的着色数学本来就乘 ≈1/d²，
+    量纲上就是 candela，只是没标定），默认全局缩放 1.0、留一个逃生口缩放。
+    推论是物理不是 bug：60 W 灯泡 ≈ 64 cd 在 EV100 15 的白天看不见，
+    夜里 EV100 ≈ 5 才亮；白天要见光锥得按路灯量级（≈10⁴ cd）填。
+  - **判据全过一遍「先证伪再转绿」**：(a2) 在 Forward 下红过（`#else` 桩 +
+    「一盏灯不参与且不报错」的归因）；(a3) 在 0 盏灯下红过；(c) 抓到过一次
+    **尺子自己的缺陷**（见坑）；(e1) 在灯无阴影/被层跳过时红过两次；
+    (e2) 的跳过分支用「灯的 Rendering Layers = Nothing」跑到过一次
+    `LAYER_SKIP_N = 16384` —— 没有一格的绿是「从没红过的绿」。
+    最终读数：`PROBES_BEGIN = 1`、`CULL_MISS = 0`、两档辐亮度最大相对差 1.9e-7、
+    `NEAR_PRE = 1024`（= 探针切片 0 的全部 32×32 点）、`SHADOWED_N = 1081`。
+    判据槽位 82 → 106。
 
 ### 取舍
 
@@ -3588,6 +3665,46 @@
   程序化 + `PerSlice` 不受影响（hash 之间独立 ⇒ CLT 那条论证在**那一档**上是对的）。
   随机瓦片偏移（能把 `K(f)` 压到 `O(1/√N)`、让两档兼容）留给 #27，
   现在它有了一个**实测的**动机。
+
+- **一条反门的推导要对「尺子自己的采样集合」成立，不只对被测路径成立。**（#23，判据(c)）
+  推导「切片 0 的求值点 0.156 m < 相机近平面 0.30 m ⇒ 钳位每帧被走到 ⇒
+  `NEAR_PRE` 必须 > 0」对**线上注入核**（逐切片全遍历）为真，
+  但探针的共享网格映射取**格心**：z 格 0 落在切片 `(0+0.5)·64/16 = 2`，
+  切片 0 和 1 永远采不到。首跑反门如设计地红了，且 `VIEWZ_MIN = 0.316 m`
+  恰好等于切片 2 的采样距离 × 视角余弦 —— 归因一步到位。
+  修法**不动共享映射**（阴影/重投影两个探针核的全部已测基线 —— ⑤b 的遮挡数、
+  ⑬ 的 1.0e-5 实测地板 —— 都挂在那份映射上），只把本核 z 格 0 的代表点
+  钉到切片 0；判据(d) 在哪个切片上比都成立，钉扎不改它的语义。
+  修完 `NEAR_PRE = 1024` = 恰好 32×32、`VIEWZ_MIN = 0.300 m` = 精确 camNear ——
+  两个读数都能从推导逐位复核。
+
+- **引用一个引擎函数之前要 grep 它真正住在哪个文件 —— URP 自己能用到它，
+  可能靠的是一条偶然的 include 链。**（#23，`IsMatchingLightLayer`）
+  它住在 core 的 `CommonLighting.hlsl:550`；URP 材质能用到它是靠
+  `Lighting.hlsl → BRDF.hlsl → ImageBasedLighting.hlsl` 这条**偶然**链
+  （grep 整个 URP 包，对 `CommonLighting.hlsl` 的直接引用为**零**）。
+  Vista 只 include `RealtimeLights.hlsl`，那条链上没有它 ——
+  而且这个未定义标识符只在 `_LIGHT_LAYERS` **变体**里才炸，
+  管线资产没开 Rendering Layers 时六个核全编译通过。
+  修法是直接 include 函数真正住的文件，而不是把整套 BRDF 拖进注入核。
+
+- **工具链写组件属性的「成功」不等于「生效」：JSON→struct 转换失败会静默
+  落成默认值 0，而 0 恰好可以是你想设的那个值。**（#23，(e2) 证伪运行）
+  给 `RenderingLayerMask` 传裸 `0` 报了转换错误（诚实的失败）；
+  传 `{"m_Bits": 0}` 报成功且读数变了 —— 但那次「成功」其实也是
+  转换失败落到默认 0，**恰好撞上要设的值**。铁证是反向操作：
+  `{"m_Bits": 1}` 同样报成功，读数却纹丝不动（`LAYER_SKIP_N` 仍 16384）。
+  一次只在「要设的值 == 失败的默认值」时才通过的写入，
+  与「哨兵值与被测量撞车」是同一族。还原最后走的是删组件让 URP 按
+  真默认值懒重建 —— 比信任一个证明过会说谎的写入通道可靠。
+
+- **一盏 type 没设生效的测试灯，在 cluster 元数据上有一个可归因的签名：
+  `DIRECTIONAL_LIGHTS_COUNT` 多 1、`PROBES_BEGIN` 不动。**（#23）
+  附加**平行光**不进 cluster（`LIGHT_LOOP_BEGIN` 用
+  `lightIndex += URP_FP_DIRECTIONAL_LIGHTS_COUNT` 跳过它们）。
+  测试聚光灯创建时 `type: Spot` 静默丢失、落成 Directional，
+  读数是 `DIR=1, PROBES=0`；重新下发 type 后翻成 `DIR=0, PROBES=1` ——
+  两个计数一增一减同步翻转，就是「灯在，但 type 不对」的指纹。
 
 ### 待办（Task #6 验收时补）
 
