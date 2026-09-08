@@ -1,4 +1,5 @@
-﻿using System.Text;
+﻿using System.Collections.Generic;
+using System.Text;
 using UnityEditor;
 using UnityEngine;
 using UnityEngine.Rendering;
@@ -213,12 +214,22 @@ namespace Vista.EditorTools
         /// <summary>
         /// <c>VistaSegmentIntegral</c> 现在用的级数分支阈值，逐字照抄 HLSL 侧的
         /// <c>VISTA_SEGMENT_SERIES_X</c>（AtmosphereScattering.hlsl）。
-        ///
-        /// #25 之前这里是两个常量：shipped = 1e-4 与 optimum = (24·2⁻²³)^¼ = 4.1127e-2，
-        /// 报表用两者的差说明「那次替换的影响面」。替换做完之后两者是同一个数，
-        /// 再留两份就变成了同一个量的两份实现 —— 合并成一个。
         /// </summary>
         const float k_SeriesThreshold = 4.1127e-2f;
+
+        /// <summary>
+        /// #25 **替换掉的**那个旧阈值。它不是 <see cref="k_SeriesThreshold"/> 的第二份实现：
+        /// 那一个是「线上此刻在用的值」，这一个是「历史上被换掉的值」——
+        /// 两个不同的量，只在替换发生的那一瞬间数值相等过。
+        ///
+        /// #25 当时把两者合并成一个，写的理由是「同一个量的两份实现」。那是误判，
+        /// 而且代价当场兑现：下面那条 before/after 的 ⓘ 从此再也判断不了
+        /// 「这一段到底有没有换过支路」，于是对一个替换前后都待在级数支上的读数
+        /// （x = 6.140e-7 ≪ 1e-4）印出了「因这次替换换了支路」，并由这个错前提
+        /// 推出一句 ⚠「那这次替换本该是可测的，去核门」。
+        /// 删掉一个历史值，等于删掉报表分辨反事实的能力。
+        /// </summary>
+        const float k_SeriesThresholdBefore25 = 1e-4f;
 
         // ---- #22a：重投影两个定点缩放，与 shader 里的 VistaProbeFixed 调用一一对应 ----
         const float k_ReprojStaticErrScale = 1.0e9f;
@@ -392,14 +403,56 @@ namespace Vista.EditorTools
         /// </summary>
         const float k_LlOrthoGate = 1.0e-6f;
 
+        /// <summary>
+        /// 一条 Debug.Log 里塞多少字符。Unity 的 console **在存储层**就把超长条目截断
+        /// （约 16 KB），截掉的部分不是「显示不全」而是**取不回来**：LogEntries 拿到的
+        /// 就是截断后的串，filter 也搜不到。
+        ///
+        /// 代价是实测出来的，不是防御性的：本报表长到 #24 之后，从判据⑰c 往后
+        /// （#22b 的尾巴、#23 局部灯、#24 局部雾体、分配口径）整段在控制台里消失了 ——
+        /// 十几格判据的 ✔/✘ 谁都读不到，而报表**看起来**是完整的，最后一行只是
+        /// 停在半句话上。一条读不到的判据不是判据。
+        ///
+        /// 7000 是给单行留了余量的分块尺寸：报表里最长的单条 ⓘ 在 1.5 KB 量级，
+        /// 分块只在行边界切，所以一块的实际长度是 7000 + 最长行，仍远在 16 KB 之下。
+        /// 单行自己超过上限时本方法不再细分 —— 那种行该拆的是它自己。
+        /// </summary>
+        const int k_LogChunkChars = 7000;
+
         [MenuItem("Window/Vista/Log Volumetric Fog State", priority = 142)]
         static void RunFromMenu()
         {
             var sb = new StringBuilder();
             Run(sb);
-            // MCP 那条通道会把多行日志截断，所以拍平成一行；即便拍平了也可能截，
-            // 完整内容从 Editor.log 里读。
-            Debug.Log(sb.ToString().Replace("\r", string.Empty).Replace("\n", "  |  "));
+            EmitChunked(sb.ToString());
+        }
+
+        /// <summary>
+        /// 拍平成单行（MCP 那条通道会把多行日志截断）并按 <see cref="k_LogChunkChars"/>
+        /// 分块发出。每块带 i/n 编号 —— 没有编号的话「第 3 块没发出来」与
+        /// 「报表本来就只有两块」在控制台里同形。
+        /// </summary>
+        static void EmitChunked(string report)
+        {
+            var lines  = report.Replace("\r", string.Empty).Split('\n');
+            var chunks = new List<string>();
+            var cur    = new StringBuilder();
+
+            foreach (var line in lines)
+            {
+                if (line.Length == 0) continue;
+                if (cur.Length > 0 && cur.Length + line.Length + 5 > k_LogChunkChars)
+                {
+                    chunks.Add(cur.ToString());
+                    cur.Clear();
+                }
+                if (cur.Length > 0) cur.Append("  |  ");
+                cur.Append(line);
+            }
+            if (cur.Length > 0) chunks.Add(cur.ToString());
+
+            for (int i = 0; i < chunks.Count; i++)
+                Debug.Log($"[Vista 体积雾状态 {i + 1}/{chunks.Count}]  |  {chunks[i]}");
         }
 
         static void Run(StringBuilder sb)
@@ -846,17 +899,69 @@ namespace Vista.EditorTools
             float segXMin = probeRan ? segXMinRaw / k_SegXScale : float.NaN;
             float segXMax = raw[k_SlotSegXMax] / k_SegXScale;
 
-            bool envelopeOk = probeRan
-                           && segXMin >= k_SegXDerivedMin && segXMax <= k_SegXDerivedMax
-                           && segXMin <= segXMax;
+            // 段长扫一遍，最短与最长一起取。最长给⑫b 当紧上界，最短给下面那两条
+            // 「实测 σ = x/Δ」的归因用。不假设「最后一段最长、第 0 段最短」——
+            // 切片 0 是 [0, d₀]，它不服从后面那个等比规律。
+            float longestMeters = 0f, shortestMeters = float.MaxValue;
+            int longestSlice = -1, shortestSlice = -1;
+            if (volume.allocatedDesc.HasValue)
+            {
+                var dseg = volume.allocatedDesc.Value;
+                for (int i = 0; i < dseg.depth; i++)
+                {
+                    float len = dseg.SegmentFar(i) - dseg.SegmentNear(i);
+                    if (len > longestMeters)  { longestMeters = len;  longestSlice = i; }
+                    if (len < shortestMeters) { shortestMeters = len; shortestSlice = i; }
+                }
+            }
+            if (shortestSlice < 0) shortestMeters = 0f;
+
+            // 近层这一帧到底持不持有雾。UsesNearLayer 为 false（档 D / Off / froxel 关）时
+            // 层权重是零态 ⇒ w ≡ 1 ⇒ 雾**全部归 AP**，注入表里剩下的只有大气。
+            //
+            // 这是本节最该先读的一行，而 #25 之前它不存在 —— 代价是「雾不在近层」
+            // 与「雾算错了」在报表上完全同形：一次 ✘⑫ 因此只能靠手推 σ = x/Δ 归因，
+            // 而那条路要先猜到「该去查 fog.mode」才走得通。
+            float handoffM   = volume.allocatedDesc.HasValue ? volume.allocatedDesc.Value.handoffMeters : 0f;
+            bool nearHoldsFog = fog != null && fog.UsesNearLayer(handoffM);
+            sb.AppendLine($"ⓘ 近层介质构成：fog.mode = {(fog != null ? fog.mode.ToString() : "（无设置）")}"
+                        + $"，handoff = {handoffM:F2} m ⇒ UsesNearLayer = {nearHoldsFog}"
+                        + (nearHoldsFog
+                            ? " ⇒ 注入表 = 大气 + 雾·(1−w)。"
+                            : " ⇒ 层权重零态（w ≡ 1），雾全部归 AP ⇒ **注入表里只有大气**。")
+                        + " 下面 ⑫ 的推导下端只在近层持有雾时才成立，⑫b 的上界两种情形都成立。");
+
+            // ⑫ 的下端「晴空最近一段」是在**近层持有雾**这个前提下推的。前提不成立时
+            // 近层是纯大气，σ 掉一到两个数量级，那道下端判的就是另一个介质了 ——
+            // 这时候只判上端，并把作用域点名（与⑪c/⑫b 同一条纪律）。
+            bool envelopeUpperOk = probeRan && segXMax <= k_SegXDerivedMax && segXMin <= segXMax;
+            bool envelopeOk = envelopeUpperOk && (!nearHoldsFog || segXMin >= k_SegXDerivedMin);
             sb.AppendLine($"{Mark(envelopeOk)}判据⑫ 段光学厚度包络：实测 x ∈ "
                         + $"[{Sci(segXMin)}, {Sci(segXMax)}]，推导区间 "
                         + $"[{Sci(k_SegXDerivedMin)}, {Sci(k_SegXDerivedMax)}]"
                         + $"（区间宽 ×{Sci(k_SegXDerivedMax / k_SegXDerivedMin)} —— 这是一道**宽门**，"
-                        + "它抓的是量级整体挪位，抓不到一个数量级内的偏差）");
+                        + "它抓的是量级整体挪位，抓不到一个数量级内的偏差）"
+                        + (nearHoldsFog ? "" : "　⚠ 近层无雾 ⇒ **下端不判**，本格只判上端"));
             sb.AppendLine($"  ⓘ 定点分辨率 {Sci(1f / k_SegXScale)}，下端还剩 "
                         + $"{(probeRan ? segXMinRaw.ToString() : "—")} 个刻度 ——"
                         + "「地板与被测量同量级时尺子会自己伪造结论」这条在这里是量出来的，不是估的。");
+
+            // 把 x 除回段长，得到「实测 σ」。这是归因的主力：x 本身混着段长的 176 倍
+            // 跨度，两端各除以自己那一段的长度之后，剩下的才是介质本身。
+            // 判据不押在它上面（探针没记录 x_min/x_max 落在哪一段，所以这两个商只是
+            // **量级**，不是那两个 froxel 真实的 σ）—— 但一个量级就足以分开
+            // 「纯大气 ~2e-2 /km」与「地面雾 2.5 /km」这两种介质。
+            if (probeRan && shortestMeters > 0f && longestMeters > 0f)
+            {
+                sb.AppendLine($"  ⓘ 实测 σ 的量级（x ÷ 段长，只判量级不判值）："
+                            + $"x_min ÷ 最短段 {shortestMeters:F3} m（切片 {shortestSlice}）= "
+                            + $"{Sci(segXMin / (shortestMeters * 1.0e-3f))} /km；"
+                            + $"x_max ÷ 最长段 {longestMeters:F3} m（切片 {longestSlice}）= "
+                            + $"{Sci(segXMax / (longestMeters * 1.0e-3f))} /km。"
+                            + $"对照：地面雾 σ_t = {Sci(globalFogOn ? fog.extinctionPerKm : 0f)} /km，"
+                            + "地表大气灰度 σ_t ≈ 2.2e-2 /km（Rayleigh 灰度 1.75e-2 + Mie 消光 4.4e-3）。"
+                            + "两个商都落在大气那一档 ⇒ 近层里没有雾。");
+            }
 
             // ⑫b 一道**紧**门。⑫ 那道推导区间宽 3.6e4 倍，挡不住一个 1000 倍的单位错；
             // 这一道的裕度是个位数百分比。
@@ -868,18 +973,10 @@ namespace Vista.EditorTools
             // 等于把那一格的结论接到这一格上。
             //
             // 最长段不假设是最后一段，直接扫一遍：切片 0 是 [0, d_0]，它不服从后面那个
-            // 等比规律，「假设最后一段最长」是一条不需要的推导。
+            // 等比规律，「假设最后一段最长」是一条不需要的推导。扫描已经提到 ⑫ 上面去了
+            // （longestMeters / longestSlice），这里直接用 —— 同一个量不留两份实现。
             if (probeRan && (globalFogOn || volSigmaSum > 0f) && volume.allocatedDesc.HasValue)
             {
-                var d = volume.allocatedDesc.Value;
-                float longestMeters = 0f;
-                int longestSlice = -1;
-                for (int i = 0; i < d.depth; i++)
-                {
-                    float len = d.SegmentFar(i) - d.SegmentNear(i);
-                    if (len > longestMeters) { longestMeters = len; longestSlice = i; }
-                }
-
                 // #24：体的 Σσ 同样进上界（与⑪d 同一条理由与同一句「变松点名」）。
                 float xSigma = (globalFogOn ? fog.extinctionPerKm : 0f) + volSigmaSum;
                 float xBound = xSigma * longestMeters * 1.0e-3f;
@@ -896,7 +993,10 @@ namespace Vista.EditorTools
                             + "取等的条件是 x_max 恰好落在最长那一段上 —— 而探针没有记录它落在哪一段，"
                             + "所以这里不断言取等（断言一个自己没有保留的中间读数等于编造证据）。"
                             + "读法：比值 > 1 ⇒ 段长或 σ_t 的单位制错了（米/千米差 1000 倍）；"
-                            + "比值 ≪ 1 而相机贴着地面 ⇒ 高度衰减被下发得太陡。");
+                            + "比值 ≪ 1 先看上面那条**近层介质构成** —— UsesNearLayer 为 false 时"
+                            + "雾整个不在近层里（注入表只有大气，σ 差一到两个数量级），"
+                            + "这条上界就是拿雾的 σ 去界一段没有雾的介质，松成这样是应然而非缺陷；"
+                            + "排除掉它之后，比值 ≪ 1 而相机贴着地面才指向「高度衰减被下发得太陡」。");
             }
             else if (probeRan)
             {
@@ -923,7 +1023,12 @@ namespace Vista.EditorTools
                 // 两个值都远在任何门之下，没有判据能把这个差量测出来（见 hlsl 里那段
                 // 「诚实地说」）。打出来是为了让「改了什么」有一个可核的数，
                 // 而不是让它看起来像被验证过了。
-                if (segXMin > 0f && segXMin <= k_SeriesThreshold)
+                //
+                // 门的形状：只有落在**旧阈值与新阈值之间**的段才真的换了支路。
+                // 小于旧阈值的段替换前后都在级数支上，大于新阈值的段替换前后都在
+                // exact 支上 —— 对这两类段说「因这次替换换了支路」是一句由错前提
+                // 推出的话，而它后面还挂着一个会自己报警的 ⚠。
+                if (segXMin > k_SeriesThresholdBefore25 && segXMin <= k_SeriesThreshold)
                 {
                     double before = 1.1920928955078125e-7 / segXMin;             // 旧：走 exact 支
                     double after  = (double)segXMin * segXMin * segXMin / 24.0;  // 新：走级数支
@@ -936,10 +1041,27 @@ namespace Vista.EditorTools
                         ? $"换前那个较大的值也只到积分门 {Sci((float)gate)} 的 1/{gate / before:0.#}，在门的分辨力之下"
                         : $"⚠ 换前的值已经够到积分门 {Sci((float)gate)} 了 —— 那这次替换本该是可测的，去核门";
 
-                    sb.AppendLine($"  ⓘ 本布景最短一段 x = {Sci(segXMin)} 因这次替换换了支路："
+                    sb.AppendLine($"  ⓘ 本布景最短一段 x = {Sci(segXMin)} 落在旧阈值 "
+                                + $"{Sci(k_SeriesThresholdBefore25)} 与新阈值 {Sci(k_SeriesThreshold)} 之间，"
+                                + "**因这次替换换了支路**："
                                 + $"固有误差（推导）{Sci((float)before)} → {Sci((float)after)}，"
                                 + $"改善 {(before / System.Math.Max(after, 1e-30)):0.#} 倍。"
                                 + vsGate + " —— 判据只能证明「没变坏」。");
+                }
+                else if (probeRan)
+                {
+                    // 「这次替换对本帧一个数都没改」是一条**有内容**的读数，不是无话可说。
+                    bool bothSeries = segXMax <= k_SeriesThresholdBefore25;
+                    sb.AppendLine($"  ⓘ 这次阈值替换（{Sci(k_SeriesThresholdBefore25)} → "
+                                + $"{Sci(k_SeriesThreshold)}）对**本帧一个 froxel 都没改**："
+                                + (bothSeries
+                                    ? $"整柱 x ≤ 旧阈值（x_max {Sci(segXMax)}），替换前后都走级数支。"
+                                    : segXMin > k_SeriesThreshold
+                                    ? $"整柱 x > 新阈值（x_min {Sci(segXMin)}），替换前后都走 exact 支。"
+                                    : $"最短段 x = {Sci(segXMin)} 不在换支区间 "
+                                      + $"({Sci(k_SeriesThresholdBefore25)}, {Sci(k_SeriesThreshold)}] 内。")
+                                + " 影响面要在别的布景上量 —— 本格如实记为未覆盖，"
+                                + "不拿一个没发生的支路切换去编造一条改善倍数。");
                 }
             }
 
@@ -1975,13 +2097,30 @@ namespace Vista.EditorTools
                 var d = volume.allocatedDesc.Value;
                 sb.AppendLine($"分配口径：{d}");
                 sb.AppendLine($"  AP 的接手点应当是 handoff = {d.handoffMeters:F3} m，"
-                            + $"不是 far = {d.farMeters:F1} m（差 {d.farMeters - d.handoffMeters:F3} m）。"
-                            + "近层与 AP 现在都从 t = 0 开始积分，两层同开时近段的雾被算两遍。"
-                            + "光把 AP 的 nearDistanceKm 推到 handoff 是不够的："
-                            + "AerialPerspectiveLut 的积分起点是 tPrev = 0.0（AtmosphereLut.compute:375），"
-                            + "切片 0 照样会积 [0, near] —— 推远 near 只让第 0 片变长，双计一点没少。"
-                            + "起点也得一起移，而那会改变 AP LUT 的语义（相机→t 变成 handoff→t），"
-                            + "读端合成要跟着改，所以归 #25。CHANGELOG 的 #19 待办已按此更正。");
+                            + $"不是 far = {d.farMeters:F1} m（差 {d.farMeters - d.handoffMeters:F3} m）。");
+
+                // 这条曾经记的是「**雾**在 [0, D] 上被两层各算一遍」，并写着「归 #25」。
+                // #25 用 σ 逐点互补分摊（σ_AP = σ_fog·w，σ_froxel = σ_fog·(1−w)）把雾那
+                // 一半解决了 —— 但**大气那一半没动**：注入 kernel 采的 σ_t 含
+                // Rayleigh + Mie + 臭氧（VolumetricFog.compute:511），而 AP LUT 恒从
+                // t = 0 积分且只让掉了雾（AtmosphereLut.compute:407），
+                // 合成端又把两个 T 乘起来（AerialPerspective.hlsl:220）。
+                // 于是 σ_atm 在 [0, D] 上仍然进了两遍指数。
+                //
+                // 三处源文件对这同一个量持相反的信念，且互为对方的理由 —— 那正是
+                // 这条注释长期停在「已归 #25」而没人再看的后果。所以现在把**当前**
+                // 数值印出来，让它每一帧自己报一次，而不是靠读注释想起来。
+                double tauAtm = 2.02e-2 * d.handoffMeters * 1.0e-3;   // 灰度 σ_atm，实测口径
+                sb.AppendLine($"  ⚠ 大气在 [0, handoff] 上仍被两层各积一遍（#25 只分摊了雾）："
+                            + $"灰度 σ_atm ≈ 2.02e-2 /km × {d.handoffMeters:F3} m ⇒ "
+                            + $"τ 重复 {Sci((float)tauAtm)}，透射率偏差 {tauAtm * 100.0:0.###}%"
+                            + (nearHoldsFog
+                                ? " —— **本帧是活的**（UsesNearLayer = true，两层都在积）。"
+                                : " —— 本帧是潜伏的：UsesNearLayer = false，合成端直接短路，"
+                                  + "近层表建了但没人采，画面上一个像素都没错。")
+                            + $" 蓝光约为灰度的 1.9 倍。handoff 被 shadow distance 顶到 500 m 时"
+                            + "灰度 ~1.0%、蓝光 ~1.9%，越过本项目 1% 的 Weber 门 —— "
+                            + "也就是说它现在没暴露只是因为 D 小，不是因为它无害。");
             }
 
             sb.AppendLine("ⓘ 注入**历史**表没有「写入路径」这回事：双缓冲的交换"
