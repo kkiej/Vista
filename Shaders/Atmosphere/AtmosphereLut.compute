@@ -404,6 +404,11 @@ void AerialPerspectiveLut(uint3 id : SV_DispatchThreadID)
                 // 唯一的例外是 g = ±1 时 HG 在 cosθ = ±1 处发散，0·inf = NaN ——
                 // CPU 侧因此把 g 钳在 ±0.99（VistaFogSettings）。
                 VistaFogSample fog = VistaSampleFogAlongRay(t, rayDir.y);
+                // 近层接手的那一段（t < D）把雾让给 froxel 体（#25）。
+                // 让掉的**只有雾**：大气的 Rayleigh/Mie/臭氧仍然从 t = 0 全额积分，
+                // 因为近层体里根本没有大气介质。
+                // 没有近层时权重恒为 1，这一行逐位等于不存在。
+                VistaScaleFogSample(fog, VistaFogApWeight(t));
 
                 // sunShadow = 1：AP 覆盖 [0, 32 km]，逐样本查级联阴影既超出相机的
                 // 阴影距离、也付不起 168 步 × 32×32 柱的采样量。光柱由近层 froxel 体

@@ -26,7 +26,7 @@ namespace Vista.Editor
     ///   fp16 存储（相对整 ulp 2⁻¹⁰ = 9.77e-4 —— 这条路径实测**截断**，不是就近取整，
     ///     所以地板是整个 ulp 而不是一半；证据是 ⓪ 格打出来的 12 对原始读数）
     ///   + fp32 累加（≤ N·2⁻²⁴）
-    ///   + 级数支的截断（x³/24，在 x ≤ 1e-4 处是 1e-13 量级，可忽略）。
+    ///   + 级数支的截断（x³/24，在阈值 x* = 4.1127e-2 处是 2.9e-6，仍比门低 700 倍）。
     /// 这也是这套判据能把门开到 2e-3 而不是「看着差不多」的全部依据 ——
     /// 门 = 地板 × 2.05，两个数都在报表里，谁都能自己核。
     /// 望远镜恒等式本身不当假设用 —— 每一档都把「闭式解 vs 逐段求和」的残差打出来。
@@ -132,8 +132,17 @@ namespace Vista.Editor
         /// </summary>
         const float k_SynthGate = k_RelGate;
 
-        /// <summary><c>VistaSegmentIntegral</c> 里选级数支的那个阈值，逐字照抄。</summary>
-        const double k_SeriesThreshold = 1e-4;
+        /// <summary>
+        /// <c>VistaSegmentIntegral</c> 里选级数支的那个阈值（HLSL 侧的
+        /// <c>VISTA_SEGMENT_SERIES_X</c>），逐字照抄。
+        ///
+        /// #25 把它从 1e-4 换成了最优的 x* = (24·2⁻²³)^¼ = 4.1127e-2 ——
+        /// 推导写在 AtmosphereScattering.hlsl 那段注释里，这里只负责跟着走。
+        /// 它落在**真实配置的 x 区间内部**（推导包络 [8.1e-6, 2.89e-1]），
+        /// 这是与旧值最本质的区别：旧值在区间下方，于是每一档都整柱走同一支；
+        /// 新值在区间中间，于是生产档天然是**两支混着走**。下面判据③因此换了内容。
+        /// </summary>
+        const double k_SeriesThreshold = 4.1127e-2;
 
         // ==================================================================== 档位
         //
@@ -201,12 +210,27 @@ namespace Vista.Editor
                 // 这一档的存在理由：晴空最近一段的 x = 8.1e-6 是线上真实会走到的值
                 // （见 CHANGELOG 的包络推导），而级数支此前一个判据都没有 ——
                 // 「一个默认关闭、又没有判据覆盖的开关，等于一段永远不会被发现写错的代码」。
+                // #25 把阈值抬到 4.1127e-2 之后，本档仍然整柱在级数支上（8.0e-5 ≪ x*），
+                // 也就是**它仍然是「全级数」那一端唯一的锚**，跨档覆盖那一格靠它。
                 // S/σ_t 抬到 1000：alpha 只能是小的（那正是稀薄的定义），
                 // 但 L 必须离开 fp16 的非规格区，否则测到的是格式而不是算术。
                 tauTotal = 1.0e-3, sourceOverExtinction = 1000.0,
-                covers = "整柱走 VistaSegmentIntegral 的**级数支**（x ≤ 1e-4）—— 线上晴空最近段的量级",
+                covers = "整柱走 VistaSegmentIntegral 的**级数支**（x ≤ x* = 4.1127e-2）"
+                       + "—— 线上晴空最近段的量级",
             },
         };
+
+        // ---- 跨档的分支覆盖（#25）----
+        //
+        // 阈值 x* 落在配置包络内部之后，「本档走哪一支」不再是一个可判对错的量
+        // （生产档混着走是正常的），但「两支各自还有没有档位走到」是。
+        // 这两个计数器由 RunTier 累加、由 Run 在循环之后判。
+        //
+        // 它们是静态的（RunTier 是静态方法、档位循环也在静态方法里），
+        // 所以**必须在 Run 的开头清零** —— 菜单可以被点第二次，
+        // 而一个只增不减的计数器会让第二次运行无条件绿。
+        static int s_TiersAllSeries, s_TiersAnyExact;
+        static string s_SeriesAnchor, s_ExactAnchor;
 
         [MenuItem("Window/Vista/Validate Froxel Integration", priority = 142)]
         static void RunFromMenu()
@@ -259,9 +283,38 @@ namespace Vista.Editor
 
                 var atmo = VistaAtmosphereParameters.CreateEarth();
                 var settings = new VistaVolumetricFogSettings();
+
+                // 静态计数器每次运行都要清零，理由见它们的声明处。
+                s_TiersAllSeries = 0; s_TiersAnyExact = 0;
+                s_SeriesAnchor = null; s_ExactAnchor = null;
+
                 bool all = true;
                 foreach (var tier in k_Tiers)
                     all &= RunTier(vol, luts, atmo, settings, tier, sb);
+
+                // ---- 判据⑦：分支覆盖（跨档）----
+                // VistaSegmentIntegral 有两条支路，都在线上被走到。这一格保证
+                // **每一支都至少有一个档位跑过它**，否则那一支等于没有判据。
+                // 它替代了旧的 per-tier okBranch —— 换的理由写在 RunTier 里
+                // 「判据③ 为什么不再是一道门」那段。
+                //
+                // 能红的两条路都是真的 —— 不是断言，是当场跑过的（#25，RTX 3060 / D3D11）：
+                //   k_SeriesThreshold ← 1e9 ⇒ ✘⑦「整柱级数支 6 档（锚 A 生产档）
+                //                              含 exact 支 0 档（锚 无）」，整体失败；
+                //   k_SeriesThreshold ← 0   ⇒ ✘⑦「整柱级数支 0 档（锚 无）
+                //                              含 exact 支 6 档（锚 A 生产档）」，整体失败。
+                // 绿态是「级数 1 档（锚 F 极稀薄）／exact 5 档（锚 A 生产档）」。
+                // 两次红的档数都是 6 而不是 12，这顺带证明了上面那句「静态计数器
+                // 必须在 Run 开头清零」确实生效 —— 菜单是连着点了三次的。
+                // 也就是说这一格同时是「阈值没被改飞」的哨兵。
+                bool okCoverage = s_TiersAllSeries > 0 && s_TiersAnyExact > 0;
+                all &= okCoverage;
+                sb.Append("　 ").Append(Mark(okCoverage))
+                  .Append("⑦ 分支覆盖（跨档）：整柱级数支 ").Append(s_TiersAllSeries)
+                  .Append(" 档（锚 ").Append(s_SeriesAnchor ?? "无").Append("）　含 exact 支 ")
+                  .Append(s_TiersAnyExact).Append(" 档（锚 ").Append(s_ExactAnchor ?? "无")
+                  .AppendLine("）　—— 两支都必须有档位走到，否则那一支等于没有判据");
+
                 return all;
             }
             finally
@@ -328,7 +381,7 @@ namespace Vista.Editor
             bool ok0 = CheckSynth(rep, n, sigmaReq, sourceReq, sb);
             bool ok6 = CheckGeometry(rep, n, desc, kmScaleCpu, sb);
             // ①②③④ 与「判据自身」共用一趟遍历：它们的参考解是同一条递推。
-            bool ok1to4 = CheckIntegral(rep, n, desc, sb);
+            bool ok1to4 = CheckIntegral(rep, n, desc, tier.name, sb);
             bool ok5 = CheckCoverage(rep, n, sb);
             return ok0 && ok6 && ok1to4 && ok5;
         }
@@ -460,7 +513,11 @@ namespace Vista.Editor
         //   ⓘ 闭式解与逐段求和的残差 —— 望远镜恒等式不当假设用
         //
         // 参考解的输入全部是 GPU 报回来的**输入量**（σ_t、S、dtKm），不含任何一个被测输出。
-        static bool CheckIntegral(Vector4[] rep, int n, in VistaFroxelVolumeDesc desc, StringBuilder sb)
+        // tierName 只被判据⑦的跨档计数器用来记「哪一档当的锚」。传名字而不是整个
+        // Tier：这个函数不该能看到档位的任何数值配置，否则参考解就有机会从配置里
+        // 抄一个数，而它现在的输入全部来自 GPU 读回。
+        static bool CheckIntegral(Vector4[] rep, int n, in VistaFroxelVolumeDesc desc,
+                                  string tierName, StringBuilder sb)
         {
             double sigma = Row(rep, 0, 1).w;
             double sR = Row(rep, 0, 1).x;
@@ -487,6 +544,11 @@ namespace Vista.Editor
             double lSum = 0.0;                 // 逐段求和（只用来验望远镜恒等式）
             double lNoT = 0.0, lMid = 0.0, lRect = 0.0;   // 三种被放弃的写法
             double xMin = double.MaxValue, xMax = 0.0;
+            // 分支各自实际走到的极端值。只留 xMin/xMax 是不够的：混着走的档里
+            // 「级数支最坏的那一段」是 ≤ 阈值的最大 x，「exact 支最坏的那一段」是
+            // > 阈值的最小 x，两者都不等于 xMin/xMax。用阈值本身去估会把两支的
+            // 误差都夸大到 x* 处的极大极小值（2.9e-6），那是个**上界**不是读数。
+            double xSeriesMax = 0.0, xExactMin = double.MaxValue;
             double worstAlphaRel = 0.0, worstAlphaAbs = 0.0, worstL = 0.0, worstIdent = 0.0;
             int argAlpha = -1, argL = -1;
             char argLCh = '?';
@@ -502,7 +564,12 @@ namespace Vista.Editor
                 double x = sigma * dt;
                 if (x < xMin) xMin = x;
                 if (x > xMax) xMax = x;
-                if (x <= k_SeriesThreshold) seriesCount++;
+                if (x <= k_SeriesThreshold)
+                {
+                    seriesCount++;
+                    if (x > xSeriesMax) xSeriesMax = x;
+                }
+                else if (x < xExactMin) xExactMin = x;
 
                 double segPerS = (1.0 - System.Math.Exp(-x)) / sigma;   // ∫₀^dt e^{−σt} dt
                 lSum += tRef * sR * segPerS;
@@ -553,9 +620,22 @@ namespace Vista.Editor
             bool okRange = nonFinite == 0 && alphaLo >= 0f && alphaHi <= 1f && lLo >= 0f
                         && monoAlpha && monoL;
             bool okIdent = worstIdent <= 1e-10;
-            // 全档都必须落在同一支：混着走说明包络算错了，而那时「分支覆盖」这件事
-            // 在报表上会被一个含混的读数掩盖。
-            bool okBranch = seriesCount == 0 || seriesCount == n;
+
+            // ---- 判据③ 为什么不再是一道门（#25）----
+            // 旧版写的是 okBranch = (seriesCount == 0 || seriesCount == n)，理由是
+            // 「混着走说明包络算错了」。那条推理**只在阈值落在配置包络之外时成立** ——
+            // 旧阈值 1e-4 低于包络下端 8.1e-6…2.89e-1 的绝大部分，于是每一档天然整柱同支。
+            // #25 把阈值抬到包络**内部**的 x* = 4.1127e-2 之后，生产档混着走是正常的，
+            // 那道门会立刻变成一条只会误报的红。
+            //
+            // 但不能就这么把门删掉了事 —— 那等于悄悄降低覆盖。真正值得守的性质换了一层：
+            // **两支都得有真实档位走到**。一支没被任何档走到，就又回到了 F 档当初要
+            // 解决的那个问题（「没有判据覆盖的分支 = 永远不会被发现写错的代码」）。
+            // 那是个跨档事实，per-tier 判不了，所以它挪到 Run() 的循环之后，
+            // 由下面这两个计数器承载。它两侧都可失败：阈值调到 +∞ ⇒ 没有档走 exact 支；
+            // 调到 0 ⇒ 没有档走级数支。
+            if (seriesCount == n) { s_TiersAllSeries++; if (s_SeriesAnchor == null) s_SeriesAnchor = tierName; }
+            if (seriesCount <  n) { s_TiersAnyExact++;  if (s_ExactAnchor  == null) s_ExactAnchor  = tierName; }
 
             // ---- ① ----
             sb.Append("　 ").Append(Mark(okAlpha)).Append("① alpha = 1 − T　最坏相对 ")
@@ -610,32 +690,37 @@ namespace Vista.Editor
             // ---- ③ ----
             // 两支的固有误差：exact 支是 S − S·e^{−x} 的抵消 ⇒ ≈ ulp/x；
             // 级数支是截断 ⇒ ≈ x³/24（因为 (1−e^{−x})/x = 1 − x/2 + x²/6 − x³/24 而级数只留到 x²/6）。
-            // 相等处 x⁴ = 24·ulp ⇒ x* = 4.11e-2，这才是**最优**阈值。
-            // 线上那一支写的是 1e-4，比最优低了两个半数量级 —— 于是 x ∈ [1e-4, 4.11e-2]
-            // 这一整段区间里，代码故意走了误差较大的那一支，代价上限 ulp/1e-4 = 1.19e-3。
-            // 这是一条**实测到的**、可以只改一个常量的改进；但那个常量是 AP 也在用的
-            // VistaSegmentIntegral 的，改它要重跑 AP 的两套判据，所以留给 #25。
+            // 相等处 x⁴ = 24·ulp ⇒ x* = 4.1127e-2 —— #25 已经把线上那一支换成了它，
+            // 所以下面 x* 与「线上写的」应当是同一个数；两者若打印得不一样，
+            // 说明 HLSL 的 VISTA_SEGMENT_SERIES_X 和这里的副本走歧了。
+            //
+            // 这一格**不是门**（理由见上面 okBranch 被拆掉那段）：阈值现在落在配置包络
+            // 内部，混着走是生产档的正常形态。门在 Run() 循环之后的跨档覆盖格上。
             double xStar = System.Math.Pow(24.0 * k_Fp32UlpAtOne, 0.25);
-            double branchErr = seriesCount == n
-                ? xMax * xMax * xMax / 24.0
-                : k_Fp32UlpAtOne / System.Math.Max(xMin, 1e-30);
-            sb.Append("　 ").Append(Mark(okBranch)).Append("③ x = σ_t·Δ ∈ [")
+            double errSeries = seriesCount > 0 ? xSeriesMax * xSeriesMax * xSeriesMax / 24.0 : 0.0;
+            double errExact  = seriesCount < n ? k_Fp32UlpAtOne / xExactMin : 0.0;
+            double branchErr = System.Math.Max(errSeries, errExact);
+            sb.Append("　 ⓘ③ x = σ_t·Δ ∈ [")
               .Append(Sci(xMin)).Append(", ").Append(Sci(xMax)).Append("]　")
               .Append(seriesCount == n ? "整柱走**级数支**" :
-                      seriesCount == 0 ? "整柱走 exact 支" : "两支混着走（包络算错了？）")
+                      seriesCount == 0 ? "整柱走 exact 支" : "两支混着走（阈值落在本档 x 区间内，正常）")
               .Append("（阈值 x ≤ ").Append(Sci(k_SeriesThreshold)).Append("，级数片数 ")
               .Append(seriesCount).Append("/").Append(n).Append("）")
               .Append("　推导包络 [8.1e-6, 2.89e-1]").AppendLine();
             sb.Append("　　 ⓘ 所走那一支的固有误差（推导，非实测）最坏 ").Append(Sci(branchErr))
-              .Append("　最优阈值 x* = (24·ulp)^¼ = ").Append(Sci(xStar))
-              .Append("，线上写的是 ").Append(Sci(k_SeriesThreshold));
-            if (seriesCount == 0 && xMin < xStar)
-                sb.Append("　← 本档最短的一段（x = ").Append(Sci(xMin))
-                  .Append("）落在「阈值选低了」的带里：该走级数支（误差 ")
-                  .Append(Sci(xMin * xMin * xMin / 24.0))
-                  .Append("）却走了 exact 支（").Append(Sci(branchErr))
-                  .Append("）—— 一个常量的事，但那个常量 AP 也在用，留给 #25");
-            sb.AppendLine();
+              .Append("　= max(级数 ").Append(Sci(errSeries))
+              .Append(" @ x ").Append(Sci(xSeriesMax))
+              .Append("，exact ").Append(Sci(errExact))
+              .Append(" @ x ").Append(seriesCount < n ? Sci(xExactMin) : "—")
+              .Append(")　最优阈值 x* = (24·ulp)^¼ = ").Append(Sci(xStar))
+              .Append("，线上写的是 ").Append(Sci(k_SeriesThreshold))
+              .Append(System.Math.Abs(k_SeriesThreshold / xStar - 1.0) < 1e-3
+                      ? "　✔ 同一个数" : "　✘ 与最优值不符（两处副本走歧了？）")
+              .AppendLine();
+            sb.AppendLine("　　 ⓘ 这些读数都低于本档的门 " + Sci(k_RelGate)
+                        + " 两个数量级以上 —— 也就是说阈值换成 x* 这件事，"
+                        + "判据能证明的只有「没变坏」，证明不了「变好了」。"
+                        + "那个「变好」是推导出来的（见 AtmosphereScattering.hlsl），不是量出来的。");
 
             // ---- ④ ----
             sb.Append("　 ").Append(Mark(okRange)).Append("④ 有限性/值域/单调：非有限 ")
@@ -654,7 +739,7 @@ namespace Vista.Editor
               .AppendLine("　—— 望远镜恒等式成立 ⇒ 参考解里没有离散化误差项，"
                         + "这是门能开在 fp16 地板的 2 倍上的全部依据");
 
-            return okAlpha && okL && okRange && okIdent && okBranch;
+            return okAlpha && okL && okRange && okIdent;
         }
 
         // ---------------------------------------------------------------- 判据⑤

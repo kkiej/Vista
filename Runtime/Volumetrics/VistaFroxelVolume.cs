@@ -33,6 +33,21 @@ namespace Vista
         // 语义写在 VistaFroxelIntegrationSelfTest 里（唯一消费者）。
         public const int k_IntegrationReportFloat4PerSlice = 4;
 
+        // #25 的分层权重探针：每个采样点五个 float4。
+        // 语义写在 VistaFogLayeringSelfTest 里（唯一消费者），与上面两个同一条约定 ——
+        // 布局写在消费端，「读错字段」才会在报表上直接显形。
+        // 这个数必须与 shader 里那句 `uint b = id.x * 5u` 一致：不一致时 D3D11
+        // 静默丢弃越界的 UAV 写，判据会读到一格恒为 0 的初值并把它当成读数。
+        public const int k_LayeringProbeFloat4PerSample = 5;
+
+        /// <summary>
+        /// 探针前若干个采样点是**指定点**（t = 0 / D−band / D−band/2 / D / D+band / 2D），
+        /// 其余按扫掠上界均匀铺开。必须与 <c>VolumetricFog.compute</c> 里的
+        /// <c>VISTA_LAYERING_ANCHORS</c> 逐位相等 —— 不等的症状是判据③把某个
+        /// 均匀扫掠点当成指定点去比「w 恰为 0.5」，而它当然不是。
+        /// </summary>
+        public const int k_LayeringProbeAnchors = 6;
+
         /// <summary>
         /// 阴影覆盖性探针的槽位数（#20 起 19，#22a 追加重投影的 14 格到 33，
         /// #22b 追加抖动源统计的 47 格到 80【实为 82：另含 BN 尺寸两格】，
@@ -90,6 +105,7 @@ namespace Vista
         readonly int m_KernelReprojProbeIdx = -1;
         readonly int m_KernelJitterProbeIdx = -1;
         readonly int m_KernelLocalLightProbeIdx = -1;
+        readonly int m_KernelLayeringProbeIdx = -1;
 
         // 注入表是**双缓冲**（#22）：本帧写一张、读另一张做时间重投影。
         //
@@ -116,6 +132,7 @@ namespace Vista
         GraphicsBuffer m_SliceReport;
         GraphicsBuffer m_ShadowProbe;
         GraphicsBuffer m_IntegrationReport;
+        GraphicsBuffer m_LayeringProbe;
 
         // 可空而不是直接存 struct：null 表示「还没分配过」。
         // 存 struct 的话就得靠一个哨兵值（比如 depth == 0）表达同一件事，
@@ -150,21 +167,23 @@ namespace Vista
                 m_KernelJitterProbeIdx = m_Cs.FindKernel("FroxelJitterProbe");
             if (m_Cs.HasKernel("FroxelLocalLightProbe"))
                 m_KernelLocalLightProbeIdx = m_Cs.FindKernel("FroxelLocalLightProbe");
+            if (m_Cs.HasKernel("FroxelLayeringProbe"))
+                m_KernelLayeringProbeIdx = m_Cs.FindKernel("FroxelLayeringProbe");
         }
 
         /// <summary>
-        /// 十个核都在。分开判「资源在不在」（<see cref="isAllocated"/>）与「核在不在」，
+        /// 十一个核都在。分开判「资源在不在」（<see cref="isAllocated"/>）与「核在不在」，
         /// 理由与 <c>VistaAtmosphereLuts</c> 那四个独立的 valid 属性相同：
         /// 前者是每帧可变的状态，后者在构造之后就是常量，混成一个属性
         /// 会让「shader 编译坏了」与「这一帧还没分配」在日志上长得一样。
         ///
-        /// 要求**全部都在**而不是按核分成十个属性：它们在同一个 .compute 文件里，
-        /// 一个编译失败就是十个都没有。真正会出现的「部分缺失」只有一种 ——
+        /// 要求**全部都在**而不是按核分成十一个属性：它们在同一个 .compute 文件里，
+        /// 一个编译失败就是十一个都没有。真正会出现的「部分缺失」只有一种 ——
         /// #pragma kernel 那行写错了名字 —— 那时按整体判会让整条近层雾路径退出，
-        /// 比让九个核继续跑、第十个安静地什么都不做要好归因。
+        /// 比让十个核继续跑、第十一个安静地什么都不做要好归因。
         ///
-        /// 五个自检核（SynthMedium / IntegralVerify / ReprojProbe / JitterProbe /
-        /// LocalLightProbe）也算进来，
+        /// 六个自检核（SynthMedium / IntegralVerify / ReprojProbe / JitterProbe /
+        /// LocalLightProbe / LayeringProbe）也算进来，
         /// 尽管线上路径不派发它们：
         /// 「一个默认关闭、又没有判据覆盖的开关，等于一段永远不会被发现写错的代码」——
         /// 把它们纳入 isValid，核名写错就会在**第一次真实渲染**时报出来，
@@ -175,7 +194,8 @@ namespace Vista
             && m_KernelInjectionIdx >= 0 && m_KernelShadowProbeIdx >= 0
             && m_KernelIntegrationIdx >= 0 && m_KernelSynthMediumIdx >= 0
             && m_KernelIntegralVerifyIdx >= 0 && m_KernelReprojProbeIdx >= 0
-            && m_KernelJitterProbeIdx >= 0 && m_KernelLocalLightProbeIdx >= 0;
+            && m_KernelJitterProbeIdx >= 0 && m_KernelLocalLightProbeIdx >= 0
+            && m_KernelLayeringProbeIdx >= 0;
 
         public bool isAllocated => m_InjectionBuffers[0] != null && m_InjectionBuffers[1] != null
             && m_Integral != null;
@@ -212,6 +232,7 @@ namespace Vista
         public GraphicsBuffer sliceReportBuffer => m_SliceReport;
         public GraphicsBuffer shadowProbeBuffer => m_ShadowProbe;
         public GraphicsBuffer integrationReportBuffer => m_IntegrationReport;
+        public GraphicsBuffer layeringProbeBuffer => m_LayeringProbe;
 
         /// <summary>这一帧实际分配下来的口径。没分配过时为 null。</summary>
         public VistaFroxelVolumeDesc? allocatedDesc => m_Allocated;
@@ -762,6 +783,59 @@ namespace Vista
             dispatcher.Dispatch(m_Cs, m_KernelLocalLightProbeIdx, 4, 4, 16);
         }
 
+        /// <summary>
+        /// 按需分配 #25 分层探针的读回 buffer（<paramref name="sampleCount"/> × 5 个 float4）。
+        /// 与另两个报告 buffer 分开：每采样点的容量不同，合成一个会让两套判据的下标互相牵连。
+        /// </summary>
+        public void EnsureLayeringProbeBuffer(int sampleCount)
+        {
+            int count = Mathf.Max(1, sampleCount) * k_LayeringProbeFloat4PerSample;
+            if (m_LayeringProbe != null && m_LayeringProbe.count == count) return;
+
+            m_LayeringProbe?.Dispose();
+            m_LayeringProbe = new GraphicsBuffer(
+                GraphicsBuffer.Target.Structured, count, sizeof(float) * 4)
+            {
+                name = "VistaFroxelLayeringProbe",
+            };
+        }
+
+        /// <summary>
+        /// #25 的分层权重探针。沿 t 扫掠近/远两层的归属权重，把 (w, 1−w) 与
+        /// **同一份**雾采样被两个权重缩放后的三组读数搬进探针 buffer。
+        ///
+        /// **不挂 <see cref="isAllocated"/> 这道门**（与 <see cref="DispatchLocalLightProbe"/>
+        /// 同款理由，但这里更彻底）：这一趟一张纹理都不绑、一张表都不读 ——
+        /// 权重是 t 与 <c>VistaFogCB</c> 的纯函数，雾采样是 t、rayDir.y 与同一个 cbuffer 的
+        /// 纯函数。挂上去的代价是判据在「froxel 体还没分配」的那一帧变成空判据，
+        /// 而分层这件事跟体分不分配得出来毫无关系。
+        ///
+        /// 同理**不下发** <c>_VistaFogLayering</c>：那一份必须由调用方经
+        /// <c>VistaAtmosphereViewData.BindFog</c> 推下去，也就是**线上那一份**绑定代码。
+        /// 在这里补一发等于让判据自带一份布景，于是「CPU 打包的 D 和 shader 用的 D
+        /// 不是同一个」这条失效会被探针自己抹平 —— 而那正是本判据要抓的东西。
+        ///
+        /// <paramref name="sweepKm"/> 传 2·D；零态档（D = 0）必须传一个固定正数，
+        /// 否则整条扫掠退化成同一个点，「零态下 w ≡ 1」就只测了 t = 0 一处。
+        /// <paramref name="rayDirY"/> **不能传 0**：雾的高度剖面沿 y 变，dir.y = 0 会让
+        /// density 全程恒等于同一个数，于是判据②「density 没被权重缩放」退化成
+        /// 「常量 == 常量」，缩放写错了也照样绿。
+        /// </summary>
+        public void DispatchLayeringProbe<T>(in T dispatcher, int sampleCount,
+                                             float sweepKm, float rayDirY)
+            where T : IVistaLutDispatcher
+        {
+            if (!isValid || m_LayeringProbe == null || sampleCount <= 0) return;
+
+            dispatcher.SetGlobalVector(VistaShaderIDs._VistaFroxelLayeringProbe,
+                new Vector4(sampleCount, sweepKm, rayDirY, 0f));
+            dispatcher.SetBuffer(m_Cs, m_KernelLayeringProbeIdx,
+                VistaShaderIDs._VistaFroxelLayeringProbeRW,
+                VistaLutBufferSlot.FroxelLayeringProbe);
+            dispatcher.Dispatch(m_Cs, m_KernelLayeringProbeIdx,
+                VistaComputeUtils.DivRoundUp(sampleCount, 64), 1, 1);
+        }
+
         void Allocate(in VistaFroxelVolumeDesc desc)
         {
             m_InjectionBuffers[0] = AllocVolume(desc, "VistaFroxelInjection[0]");
@@ -826,6 +900,8 @@ namespace Vista
             m_ShadowProbe = null;
             m_IntegrationReport?.Dispose();
             m_IntegrationReport = null;
+            m_LayeringProbe?.Dispose();
+            m_LayeringProbe = null;
         }
     }
 }

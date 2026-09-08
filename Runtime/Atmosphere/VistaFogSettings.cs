@@ -28,10 +28,23 @@ namespace Vista
             /// </summary>
             AerialPerspective = 1,
 
-            // Froxel（档 A，PC 主线）不在这里 —— 它要等 #19 的近层体积存在之后才能加。
-            // 现在就放一个「选了什么都不发生」的枚举值，等于把一个哑档位摆给美术；
-            // 而且近层与 AP LUT 都是从 t = 0 开始积分的，两层同时开会把近段的雾算两遍，
-            // 那个 double-counting 的归属是 #25（统一采样函数）。
+            /// <summary>
+            /// 近层 froxel 体 + AP LUT 分层（档 A，PC 主线）。
+            ///
+            /// 近层负责 [0, D]（D = froxel 体的接手距离，被 shadow distance 夹住），
+            /// 逐 froxel 采级联阴影 ⇒ 光柱、局部灯（#23）、局部雾体（#24）都只在这一层里。
+            /// AP LUT 负责其余的 (D, 32 km]，无阴影、无局部项。
+            ///
+            /// 两层怎么不重不漏：<c>FogMedium.hlsl</c> 里的 <c>VistaFogApWeight</c>
+            /// 把 σ_fog 在两层之间**互补**地分掉（w 与 1−w），指数一相乘就拼回
+            /// 完整的光学厚度。合成在 <c>VistaSampleAerialPerspective</c> 里，
+            /// 消费者一行都不用改。
+            ///
+            /// 选了本档但 froxel 体这一帧不存在（feature 上的注入开关关着、
+            /// 或体积分配失败）时会退化成 <see cref="AerialPerspective"/> ——
+            /// 权重的零态让 AP 吃满雾，画面只是没有光柱，不会突然没有雾。
+            /// </summary>
+            Froxel = 2,
         }
 
         /// <summary>密度怎么给。两者都换成同一个 σ_t，只是口径不同。</summary>
@@ -198,6 +211,55 @@ namespace Vista
                 finiteH ? 1f / scaleHeightMeters : 0f,
                 Mathf.Max(0f, skyAmbientIntensity),
                 enableSunSelfShadow && finiteH ? 1f : 0f);
+        }
+
+        /// <summary>
+        /// 交接带占接手距离 D 的比例。硬编码不暴露给美术 —— 见下面的理由。
+        /// </summary>
+        public const float k_HandoffBandFraction = 0.15f;
+
+        /// <summary>
+        /// 这一帧到底有没有「近层」。<paramref name="handoffMeters"/> 是 pass 那边
+        /// 解出来的接手距离（0 = froxel 体这一帧不存在）。
+        ///
+        /// 抽成一个谓词而不是让两处各写一遍同样的三个条件：它有**两个**消费者 ——
+        /// <see cref="PackedLayering"/>（决定雾怎么在两层之间分）与 pass 里那个
+        /// <c>_VistaFroxelComposite</c> 的开关位（决定采样端要不要去采近层的表）。
+        /// 两者若走歧，得到的是最坏的一种失效：一边认为近层认领了 [0, D] 的雾，
+        /// 另一边却不去采那张表 —— 那段雾**凭空消失**，而两边各自看都是自洽的。
+        /// </summary>
+        public bool UsesNearLayer(float handoffMeters)
+            => enabled && mode == Mode.Froxel && handoffMeters > 0f;
+
+        /// <summary>
+        /// x: 近层接手距离 D (km), y: 交接带宽度 (km), z: 1/交接带宽度 (1/km), w: 保留。
+        ///
+        /// <see cref="UsesNearLayer"/> 为 false 时返回全零 —— 而 <c>VistaFogApWeight</c>
+        /// 在零态下恒返回 1，于是 AP 吃满雾、近层什么都不认领，
+        /// **逐位等于本改动之前**。
+        /// 这就是「失能态 = 零态」在这一层的具体含义，也是移动端那一档不受影响的保证。
+        ///
+        /// 为什么交接带宽度是硬编码的比例、不给美术一个旋钮：
+        /// 它要控制的是「近层独有的那几项（阴影 / 局部灯 / 局部体）在 D 处别硬切」，
+        /// 而 D 本身已经被 shadow distance 夹住了。再多一个旋钮，
+        /// 美术能配出「带宽 > D」这种让权重在相机处就不是 1 的组合，
+        /// 症状是近处的光柱莫名其妙变淡 —— 一个没人能反查的行为。
+        /// 0.15 的来源：默认 D = 48 m ⇒ 带宽 7.2 m，
+        /// 比 froxel 最后一片的厚度（48 × (1 − 1/1.083) = 3.7 m）宽约 2 片，
+        /// 也就是「交接至少铺开两片」这个下界。切片数变了要重核这个数。
+        /// </summary>
+        public Vector4 PackedLayering(float handoffMeters)
+        {
+            if (!UsesNearLayer(handoffMeters))
+                return Vector4.zero;
+
+            float dKm    = handoffMeters * 0.001f;
+            float bandKm = dKm * k_HandoffBandFraction;
+
+            // bandKm 恒 > 0（handoffMeters > 0 且比例是正的常量），所以这里的
+            // 除法不需要兜底。写成需要兜底的形态反而会把「D 可能是 0」这条
+            // 已经在上面拦掉的路重新显得像是活的。
+            return new Vector4(dKm, bandKm, 1f / bandKm, 0f);
         }
 
         public VistaFogSettings Clone() => (VistaFogSettings)MemberwiseClone();

@@ -126,6 +126,8 @@ namespace Vista
         FroxelShadowProbe,
         /// <summary>仅 Editor 自检使用（#21 的逐片积分报告）。运行时路径不分配它。</summary>
         FroxelIntegrationReport,
+        /// <summary>仅 Editor 自检使用（#25 的分层权重探针）。运行时路径不分配它。</summary>
+        FroxelLayeringProbe,
     }
 
     /// <summary>
@@ -273,6 +275,7 @@ namespace Vista
             VistaLutBufferSlot.FroxelSliceReport     => m_Luts.froxelSliceReportBuffer,
             VistaLutBufferSlot.FroxelShadowProbe     => m_Luts.froxelShadowProbeBuffer,
             VistaLutBufferSlot.FroxelIntegrationReport => m_Luts.froxelIntegrationReportBuffer,
+            VistaLutBufferSlot.FroxelLayeringProbe    => m_Luts.froxelLayeringProbeBuffer,
             _                                        => null,
         };
     }

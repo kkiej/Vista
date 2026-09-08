@@ -3,8 +3,9 @@
 //
 //  #19 交付「资源 + 分布 + 判据」，#20 交付逐 froxel 的光照注入，#21 交付深度积分，
 //  #22a 交付抖动 + 时间重投影，#22b 交付蓝噪声源与横向形态的两档对照，
-//  #23 交付局部灯（点光/聚光/副平行光）参与介质散射。
-//  十个核：
+//  #23 交付局部灯（点光/聚光/副平行光）参与介质散射，
+//  #25 把近层贴上画面并与 AP 分层。
+//  十一个核：
 //    FroxelPlaceholder   把切片几何写进注入表 —— 它**不是**雾，是一份能被读回来对账的
 //                        已知内容。存在的理由是「RWTexture3D 绑定失败」这个坑：
 //                        RTHandle 的 2D 便捷重载会静默建成 Tex2D，症状只有 Editor.log
@@ -28,11 +29,16 @@
 //                        各跑一遍再比灯集合位图（超集判据），并把 URP 的 cluster 元数据、
 //                        三个引擎内建全局的哨兵、以及近/远端钳位的命中次数搬进探针 buffer。
 //                        「同一个点」是那条超集判据成立的全部前提，所以它不能拆成两次派发。
+//    FroxelLayeringProbe #25 判据的探针：沿 t 扫掠近/远两层的归属权重，把
+//                        (w, 1−w) 与**同一份**雾采样被两个权重缩放后的三组读数
+//                        搬进探针 buffer。它调的是线上那一份 VistaScaleFogSample，
+//                        所以「谁被缩放、谁不被缩放」是被测的而不是被假设的。
+//                        一张表都不读 —— 权重是 t 与 cbuffer 的纯函数。
 //
-//  #22a 之后 VistaFogSettings.Mode 里**仍然没有** Froxel 档 ——
-//  一个选了什么都不发生的枚举值等于把哑档位摆给美术，而把积分结果贴到画面上是 #25。
-//  #20~#22 的这条链路因此挂在一个开发者开关上（默认关），画面上要看到它得开
-//  Debug View；而那个开关关着的时候由 Window/Vista/Log Volumetric Fog State 点名。
+//  #25 之后 VistaFogSettings.Mode 里有了 Froxel 档：近层认领 [0, D]、AP 认领其余，
+//  两层靠 VistaFogApWeight 的互补分法不重不漏（推导见 FogMedium.hlsl）。
+//  档 D（AerialPerspective）与 Off 档下权重是零态 ⇒ AP 吃满雾，
+//  这条链路逐位等于 #25 之前 —— 移动端那一档因此完全不受影响。
 // ============================================================================
 
 #pragma kernel FroxelPlaceholder
@@ -45,6 +51,7 @@
 #pragma kernel FroxelReprojProbe
 #pragma kernel FroxelJitterProbe
 #pragma kernel FroxelLocalLightProbe
+#pragma kernel FroxelLayeringProbe
 
 // 与大气那批核同一条排除线：GLES 没有 RWTexture3D，编译只会产出一堆噪声。
 #pragma only_renderers d3d11 vulkan metal playstation xboxone xboxseries switch
@@ -165,6 +172,22 @@ RWStructuredBuffer<float4> _VistaFroxelIntegrationReportRW;
 // 只有 FroxelSynthMedium 读它 —— 线上路径一个字节都不下发，
 // 所以它的零态（σ_t = 0, S = 0）就是「没有布景」。
 float4 _VistaFroxelSynthMedium;
+
+// ---------------------------------------------------------------- #25 分层判据
+// 探针参数。
+//   x 采样数 N（含前 k_AnchorCount 个**指定点**，见 FroxelLayeringProbe）
+//   y 扫掠上界 (km)。C# 传 2·D；零态档（D = 0）传一个固定正数，
+//     否则整条扫掠会退化成同一个点，「零态下 w ≡ 1」就变成只测了 t = 0 一处。
+//   z rayDir.y。**不能传 0**：雾的高度剖面沿 y 变，dir.y = 0 会让 density
+//     全程恒等于同一个数，于是「density 没被权重缩放」这条判据退化成
+//     「常量 == 常量」，缩放写错了也照样绿。
+//   w 保留
+float4 _VistaFroxelLayeringProbe;
+
+// 每个采样点五个 float4。语义写在唯一的消费端（VistaFogLayeringSelfTest）——
+// 与上面两个报告 buffer 同一条约定：把布局写在消费端，「读错字段」才会
+// 在判据的报表上直接显形，而不是在这里和那边各写一份注释慢慢走歧。
+RWStructuredBuffer<float4> _VistaFroxelLayeringProbeRW;
 
 
 // ----------------------------------------------------------------------------
@@ -431,6 +454,15 @@ VistaFroxelSample VistaFroxelSampleAt(float2 pixelCenter, float slice)
     // 体不喂 fog.density（太阳自遮蔽的无限平板闭式解装不进一个盒子，
     // 已知近似，理由在 FogVolumes.hlsl 头注）。
     VistaApplyFogVolumes(o.posWS, o.fog);
+    // 交接带（#25）。放在局部体**之后**是刻意的：交接带要淡出的正是
+    // 「近层独有、AP 结构上表达不了」的那一整套 —— 级联阴影、#23 的局部灯、
+    // #24 的局部体。它们全都按 σ_s 走，所以对合成后的 σ 乘一次 1−w，
+    // 三样一起淡出，不需要三处分别写淡出。
+    //
+    // 反过来说，这也是局部体不能骑在远边界上的原因（FogVolumes.hlsl 头注里
+    // 那条「已知语义」在这里从"被切开"变成了"被淡出"—— 好一些，但仍然不是
+    // 体该有的形状）。
+    VistaScaleFogSample(o.fog, VistaFogNearWeight(o.tKm));
     o.smp = VistaEvaluateScatterSample(
         o.posKm, o.rayDir, _VistaSunDirection.xyz, o.fog, s, VistaFroxelSunShadow(o.posWS));
 
@@ -1736,4 +1768,90 @@ void FroxelLocalLightProbe(uint3 id : SV_DispatchThreadID)
     float lb  = VistaFroxelLuminance(rb);
     float lc  = VistaFroxelLuminance(rc);
     VistaLlProbeMax(VISTA_PROBE_LL_AB_REL_DIFF, abs(lc - lb) / max(lb, 1.0e-9), 1.0e9);
+}
+
+// ----------------------------------------------------------------------------
+//  #25 判据的探针：近/远两层的雾归属
+//
+//  ---- 它要证明什么 ----
+//  #25 的全部正确性押在一句话上：**两层各认领一部分 σ_fog，加起来恰好是完整的
+//  σ_fog，一点不重一点不漏**。这句话是逐点的代数恒等式（σ·w + σ·(1−w) ≡ σ），
+//  不是积分性质 —— 所以判它不需要 march，逐点扫掠就够，而且逐点扫掠**更强**：
+//  march 会把逐点的偏差在求和里互相抵消掉一部分。
+//
+//  ---- 为什么必须在 GPU 上判，不能在 C# 上算一遍 ----
+//  被判的对象就是 shader 里那两个函数（VistaFogApWeight / VistaScaleFogSample）
+//  在**线上那份 cbuffer** 上的取值。在 C# 里照抄一遍公式，判的是两份实现是否
+//  一致；线上那份写错、抄的那份跟着抄错，判据照样全绿。
+//
+//  ---- 为什么调 VistaScaleFogSample 而不是自己乘 ----
+//  「谁被缩放、谁不被缩放」正是要判的东西之一（density 与 phaseG 必须**不**被缩放，
+//  理由见 FogMedium.hlsl 里那段）。自己写乘法等于把答案先写进探针里。
+//
+//  ---- 一张表都不读 ----
+//  权重是 t 与 cbuffer 的纯函数，雾采样是 t 与 cbuffer 的纯函数。所以这个核
+//  不需要注入表、不需要积分表、不需要阴影 —— 它能在任何一帧、任何相机下跑，
+//  判据因此不依赖「这一帧 froxel 排没排入图」。
+//
+//  ---- 探针 buffer 布局（每个采样点五个 float4，语义的唯一副本在消费端）----
+//  与另外两个报告 buffer 同一条约定，见 VistaFogLayeringSelfTest。
+// ----------------------------------------------------------------------------
+
+// 前几个是**指定点**而不是扫掠点：判据要在 D 与 D−band 这两处摆等号，
+// 而均匀扫掠落不到它们上面（浮点上更落不准）。放在下标最前面，
+// 报表第一眼就是这几行。C# 侧按同一个约定读，那边有一份对照的常量。
+#define VISTA_LAYERING_ANCHORS 6u
+
+[numthreads(64, 1, 1)]
+void FroxelLayeringProbe(uint3 id : SV_DispatchThreadID)
+{
+    uint n = (uint)_VistaFroxelLayeringProbe.x;
+    if (id.x >= n)
+        return;
+
+    float sweepKm = _VistaFroxelLayeringProbe.y;
+    float rayY    = _VistaFroxelLayeringProbe.z;
+
+    // D 与 band 从**线上那份 cbuffer** 取，不从探针参数里另传一份：
+    // 「CPU 下发的 D 和 shader 用的 D 是同一个」正是这条链路上最容易走歧的地方，
+    // 探针再传一份就等于把它绕过去了。C# 侧拿读回的 t 反算这两个数来对账。
+    float dKm    = _VistaFogLayering.x;
+    float bandKm = _VistaFogLayering.y;
+
+    float tKm;
+    if      (id.x == 0u) tKm = 0.0;                     // 相机处：近层必须吃满
+    else if (id.x == 1u) tKm = max(dKm - bandKm, 0.0);  // 交接带近端：w 应恰为 0
+    else if (id.x == 2u) tKm = dKm - bandKm * 0.5;      // 带中点：w 应恰为 0.5
+    else if (id.x == 3u) tKm = dKm;                     // 交接带远端：w 应恰为 1
+    else if (id.x == 4u) tKm = dKm + bandKm;            // 带外
+    else if (id.x == 5u) tKm = 2.0 * dKm;               // 更远
+    else tKm = sweepKm * (float)(id.x - VISTA_LAYERING_ANCHORS)
+                       / (float)(n - VISTA_LAYERING_ANCHORS - 1u);
+
+    float w = VistaFogApWeight(tKm);
+    float k = VistaFogNearWeight(tKm);
+
+    // 一份采样，两个副本 —— 这正是线上的形态：AP 核与注入核拿到的是同一个
+    // VistaSampleFogAlongRay 的结果，各自乘一个权重。
+    VistaFogSample full = VistaSampleFogAlongRay(tKm, rayY);
+    VistaFogSample ap   = full;
+    VistaFogSample nr   = full;
+    VistaScaleFogSample(ap, w);
+    VistaScaleFogSample(nr, k);
+
+    // 和在**核内**求：判据要的是 GPU 的 fp32 加法结果。搬回 C# 再加，
+    // 判的就成了 C# 的加法，而线上那两层的和从来不在同一个寄存器里出现过 ——
+    // 这一格是「若它们相加会等于多少」这个反事实量，只能由这里造。
+    uint b = id.x * 5u;
+    _VistaFroxelLayeringProbeRW[b + 0u] = float4(tKm, w, k, w + k);
+    _VistaFroxelLayeringProbeRW[b + 1u] = float4(
+        full.extinction.r, ap.extinction.r, nr.extinction.r,
+        ap.extinction.r + nr.extinction.r);
+    _VistaFroxelLayeringProbeRW[b + 2u] = float4(
+        full.scattering.r, ap.scattering.r, nr.scattering.r,
+        ap.scattering.r + nr.scattering.r);
+    _VistaFroxelLayeringProbeRW[b + 3u] = float4(
+        full.density, ap.density, nr.density, full.phaseG);
+    _VistaFroxelLayeringProbeRW[b + 4u] = float4(
+        ap.phaseG, nr.phaseG, dKm, bandKm);
 }

@@ -57,6 +57,9 @@
 // ============================================================================
 
 #include "Packages/com.kkiej.vista/ShaderLibrary/AtmosphereScattering.hlsl"
+// 近层积分表（#25）。合成在本文件的 VistaSampleAerialPerspective 里，
+// 近层不存在时那张表一次都不会被采（见它自己的开关位）。
+#include "Packages/com.kkiej.vista/ShaderLibrary/FroxelComposite.hlsl"
 
 TEXTURE3D(_VistaApScatterLut);
 TEXTURE3D(_VistaApTransmittanceLut);
@@ -135,8 +138,8 @@ float3 VistaApFroxelRayDirection(float2 uv)
 //  需要绝对光度量的消费者（Step 5 的 SH 投影）乘 rcp(VISTA_EXPOSURE) 还原 ——
 //  fp16 的相对精度与量级无关，还原不丢有效位。
 // ----------------------------------------------------------------------------
-void VistaSampleAerialPerspective(float2 screenUv, float distanceKm,
-                                  out float3 inScatter, out float3 transmittance)
+void VistaSampleApTable(float2 screenUv, float distanceKm,
+                        out float3 inScatter, out float3 transmittance)
 {
     float w = VistaApDistanceToSliceCoord(distanceKm);
 
@@ -159,6 +162,63 @@ void VistaSampleAerialPerspective(float2 screenUv, float distanceKm,
 
     inScatter     = scatter.rgb * nearFade;
     transmittance = lerp(1.0, transmittance, nearFade);
+}
+
+// ----------------------------------------------------------------------------
+//  统一采样函数（#25）
+//
+//  这才是**消费者唯一该调的入口**。上面那个只读远层的表；两层怎么合成
+//  是本函数的事，调用点不需要知道近层存不存在 —— 这正是文件头那句
+//  「要保的不是同一张表，是同一个采样函数」的兑现处。
+//
+//  ------------------------------------------------------------------ 合成
+//      T = T_near · T_ap
+//      S = S_near + T_near · S_ap
+//  近层在前：背景的光先被远层的介质衰减、再被近层衰减（乘法可交换，
+//  所以顺序只影响 S 那一项）。S_ap 主要产生在 D 之外，要额外穿过近层 ⇒ ×T_near。
+//
+//  ------------------------------------------------------------------ 透射率是**精确**的，不是近似
+//  这不是"凑得比较准"，是 VistaFogApWeight 那条互补分法的直接推论：
+//      T_near·T_ap = exp(−∫₀^D σ_fog·(1−w)) · exp(−∫₀^d (σ_atm + σ_fog·w))
+//                  = exp(−∫₀^d (σ_atm + σ_fog))
+//  两层各认领一部分 σ_fog，指数一相乘就拼回完整的光学厚度，**一点都不重、一点都不漏**。
+//  能摆这个等号的前提是「权重互补」而不是「近端硬切」—— 硬切在交接带里
+//  两边都会算一遍（w 不是 0/1 的地方）。判据 (c) 就押在这条恒等式上。
+//
+//  ------------------------------------------------------------------ 内散射有一处已知近似
+//  S_ap 里含有**产生在 [0, D] 之内的大气内散射**（AP 恒从相机积分），
+//  这部分本该只穿过近层的一部分，却被整个 T_near 衰减了一次。
+//  偏差上界 = (1 − T_near(D)) × S_atm([0, D])：默认 D = 48 m，
+//  那 48 m 里的大气内散射本身就是整条视线的 48/32000 = 0.15%，
+//  再乘一个 (1 − T_near) < 1 ⇒ **远小于 fp16 的量化**。
+//  它随 D 增大而增大，所以 D 被 shadow distance 夹住这件事同时也是这条近似的护栏。
+//  修掉它需要 AP 表额外存一份「[0, D] 之内的内散射」—— 多一张表换 0.15% 以下的项，
+//  没有付这个价的理由。
+// ----------------------------------------------------------------------------
+void VistaSampleAerialPerspective(float2 screenUv, float distanceKm,
+                                  out float3 inScatter, out float3 transmittance)
+{
+    float3 apScatter, apTransmittance;
+    VistaSampleApTable(screenUv, distanceKm, apScatter, apTransmittance);
+
+    // 没有近层（档 D / 移动端 / froxel 关）时**整段短路**，逐位等于本改动之前。
+    // 短路而不是"让近层返回 (0, 1) 再照常合成"：后者要多采一次 3D 表，
+    // 而这一帧那张表可能压根没绑（见 FroxelComposite.hlsl 里那条注释）。
+    if (!VistaNearVolumeEnabled())
+    {
+        inScatter     = apScatter;
+        transmittance = apTransmittance;
+        return;
+    }
+
+    float3 nearScatter, nearTransmittance;
+    // km → m 用 CPU 下发的那一个缩放的倒数，不写 1000.0 字面量
+    // （与 VistaFroxelSegmentLengthKm 同一条约定：这个换算只有一份来源）。
+    VistaSampleNearVolume(screenUv, distanceKm / _VistaGround.w,
+                          nearScatter, nearTransmittance);
+
+    transmittance = nearTransmittance * apTransmittance;
+    inScatter     = nearScatter + nearTransmittance * apScatter;
 }
 
 #endif // VISTA_AERIAL_PERSPECTIVE_INCLUDED

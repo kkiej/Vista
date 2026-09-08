@@ -64,6 +64,12 @@ namespace Vista
         public static readonly int _VistaFogAlbedo                = Shader.PropertyToID("_VistaFogAlbedo");
         public static readonly int _VistaFogExtinct               = Shader.PropertyToID("_VistaFogExtinct");
         public static readonly int _VistaFogHeight                = Shader.PropertyToID("_VistaFogHeight");
+        /// <summary>
+        /// 近层 / 远层的雾归属（#25）。与 <c>_VistaApConsumer</c> 同理，**每帧无条件下发**：
+        /// froxel 从开到关的那一帧如果跳过下发，AP 会拿着上一帧的接手距离继续
+        /// 把近段的雾让出去 —— 症状是「关掉体积雾，近处的雾也跟着没了」。
+        /// </summary>
+        public static readonly int _VistaFogLayering              = Shader.PropertyToID("_VistaFogLayering");
 
         // ---- Volumetrics: VistaFroxelCB (ShaderLibrary/FroxelVolume.hlsl) ----
         // 失能态同样是全零：logRatio = 0 且 rcpLog = 0 ⇒ 编码坐标恒 0、距离恒 0，
@@ -198,6 +204,13 @@ namespace Vista
         public static readonly int _VistaFroxelInjectionHistory   = Shader.PropertyToID("_VistaFroxelInjectionHistory");
         public static readonly int _VistaFroxelIntegralRW         = Shader.PropertyToID("_VistaFroxelIntegralRW");
         public static readonly int _VistaFroxelIntegral           = Shader.PropertyToID("_VistaFroxelIntegral");
+        /// <summary>
+        /// 近层积分表的开关与近端淡入（#25）。x &gt; 0.5 = 本帧有表可读，y = 1/第一片存储距离 (1/m)。
+        /// 与 <c>_VistaFogLayering</c> 同一条约定：**每帧无条件下发**。
+        /// 这一位不能省成「看 _VistaFroxelSize.z 是不是 0」—— 那个 cbuffer 是记录期推的，
+        /// froxel 没排入的帧里留着的是上一帧的合法值。
+        /// </summary>
+        public static readonly int _VistaFroxelComposite          = Shader.PropertyToID("_VistaFroxelComposite");
         // 自检专用：逐片的分布报告
         public static readonly int _VistaFroxelSliceReportRW      = Shader.PropertyToID("_VistaFroxelSliceReportRW");
         // 自检专用：阴影覆盖性探针（min/max 的定点编码 + 关键字状态）
@@ -208,6 +221,12 @@ namespace Vista
         // 线上路径**一个字节都不下发** —— 它的零态就是「没有布景」，
         // 所以这条绑定点写错的症状是判据全零，而不是画面上多一层看不出来的雾。
         public static readonly int _VistaFroxelSynthMedium        = Shader.PropertyToID("_VistaFroxelSynthMedium");
+        // 自检专用：#25 分层判据的探针参数 (N, 扫掠上界 km, rayDir.y, 0)。
+        // 与合成介质同一条：线上一个字节都不下发。零态（N = 0）下核直接 return，
+        // 探针 buffer 保持清空态 —— 「没派发」与「派发了但全零」因此可分。
+        public static readonly int _VistaFroxelLayeringProbe       = Shader.PropertyToID("_VistaFroxelLayeringProbe");
+        // 自检专用：#25 分层判据的读回（每采样点 5 个 float4，布局在消费端）
+        public static readonly int _VistaFroxelLayeringProbeRW     = Shader.PropertyToID("_VistaFroxelLayeringProbeRW");
         // 调试视图专用：x = gain，y = 单片档的切片下标（已夹紧），z = 档位，w 保留。
         // 走 MaterialPropertyBlock 下发，不是全局 —— 那一趟 pass 因此不声明
         // AllowGlobalStateModification，「它不改全局」在代码里读得出来。

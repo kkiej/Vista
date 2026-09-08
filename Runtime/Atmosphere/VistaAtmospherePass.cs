@@ -42,6 +42,17 @@ namespace Vista
             public Vector4 apConsumer;
             /// <summary>同上，同一条「每帧无条件下发」的理由。</summary>
             public Vector4 sunTransmittanceRef;
+            /// <summary>
+            /// 近层积分表的开关与近端淡入（#25）。同上，**每帧无条件下发** ——
+            /// 它是唯一能让采样端知道「这一帧那张 3D 表到底绑没绑」的位。
+            /// </summary>
+            public Vector4 froxelComposite;
+            /// <summary>
+            /// 近层的接手距离 D（米），0 = 这一帧没有近层。AP 核据此把 t &lt; D 的雾
+            /// 让给近层（#25）。它与注入核拿到的必须是**同一个数** ——
+            /// 两处都从同一个 <see cref="froxelDesc"/> 取，见 AP pass 里填它处的注释。
+            /// </summary>
+            public float froxelHandoffMeters;
             public TextureHandle transmittance;
             public TextureHandle multiScattering;
             public TextureHandle skyView;
@@ -459,6 +470,29 @@ namespace Vista
                 // 组件不在 / 没在驱动光色时给 (1,1,1,0)，比值恒为 1，整条退化成 no-op。
                 data.sunTransmittanceRef = VistaTimeOfDay.ResolveSunTransmittanceRef();
 
+                // 近层积分表的开关位（#25），同样**每帧无条件下发**，理由同上两段：
+                // froxel 从开到关的那一帧，积分那趟 pass 根本不排入，而采样端
+                // 若还留着上一帧的 1，就会去采一张已经不在图里的 3D 表。
+                //
+                // 为什么不能省成「看 _VistaFroxelSize.z 是不是 0」：那个 cbuffer 是
+                // Prepare 在**记录期**推的，froxel 没排入的帧里它留着的是上一帧的
+                // 合法值 —— 一个「看起来完全正常」的失效。
+                //
+                // y = 1/第一片的存储距离：近层的近端淡入（与 AP 表的 nearFade 同构，
+                // 见 VistaSampleApTable 里那段「按距离淡出而不是按 w 淡出」）。
+                // 关掉时整个 float4 是零态 ⇒ x = 0 ⇒ 采样端整段短路，y 不会被读。
+                //
+                // 开关位与「雾怎么在两层之间分」**必须同一个谓词**（UsesNearLayer）：
+                // 走歧的后果是最坏的一种 —— 一边把 [0,D] 的雾判给了近层，
+                // 另一边却不去采近层的表，那段雾凭空消失，而两边各自看都自洽。
+                // 特别地，档 D（AerialPerspective）下 froxel 体可能仍然分配着，
+                // 但它不参与合成 —— 那正是档 D 的定义（雾全部并进 AP 的 march）。
+                bool nearLayer = froxelEnabled && m_FogSettings != null
+                    && m_FogSettings.UsesNearLayer(froxelDesc.handoffMeters);
+                data.froxelComposite = nearLayer
+                    ? new Vector4(1f, 1f / froxelDesc.StoredDistance(0), 0f, 0f)
+                    : Vector4.zero;
+
                 builder.UseTexture(transmittance, AccessFlags.Read);
                 builder.UseTexture(multiScattering, AccessFlags.Read);
                 builder.UseTexture(skyView, AccessFlags.Write);
@@ -484,6 +518,8 @@ namespace Vista
                     ctx.cmd.SetGlobalVector(VistaShaderIDs._VistaApConsumer, d.apConsumer);
                     ctx.cmd.SetGlobalVector(
                         VistaShaderIDs._VistaSunTransmittanceRef, d.sunTransmittanceRef);
+                    ctx.cmd.SetGlobalVector(
+                        VistaShaderIDs._VistaFroxelComposite, d.froxelComposite);
                 });
             }
 
@@ -735,12 +771,26 @@ namespace Vista
                     builder.UseTexture(froxelInjection, AccessFlags.Read);
                     builder.UseTexture(froxelIntegral, AccessFlags.Write);
 
-                    // 不推任何全局：积分核只吃 _VistaFroxelRange/Size（Prepare 在记录期推的）
-                    // 与 _VistaGround.w（PrepareLuts 推的）。所以这里**没有**
-                    // AllowGlobalStateModification —— 少一个开关等于让「这一趟不改全局」
-                    // 在代码里就能读出来。
+                    // 积分核自己不推任何全局：它只吃 _VistaFroxelRange/Size
+                    // （Prepare 在记录期推的）与 _VistaGround.w（PrepareLuts 推的）。
                     //
-                    // 消费者是 #25 的统一采样函数与 #21 的 debug view，都还不在图里。
+                    // 但产出的表要发布给帧内更晚的消费者（#25 的统一采样函数：
+                    // 全屏合成那一趟、以及 Vista/Lit 的变体 B）—— 那些消费者
+                    // 全都通过全局纹理读，图里没有边。走 SetGlobalTextureAfterPass
+                    // 而不是在 execute 里手绑，是因为**只有前者会让 RenderGraph
+                    // 知道这张资源之后要被当 SRV 读**，从而插入 UAV→SRV 的状态转换；
+                    // 手绑只解决「谁先谁后」，解决不了资源状态。AP 那两张表走的是
+                    // 同一条路（见 VistaAerialPerspectiveCompositePass 里那段注释）。
+                    //
+                    // 发布全局就必须申报 AllowGlobalStateModification —— 少一个开关
+                    // 等于让「这一趟改不改全局」在代码里读不出来。
+                    //
+                    // 开关位（_VistaFroxelComposite）**不在这里推**：它必须在
+                    // froxel 关掉的帧里也下发，而那些帧本 pass 根本不存在。
+                    // 它挂在 Sky-View 那一趟（唯一一个一定存在的逐帧 pass）。
+                    builder.SetGlobalTextureAfterPass(
+                        froxelIntegral, VistaShaderIDs._VistaFroxelIntegral);
+                    builder.AllowGlobalStateModification(true);
                     builder.AllowPassCulling(false);
 
                     builder.SetRenderFunc((LutPassData d, ComputeGraphContext ctx) =>
@@ -977,6 +1027,13 @@ namespace Vista
                 data.apTransmittance = apTransmittance;
                 data.skyAmbientSh = skyAmbientSh;
 
+                // 近层接手距离（#25）。取自与注入核**同一个** froxelDesc 局部变量 ——
+                // 两处若各自算一遍 D，互补权重就不再互补，交接带里会留下一条
+                // 多算或少算的环（而且只在相机移动、shadow distance 变化时才现形）。
+                // froxel 这一帧不存在时传 0 = 权重的零态 = AP 吃满雾，
+                // 逐位等于本改动之前。
+                data.froxelHandoffMeters = froxelEnabled ? froxelDesc.handoffMeters : 0f;
+
                 builder.UseTexture(transmittance, AccessFlags.Read);
                 builder.UseTexture(multiScattering, AccessFlags.Read);
                 builder.UseTexture(apScatter, AccessFlags.Write);
@@ -1001,7 +1058,7 @@ namespace Vista
                 builder.SetRenderFunc((LutPassData d, ComputeGraphContext ctx) =>
                     d.luts.RenderAerialPerspectiveLut(
                         new VistaGraphLutDispatcher(ctx.cmd, Handles(d)),
-                        d.view, d.apSettings, d.fogSettings));
+                        d.view, d.apSettings, d.fogSettings, d.froxelHandoffMeters));
             }
         }
 

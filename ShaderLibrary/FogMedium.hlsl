@@ -92,7 +92,60 @@ CBUFFER_START(VistaFogCB)
     // z 天光环境项强度 (0~1)
     // w > 0.5 = 太阳方向的解析自遮蔽项生效
     float4 _VistaFogHeight;
+    // 近层 / 远层的分工（#25）。见下面 VistaFogApWeight 的推导。
+    // x 近层接手距离 D (km)：0 = 没有近层
+    // y 交接带宽度 (km)
+    // z 1/交接带宽度 (1/km)：0 = 没有近层（零态恒让 AP 吃满雾）
+    // w 保留
+    float4 _VistaFogLayering;
 CBUFFER_END
+
+// ----------------------------------------------------------------------------
+//  近层 / 远层的雾归属权重（#25）
+//
+//  ---- 要解决的是什么 ----
+//  近层 froxel 体覆盖 [0, D]，AP LUT 覆盖 [0, 32 km] —— 注意 AP 也是**从相机**
+//  开始积分的（AtmosphereLut.compute 里 `float tPrev = 0.0;`）。
+//  「把 AP 的 near 推到 D」只改变切片怎么分布，**不改变积分起点**，
+//  所以两层同时开的话，[0, D] 这一段的雾会被算两遍。
+//  （被算两遍的只有**雾**：froxel 注入的是 VistaFogSample，AP 走的是
+//   VistaEvaluateScatterSample = 大气 + 雾。大气那一份只有 AP 有，不重复。）
+//
+//  ---- 分法：一个权重，两边互补 ----
+//      AP 的雾    × w(t)
+//      froxel 的雾 × 1 − w(t)
+//  于是逐点恒有 σ_AP(t) + σ_froxel(t) ≡ σ_fog(t) —— 交接**不创造也不销毁**介质，
+//  只搬动「这一段由谁去算」。这条恒等式是判据能摆等号的原因。
+//
+//  ---- 为什么不是硬切（step） ----
+//  两层对同一份介质的**光照**不同：近层逐 froxel 采级联阴影、吃 #23 的局部灯、
+//  含 #24 的局部体，AP 三样都没有。硬切会让这三样在 D 处整片突变，
+//  症状是「远处某个距离上有一道看得见的环」，而且相机一动环就扫过画面。
+//  所以在 [D−band, D] 上线性交接：近层的贡献（连同它独有的阴影/局部灯/局部体）
+//  按 1−w 淡出，AP 的无阴影版本按 w 淡入，总介质守恒。
+//
+//  ---- 为什么权重必须作用在**注入时**，不能放到合成时 ----
+//  积分表存的是沿深度累积的 (∫σ_s·J·T, 1−T)，近层独有的那几项在累积里
+//  已经和别的项拌在一起了，合成时再想把它们单独淡出是不可能的。
+//  唯一能分离它们的位置是注入的那一刻。
+//
+//  ---- 零态 ----
+//  没有近层（档 D / Off / froxel 关）时 CPU 下发全零，w ≡ saturate(1 − 0) = 1，
+//  AP 吃满雾，与本改动之前**逐位相同**。移动端那一档因此不受影响。
+// ----------------------------------------------------------------------------
+float VistaFogApWeight(float tKm)
+{
+    // 写成 1 − (D − t)·rcpBand 而不是 (t − start)·rcpBand，正是为了零态：
+    // 后者在 rcpBand = 0 时给 0（= 雾全部消失），前者给 1（= 雾全部归 AP）。
+    // 「失能态必须是零态」在这里的具体含义就是这一个减号的方向。
+    return saturate(1.0 - (_VistaFogLayering.x - tKm) * _VistaFogLayering.z);
+}
+
+// 近层该吃多少。两个消费者各调各的一半，和恒为 1。
+float VistaFogNearWeight(float tKm)
+{
+    return 1.0 - VistaFogApWeight(tKm);
+}
 
 // ----------------------------------------------------------------------------
 //  介质采样
@@ -162,6 +215,21 @@ VistaFogSample VistaSampleFog(float heightMeters)
 VistaFogSample VistaSampleFogAlongRay(float tKm, float rayDirWorldY)
 {
     return VistaSampleFog(VistaFogHeightMeters(tKm, rayDirWorldY));
+}
+
+// 按归属权重缩放一份雾采样（#25 的交接）。两个消费者都调这一个。
+//
+// **只缩放 σ_s 与 σ_t，不碰 density 与 phaseG** —— 这不是省事，是两类量的区别：
+//   · σ_s / σ_t 是「这一层认领了多少介质」，正是要分的东西；
+//   · density 喂的是太阳方向自遮蔽的闭式解，它表达的是「照到这一点的阳光
+//     被上方的雾柱挡掉多少」。那根雾柱是**完整**的，不因为这一段的记账
+//     归了另一层就变薄。缩它等于把同一个衰减算两次（σ 一次、光照再一次），
+//     症状是交接带里雾莫名其妙地亮起来一条。
+//   · phaseG 是介质属性，与量无关。
+void VistaScaleFogSample(inout VistaFogSample fog, float weight)
+{
+    fog.extinction *= weight;
+    fog.scattering *= weight;
 }
 
 // ----------------------------------------------------------------------------

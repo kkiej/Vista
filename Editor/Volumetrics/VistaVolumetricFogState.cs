@@ -211,15 +211,14 @@ namespace Vista.EditorTools
         const float k_SegXDerivedMax = 0.289f;
 
         /// <summary>
-        /// VistaSegmentIntegral 现在用的级数分支阈值（AtmosphereScattering.hlsl:492）。
+        /// <c>VistaSegmentIntegral</c> 现在用的级数分支阈值，逐字照抄 HLSL 侧的
+        /// <c>VISTA_SEGMENT_SERIES_X</c>（AtmosphereScattering.hlsl）。
+        ///
+        /// #25 之前这里是两个常量：shipped = 1e-4 与 optimum = (24·2⁻²³)^¼ = 4.1127e-2，
+        /// 报表用两者的差说明「那次替换的影响面」。替换做完之后两者是同一个数，
+        /// 再留两份就变成了同一个量的两份实现 —— 合并成一个。
         /// </summary>
-        const float k_SeriesThresholdShipped = 1.0e-4f;
-
-        /// <summary>
-        /// 那个阈值的最优值 x* = (24·2⁻²³)¼ = 4.113e-2。#25 要把 shipped 换成它，
-        /// 而这一格的读数决定了那次替换的影响面 —— 见下面判据⑫的说明。
-        /// </summary>
-        const float k_SeriesThresholdOptimum = 4.113e-2f;
+        const float k_SeriesThreshold = 4.1127e-2f;
 
         // ---- #22a：重投影两个定点缩放，与 shader 里的 VistaProbeFixed 调用一一对应 ----
         const float k_ReprojStaticErrScale = 1.0e9f;
@@ -905,21 +904,43 @@ namespace Vista.EditorTools
                             + "而空气的 σ_t 不由 VistaFogSettings 给 —— 那条上界要另外推。");
             }
 
-            // 分支覆盖：这是 #25 那次阈值替换的影响面，必须在**换之前**量出来。
+            // 分支覆盖：#25 那次阈值替换（1e-4 → x* = 4.1127e-2）之后，这一格量的是
+            // **真实帧**里两支各自被走到多少。合成介质自检（Window/Vista/Validate Froxel
+            // Integration）覆盖的是构造出来的档位，这里覆盖的是这台机器上真的在跑的那一帧
+            // —— 两者缺一个都会留下「线上其实只走一支」这种看不见的事实。
             if (probeRan)
             {
-                bool seriesCoveredNow = segXMin < k_SeriesThresholdShipped;
-                bool allSeriesAfter    = segXMax < k_SeriesThresholdOptimum;
-                sb.AppendLine($"  ⓘ 级数分支覆盖（VistaSegmentIntegral 的 x ≤ {Sci(k_SeriesThresholdShipped)} 那一支）："
-                            + (seriesCoveredNow
-                                ? "真实帧里**有**段落在级数支上。"
-                                : "真实帧里**没有**任何段落在级数支上 —— 那一支今天只由合成介质自检覆盖。"));
-                sb.AppendLine($"  ⓘ #25 要把阈值换成最优的 x* = {Sci(k_SeriesThresholdOptimum)}。"
-                            + (allSeriesAfter
-                                ? $"换完之后本布景**每一段**都会走级数支（x_max {Sci(segXMax)} < x*）—— "
-                                + "所以那次替换不是一个边角优化，它会整体改写这条积分路径，"
-                                + "AP 必须跟着重跑一遍判据。"
-                                : $"换完之后仍有段走 exp 支（x_max {Sci(segXMax)} ≥ x*），两支都有真实帧覆盖。"));
+                bool anySeries = segXMin <= k_SeriesThreshold;
+                bool anyExact  = segXMax >  k_SeriesThreshold;
+                sb.AppendLine($"  ⓘ 级数分支覆盖（VistaSegmentIntegral 的 x ≤ {Sci(k_SeriesThreshold)} 那一支）："
+                            + (anySeries && anyExact
+                                ? $"真实帧**两支都走到**（x ∈ [{Sci(segXMin)}, {Sci(segXMax)}] 跨过阈值）。"
+                                : anySeries
+                                ? $"真实帧**整柱走级数支**（x_max {Sci(segXMax)} ≤ x*）—— exact 支今天只由合成介质自检覆盖。"
+                                : $"真实帧**整柱走 exact 支**（x_min {Sci(segXMin)} > x*）—— 级数支今天只由合成介质自检覆盖。"));
+
+                // 换完之后本布景那些片的固有误差变了多少。这是**推导**，不是读数：
+                // 两个值都远在任何门之下，没有判据能把这个差量测出来（见 hlsl 里那段
+                // 「诚实地说」）。打出来是为了让「改了什么」有一个可核的数，
+                // 而不是让它看起来像被验证过了。
+                if (segXMin > 0f && segXMin <= k_SeriesThreshold)
+                {
+                    double before = 1.1920928955078125e-7 / segXMin;             // 旧：走 exact 支
+                    double after  = (double)segXMin * segXMin * segXMin / 24.0;  // 新：走级数支
+
+                    // 与门的距离要**算**出来而不是断言。原先这里写死「低两个数量级以上」，
+                    // 而实测 segXMin ~ 1e-3 时 before = 1.2e-4 只有门的 1/17 —— 一个半
+                    // 数量级，那句断言是错的。写成比值就不会再随布景变化而变成假话。
+                    const double gate = 2e-3;   // froxel 深度积分自检的门（fp16 存储地板 ×2.05）
+                    string vsGate = before < gate
+                        ? $"换前那个较大的值也只到积分门 {Sci((float)gate)} 的 1/{gate / before:0.#}，在门的分辨力之下"
+                        : $"⚠ 换前的值已经够到积分门 {Sci((float)gate)} 了 —— 那这次替换本该是可测的，去核门";
+
+                    sb.AppendLine($"  ⓘ 本布景最短一段 x = {Sci(segXMin)} 因这次替换换了支路："
+                                + $"固有误差（推导）{Sci((float)before)} → {Sci((float)after)}，"
+                                + $"改善 {(before / System.Math.Max(after, 1e-30)):0.#} 倍。"
+                                + vsGate + " —— 判据只能证明「没变坏」。");
+                }
             }
 
             // ================================================================ #22a 时间重投影

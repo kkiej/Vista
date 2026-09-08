@@ -260,7 +260,15 @@ namespace Vista
         /// 如果跳过下发，shader 会拿着上一帧的 σ_t 继续算 —— 那正是
         /// <c>_VistaApConsumer</c> 踩过的坑（见 VistaShaderIDs 里那条注释）。
         /// </summary>
-        public void BindFog<T>(T cmd, VistaFogSettings fog)
+        /// <param name="froxelHandoffMeters">
+        /// 近层 froxel 体的接手距离（米）。传 0 = 这一帧没有近层，雾全部归 AP ——
+        /// 见 <see cref="VistaFogSettings.PackedLayering"/> 的零态。
+        /// 它是个参数而不是从 <paramref name="fog"/> 里读的字段，因为「近层这一帧
+        /// 存不存在」是 pass 的调度结果（feature 开关 / 分配是否成功 / 相机类型），
+        /// 不是雾的设置 —— 把它塞进 VistaFogSettings 会让一个每帧都可能变的
+        /// 调度事实伪装成一条美术配置。
+        /// </param>
+        public void BindFog<T>(T cmd, VistaFogSettings fog, float froxelHandoffMeters = 0f)
             where T : struct, IVistaLutDispatcher
         {
             if (fog == null)
@@ -268,12 +276,15 @@ namespace Vista
                 cmd.SetGlobalVector(VistaShaderIDs._VistaFogAlbedo, Vector4.zero);
                 cmd.SetGlobalVector(VistaShaderIDs._VistaFogExtinct, Vector4.zero);
                 cmd.SetGlobalVector(VistaShaderIDs._VistaFogHeight, Vector4.zero);
+                cmd.SetGlobalVector(VistaShaderIDs._VistaFogLayering, Vector4.zero);
                 return;
             }
 
             cmd.SetGlobalVector(VistaShaderIDs._VistaFogAlbedo, fog.packedAlbedo);
             cmd.SetGlobalVector(VistaShaderIDs._VistaFogExtinct, fog.packedExtinct);
             cmd.SetGlobalVector(VistaShaderIDs._VistaFogHeight, fog.PackedHeight(cameraWorldY));
+            cmd.SetGlobalVector(VistaShaderIDs._VistaFogLayering,
+                fog.PackedLayering(froxelHandoffMeters));
         }
     }
 }

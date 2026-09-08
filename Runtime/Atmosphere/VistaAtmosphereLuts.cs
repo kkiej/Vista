@@ -311,6 +311,9 @@ namespace Vista
         /// <summary>froxel 深度积分判据输出（#21）。只在 <c>EnsureIntegrationReportBuffer</c> 之后非 null。</summary>
         public GraphicsBuffer froxelIntegrationReportBuffer => m_FroxelVolume?.integrationReportBuffer;
 
+        /// <summary>froxel 近/远分层权重探针输出（#25）。只在 <c>EnsureLayeringProbeBuffer</c> 之后非 null。</summary>
+        public GraphicsBuffer froxelLayeringProbeBuffer => m_FroxelVolume?.layeringProbeBuffer;
+
         public int skyViewWidth  => m_SkyViewWidth;
         public int skyViewHeight => m_SkyViewHeight;
 
@@ -1029,9 +1032,16 @@ namespace Vista
         /// 雾配置。null / Off 档时下发零态，AP 表逐位等于没有雾（见 <c>FogMedium.hlsl</c>）。
         /// **无条件下发**，包括关雾的那一帧 —— 跳过下发会让核拿着上一帧的 σ_t 继续算。
         /// </param>
+        /// <param name="froxelHandoffMeters">
+        /// 近层 froxel 体的接手距离（米），0 = 这一帧没有近层。
+        /// 非零时本核在 t &lt; D 处**不算雾**（大气照算），把那一段让给近层 —— 见 #25。
+        /// 它必须与近层注入拿到的是**同一个数**：两边用不同的 D，
+        /// 互补权重就不再互补，交接处会出现一条多算或少算的环。
+        /// 同源由调用方保证（两处都取自同一个 <c>VistaFroxelVolumeDesc</c>）。
+        /// </param>
         public void RenderAerialPerspectiveLut<T>(
             T d, in VistaAtmosphereViewData view, VistaAerialPerspectiveSettings settings,
-            VistaFogSettings fog)
+            VistaFogSettings fog, float froxelHandoffMeters = 0f)
             where T : struct, IVistaLutDispatcher
         {
             if (!isAerialPerspectiveValid || m_ApScatter == null) return;
@@ -1045,7 +1055,7 @@ namespace Vista
             //   误差曲线一个数都没变，因为核根本没看到新视图。）
             view.Bind(d, m_SkyViewWidth, m_SkyViewHeight);
             view.BindAerialPerspective(d, settings);
-            view.BindFog(d, fog);
+            view.BindFog(d, fog, froxelHandoffMeters);
 
             d.SetTexture(m_LutCS, m_KernelApIdx,
                 VistaShaderIDs._VistaTransmittanceLut, VistaLutSlot.Transmittance);
@@ -1104,7 +1114,7 @@ namespace Vista
             // 深度映射，跟着雾体一起推就变成「改雾体分辨率会动 AP 的分布」。
             view.Bind(d, m_SkyViewWidth, m_SkyViewHeight);
             view.BindFrustumRays(d);
-            view.BindFog(d, fog);
+            view.BindFog(d, fog, desc.handoffMeters);
 
             // 重投影常量在这里推、而不是在 VistaFroxelVolume.Prepare 里：Prepare 也被
             // 立即模式的自检调用，而自检里没有「上一帧」。放在唯一的消费者旁边，
@@ -1196,7 +1206,7 @@ namespace Vista
 
             view.Bind(d, m_SkyViewWidth, m_SkyViewHeight);
             view.BindFrustumRays(d);
-            view.BindFog(d, fog);
+            view.BindFog(d, fog, desc.handoffMeters);
 
             // ① 在线读数。**第一趟**，且这之前没有任何 reproj.Bind。
             DispatchReprojProbeCounted(d, Vector3.zero, 1);
@@ -1351,7 +1361,7 @@ namespace Vista
 
             view.Bind(d, m_SkyViewWidth, m_SkyViewHeight);
             view.BindFrustumRays(d);
-            view.BindFog(d, fog);
+            view.BindFog(d, fog, m_FroxelVolume.allocatedDesc?.handoffMeters ?? 0f);
 
             m_FroxelVolume.DispatchLocalLightProbe(d, localLights, fogVolumes);
             m_LocalLightProbeDispatches++;
