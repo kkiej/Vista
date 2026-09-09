@@ -405,8 +405,17 @@ void AerialPerspectiveLut(uint3 id : SV_DispatchThreadID)
                 // CPU 侧因此把 g 钳在 ±0.99（VistaFogSettings）。
                 VistaFogSample fog = VistaSampleFogAlongRay(t, rayDir.y);
                 // 近层接手的那一段（t < D）把雾让给 froxel 体（#25）。
-                // 让掉的**只有雾**：大气的 Rayleigh/Mie/臭氧仍然从 t = 0 全额积分，
-                // 因为近层体里根本没有大气介质。
+                // 让掉的**只有雾**：大气的 Rayleigh/Mie/臭氧仍然从 t = 0 全额积分。
+                //
+                // 这句话在 #25 那阵子是错的 —— 当时近层注入的 σ_t 含大气
+                // （VolumetricFog.compute 存的是 smp.extinction），而合成端把两层的
+                // 透射率相乘，于是 σ_atm 在 [0, D] 上过了两遍指数：D = 500 m 时
+                // 灰度 1.0%、蓝光 1.9%，越过本项目 1% 的 Weber 门。
+                // 这一行当时写的理由是「因为近层体里根本没有大气介质」，
+                // 而那正好是另一份源文件里被明确否掉的说法 —— 两边各自把对方
+                // 当理由，谁都没去核对。#25b 用修法 A 把它变成真的：
+                // 近层只注入雾（VistaScatterSample.scatteredFog / extinctionFog）。
+                //
                 // 没有近层时权重恒为 1，这一行逐位等于不存在。
                 VistaScaleFogSample(fog, VistaFogApWeight(t));
 

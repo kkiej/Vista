@@ -794,6 +794,24 @@ namespace Vista.EditorTools
                             + "头号嫌疑：探针写那一段被 probeRequested 的门挡掉了。");
 
             // ---------------------------------------------------------------- 判据⑪ 积分表健康
+            //
+            // 近层这一帧到底持不持有介质。UsesNearLayer 为 false（档 D / Off / froxel 关）时
+            // 层权重是零态 ⇒ w ≡ 1 ⇒ 雾**全部归 AP**；而 #25b 的修法 A 之后大气也全部归 AP
+            // （注入端存的是 extinctionFog / scatteredFog，见 VistaScatterSample）。
+            // 两条合起来：那一档的近层介质是**精确的零**，不是「淡」。
+            //
+            // 这一行必须排在⑪之前，因为⑪c 的断言方向由它决定 —— 而 #25 之前它在⑫那边，
+            // ⑪c 于是只能写成一句「本格只在布景有介质时能失败」的免责声明。
+            var fog = feature.fog;
+            float handoffM   = volume.allocatedDesc.HasValue ? volume.allocatedDesc.Value.handoffMeters : 0f;
+            bool nearHoldsFog = fog != null && fog.UsesNearLayer(handoffM);
+            sb.AppendLine($"ⓘ 近层介质构成：fog.mode = {(fog != null ? fog.mode.ToString() : "（无设置）")}"
+                        + $"，handoff = {handoffM:F2} m ⇒ UsesNearLayer = {nearHoldsFog}"
+                        + (nearHoldsFog
+                            ? " ⇒ 注入表 = 雾·(1−w)（修法 A：大气整段归 AP，近层不碰）。"
+                            : " ⇒ 层权重零态（w ≡ 1）⇒ 注入表**精确为零**（雾归 AP、大气也归 AP）。")
+                        + " 下面 ⑪c 的断言方向、⑫ 的推导下端都挂在这一行上；⑫b 的上界两种情形都成立。");
+
             uint integralNonFinite = raw[k_SlotIntegralNonFinite];
             float alphaMax = raw[k_SlotIntegralAlphaMax] / k_IntegralAlphaScale;
             float lumMax   = raw[k_SlotIntegralLumMax] / k_IntegralLumScale;
@@ -814,20 +832,49 @@ namespace Vista.EditorTools
             sb.AppendLine($"{Mark(alphaRangeOk)}判据⑪b 积分 alpha 定义域：max(1 − T)"
                         + $" = {Sci(alphaMax)}（定义上 ≤ 1，定点分辨率 {Sci(1f / k_IntegralAlphaScale)}）");
 
-            // 「积分表真的被写过」。存 1 − T 而不是 T 这条约定在这里第二次付钱：
+            // 「积分表的内容对不对」。存 1 − T 而不是 T 这条约定在这里第二次付钱：
             // 清空态 alpha = 0，所以 max > 0 就是「有人写过」，不需要额外的哨兵槽位。
             // 存 T 的话清空态是 0 = 全黑，而 0 同时也是「雾浓到不透明」的合法读数。
+            //
+            // ---- 修法 A（#25b）之后这一格分成两档，断言方向相反 ----
+            // 原先它只有一句免责声明（「只在布景有介质时能失败」），而那句话在
+            // UsesNearLayer = false 的档里把一格判据整个让了出去。A 之后那一档
+            // 反而变得**更**可判：近层介质精确为零 ⇒ alpha 必须是**恰好** 0，
+            // 一个刻度都不许有。它拒绝的是「积分核在一个无介质的近层里凭空造出介质」——
+            // 与另一档要拒绝的「该有介质却没写」是两回事，所以不是同一道门的两种写法。
+            //
+            // ---- 那一档缺的是**执行性**，而这里不补 ----
+            // alpha ≡ 0 证明不了积分核这一帧跑过（不跑也是 0）。⑩ 补不上：它的
+            // RAN 位是探针/注入核写的（VolumetricFog.compute:1018），积分核不写探针 buffer。
+            // 但那一档里这张表**没有消费者**：VistaNearVolumeEnabled() 为假时
+            // VistaSampleAerialPerspective 整段短路（AerialPerspective.hlsl:222），
+            // 表这一帧一个字节都不会被读。给一张没人读的表补一道执行性的门，
+            // 守的是这一档里不存在的对象；要付的价是把在线积分派发绑上一个
+            // 只在 probeRequested 的帧才分配的 Editor-only buffer。不付。
             float alphaFloor = 1f / k_IntegralAlphaScale;
-            bool integralWritten = probeRan && alphaMax > alphaFloor;
-            sb.AppendLine($"{Mark(integralWritten)}判据⑪c 积分表被写过：max(1 − T) = {Sci(alphaMax)}"
-                        + $" > 定点地板 {Sci(alphaFloor)}");
-            sb.AppendLine("  ⓘ 这一格**只在布景有介质时能失败**：雾关掉之后只剩空气，"
-                        + "50 m 内的 1 − T 会落到定点地板附近，那时「没写」与「太淡」再次同形。"
-                        + "所以它的作用域必须写出来 —— 下面那条上界是它的归因输入。");
+            uint  alphaRaw   = raw[k_SlotIntegralAlphaMax];
+            bool  integralContentOk = probeRan && (nearHoldsFog ? alphaMax > alphaFloor : alphaRaw == 0u);
+            sb.AppendLine($"{Mark(integralContentOk)}判据⑪c 积分表内容"
+                        + (nearHoldsFog
+                            ? $"（作用域：近层持有介质）：max(1 − T) = {Sci(alphaMax)}"
+                              + $" > 定点地板 {Sci(alphaFloor)}（= 1 个刻度）。"
+                              + "它拒绝的是「积分表没被写过」。"
+                            : $"（作用域：近层零态）：定点读数 = {alphaRaw} 个刻度，必须**恰好** 0。"
+                              + "近层这一档的介质是精确零（修法 A：雾与大气都归 AP），"
+                              + "所以这里判的不是「淡」而是「无」—— 它拒绝的是"
+                              + "「积分核在无介质的近层里凭空造出介质」，任何一个刻度都判红。"));
+            if (!nearHoldsFog)
+                sb.AppendLine("  ⓘ 本档不覆盖积分核的**执行性**（alpha ≡ 0 不区分「跑过且全零」与「没跑」），"
+                            + "理由写在源码里：这一档 VistaNearVolumeEnabled() 为假，积分表没有消费者。"
+                            + "要覆盖执行性：把 fog.mode 切到 Froxel 再跑一次 —— 那一档里它有消费者，"
+                            + "上面那条 > 地板的门同时就是执行性证据。");
 
-            var fog = feature.fog;
-            // #24：局部雾体也算介质。全局雾关着但体在场时，⑪c/⑪d 仍然可判 ——
+            // #24：局部雾体也算介质。全局雾关着但体在场时，⑪d 仍然可判 ——
             // 「雾关着 = 空判据」这条老结论在 #24 之后只对「体也没有」成立。
+            // 注意这道上界与⑪c 的作用域**不是同一个**：⑪d 问的是「场景里有没有雾」，
+            // ⑪c 问的是「这一帧的近层里有没有雾」。AP 档下前者为真、后者为假，
+            // 于是这里印出一条 σ_t = 52.5 /km 的上界去界一个恒为 0 的读数 ——
+            // 上界仍然成立（它是真上界），但比值那条归因在这一档读不出东西。
             float volSigmaSum = fogVolumes.sigmaSumPerKm;
             bool globalFogOn = fog != null && fog.enabled;
             if ((globalFogOn || volSigmaSum > 0f) && volume.allocatedDesc.HasValue)
@@ -853,18 +900,23 @@ namespace Vista.EditorTools
                                 + "上界仍然成立（体相加语义），但比值的「≈ 1 说明贴地」那条读法"
                                 + "在有体时不再适用。");
                 sb.AppendLine($"  ⓘ 比值 {Sci(alphaMax / Mathf.Max(alphaBound, 1e-30f))} 的读法："
-                            + "> 1 是结构性错误（那就是上面这道门）；≈ 1 说明取到 max 的那条射线"
-                            + "几乎全程贴着地面密度走 —— 探针网格里有朝下看的方向，所以这是正常的；"
-                            + "而**相机远高于雾层时**比值仍然 ≈ 1 才是可疑的，那意味着"
-                            + "高度衰减没生效（scaleHeight 被下发成了 0 或 ∞）。"
-                            + "这一格判的是前一种，后一种要靠 #27 的跨布景对照。");
+                            + (nearHoldsFog
+                                ? "> 1 是结构性错误（那就是上面这道门）；≈ 1 说明取到 max 的那条射线"
+                                  + "几乎全程贴着地面密度走 —— 探针网格里有朝下看的方向，所以这是正常的；"
+                                  + "而**相机远高于雾层时**比值仍然 ≈ 1 才是可疑的，那意味着"
+                                  + "高度衰减没生效（scaleHeight 被下发成了 0 或 ∞）。"
+                                  + "这一格判的是前一种，后一种要靠 #27 的跨布景对照。"
+                                : "本档（UsesNearLayer = false）**没有读法** —— 分子恒为 0，"
+                                  + "比值只是在复述⑪c 已经判过的那件事。上面「≈ 1 说明贴地」"
+                                  + "那条归因要等切回 Froxel 档才成立。"));
             }
             else
             {
                 // 空判据的格子要在报表上点名。
                 sb.AppendLine("ⓘ 判据⑪d 未覆盖：全局雾关着（Fog ▸ Mode = Off 或 σ_t = 0）"
                             + "**且**场景里没有局部雾体（#24），没有可比的上界。"
-                            + "此时判据⑪c 也失去了失败能力 —— 上面已经说明。");
+                            + "此时⑪c 落在**零态那一档**（近层无介质 ⇒ 判 alpha 恰好为 0），"
+                            + "它仍然能失败，只是失败的含义变成了「凭空造介质」。");
             }
 
             sb.AppendLine($"  ⓘ 积分 rgb 的最大亮度分量 = {Sci(lumMax)}"
@@ -916,24 +968,13 @@ namespace Vista.EditorTools
             }
             if (shortestSlice < 0) shortestMeters = 0f;
 
-            // 近层这一帧到底持不持有雾。UsesNearLayer 为 false（档 D / Off / froxel 关）时
-            // 层权重是零态 ⇒ w ≡ 1 ⇒ 雾**全部归 AP**，注入表里剩下的只有大气。
-            //
-            // 这是本节最该先读的一行，而 #25 之前它不存在 —— 代价是「雾不在近层」
-            // 与「雾算错了」在报表上完全同形：一次 ✘⑫ 因此只能靠手推 σ = x/Δ 归因，
-            // 而那条路要先猜到「该去查 fog.mode」才走得通。
-            float handoffM   = volume.allocatedDesc.HasValue ? volume.allocatedDesc.Value.handoffMeters : 0f;
-            bool nearHoldsFog = fog != null && fog.UsesNearLayer(handoffM);
-            sb.AppendLine($"ⓘ 近层介质构成：fog.mode = {(fog != null ? fog.mode.ToString() : "（无设置）")}"
-                        + $"，handoff = {handoffM:F2} m ⇒ UsesNearLayer = {nearHoldsFog}"
-                        + (nearHoldsFog
-                            ? " ⇒ 注入表 = 大气 + 雾·(1−w)。"
-                            : " ⇒ 层权重零态（w ≡ 1），雾全部归 AP ⇒ **注入表里只有大气**。")
-                        + " 下面 ⑫ 的推导下端只在近层持有雾时才成立，⑫b 的上界两种情形都成立。");
-
-            // ⑫ 的下端「晴空最近一段」是在**近层持有雾**这个前提下推的。前提不成立时
-            // 近层是纯大气，σ 掉一到两个数量级，那道下端判的就是另一个介质了 ——
+            // ⑫ 的下端「晴空最近一段」是在**近层持有介质**这个前提下推的
+            // （nearHoldsFog 与那条 ⓘ 已经在⑪之前印过，理由见那里）。前提不成立时
+            // 近层是精确的零，那道下端判的就不是「另一个介质」而是「没有介质」——
             // 这时候只判上端，并把作用域点名（与⑪c/⑫b 同一条纪律）。
+            //
+            // 修法 A 之后这句话比 #25 时更强：那时零态下近层还剩大气（σ 掉一到两个
+            // 数量级但不为零），现在是精确 0，下端连「量级对不对」都无从谈起。
             bool envelopeUpperOk = probeRan && segXMax <= k_SegXDerivedMax && segXMin <= segXMax;
             bool envelopeOk = envelopeUpperOk && (!nearHoldsFog || segXMin >= k_SegXDerivedMin);
             sb.AppendLine($"{Mark(envelopeOk)}判据⑫ 段光学厚度包络：实测 x ∈ "
@@ -941,26 +982,91 @@ namespace Vista.EditorTools
                         + $"[{Sci(k_SegXDerivedMin)}, {Sci(k_SegXDerivedMax)}]"
                         + $"（区间宽 ×{Sci(k_SegXDerivedMax / k_SegXDerivedMin)} —— 这是一道**宽门**，"
                         + "它抓的是量级整体挪位，抓不到一个数量级内的偏差）"
-                        + (nearHoldsFog ? "" : "　⚠ 近层无雾 ⇒ **下端不判**，本格只判上端"));
+                        + (nearHoldsFog ? "" : "　⚠ 近层零态 ⇒ **下端不判**，本格只判上端"));
             sb.AppendLine($"  ⓘ 定点分辨率 {Sci(1f / k_SegXScale)}，下端还剩 "
                         + $"{(probeRan ? segXMinRaw.ToString() : "—")} 个刻度 ——"
                         + "「地板与被测量同量级时尺子会自己伪造结论」这条在这里是量出来的，不是估的。");
 
             // 把 x 除回段长，得到「实测 σ」。这是归因的主力：x 本身混着段长的 176 倍
             // 跨度，两端各除以自己那一段的长度之后，剩下的才是介质本身。
-            // 判据不押在它上面（探针没记录 x_min/x_max 落在哪一段，所以这两个商只是
-            // **量级**，不是那两个 froxel 真实的 σ）—— 但一个量级就足以分开
-            // 「纯大气 ~2e-2 /km」与「地面雾 2.5 /km」这两种介质。
+            //
+            // 两个商**不是同一种东西**，方向必须写对（第一版写成了「都只是量级」，
+            // 那是一句把两个方向相反的界抹平的话）：
+            //   · x_max 落在某段 k 上，Δ_k ≤ Δ_max ⇒ σ_k ≥ x_max / Δ_max ——**下界**；
+            //   · x_min 落在某段 j 上，Δ_j ≥ Δ_min ⇒ σ_j ≤ x_min / Δ_min ——**上界**。
+            // 探针没记录 x_min/x_max 落在哪一段，所以取等不成立，只有这两个界成立。
+            //
+            // 这两个商是**归因**用的，不是判据的操作数：⑫c 判的是定点刻度本身
+            // （见下面），而这里把刻度翻译成「某个 froxel 的 σ 至少 / 至多是多少」，
+            // 好让一次红能直接读出「漏进来的是雾还是大气」。红的时候才印下界。
+            const float k_SigmaAtmGroundPerKm = 2.189e-2f;   // Rayleigh 灰度 1.749e-2 + Mie 消光 4.40e-3
             if (probeRan && shortestMeters > 0f && longestMeters > 0f)
             {
-                sb.AppendLine($"  ⓘ 实测 σ 的量级（x ÷ 段长，只判量级不判值）："
+                float sigmaLower = segXMax / (longestMeters  * 1.0e-3f);   // 下界
+                float sigmaUpper = segXMin / (shortestMeters * 1.0e-3f);   // 上界
+
+                sb.AppendLine($"  ⓘ 实测 σ：x_max ÷ 最长段 {longestMeters:F3} m（切片 {longestSlice}）= "
+                            + $"{Sci(sigmaLower)} /km，这是某个 froxel 的 σ **下界**；"
                             + $"x_min ÷ 最短段 {shortestMeters:F3} m（切片 {shortestSlice}）= "
-                            + $"{Sci(segXMin / (shortestMeters * 1.0e-3f))} /km；"
-                            + $"x_max ÷ 最长段 {longestMeters:F3} m（切片 {longestSlice}）= "
-                            + $"{Sci(segXMax / (longestMeters * 1.0e-3f))} /km。"
-                            + $"对照：地面雾 σ_t = {Sci(globalFogOn ? fog.extinctionPerKm : 0f)} /km，"
-                            + "地表大气灰度 σ_t ≈ 2.2e-2 /km（Rayleigh 灰度 1.75e-2 + Mie 消光 4.4e-3）。"
-                            + "两个商都落在大气那一档 ⇒ 近层里没有雾。");
+                            + $"{Sci(sigmaUpper)} /km，这是另一个 froxel 的 σ **上界**。"
+                            + $"对照：地面雾 σ_t = {Sci(globalFogOn ? fog.extinctionPerKm : 0f)} /km"
+                            + (volSigmaSum > 0f ? $"（+ 体 Σσ {Sci(volSigmaSum)}）" : "")
+                            + $"，地表大气灰度 σ_t = {Sci(k_SigmaAtmGroundPerKm)} /km"
+                            + "（Rayleigh 灰度 1.749e-2 + Mie 消光 4.40e-3）。");
+
+                // ---- 判据⑫c 零态：注入表必须**精确**为零 ----
+                //
+                // 作用域：只在 UsesNearLayer = false 时判。
+                //
+                // 这道门在 #25b 之前摆的是「σ 下界 ≤ 2 × 地表大气灰度」。那时零态下
+                // 近层还剩大气，能判的最强的话就只是「量级落在大气档」。修法 A 把大气
+                // 也整段交给了 AP，零态从此是**精确的零**，门跟着从一个带余量的比较
+                // 变成一条恒等式：定点读数必须是 0 个刻度。
+                //
+                // 换掉旧门不是「顺手收紧」，是因为旧门**判不了修法 A 自己**：A 之前的
+                // 实测 σ 下界 2.021e-2 /km 稳稳落在 2 × 2.189e-2 = 4.378e-2 之下 ——
+                // 也就是说「大气还留在近层里」这个 A 要消灭的状态，旧门是绿的。
+                // 一道对被测改动免疫的门不是这个改动的回归护栏，它只是碰巧同时为真。
+                //
+                // 「恰好 0 刻度」的实际含义（定点尺子要报自己的地板）：VistaProbeFixed
+                // 的缩放是 1e9，半个刻度 = 5e-10，对应最长段上的 σ < 1.4e-7 /km，
+                // 比地表大气低五个数量级。这不是「约等于零」，是这把尺子能表达的最强的零。
+                //
+                // 但也要说清它**判不到**什么：注入端若给 extinctionFog 兜一个 1e-9 的底
+                // （scattered 那一份就有），x 会是 3.7e-3 个刻度，照样舍入成 0 ⇒ 本门仍绿。
+                // 所以「失能态 = 零态」这条约定在这一层是源码级的选择，不是这里量出来的 ——
+                // 不能拿本格的绿去替它背书。
+                //
+                // UsesNearLayer = true 时不判：那一档的上界已经是⑫b，这里再摆一道
+                // 只会是同一道门的第二份实现，而且是更松的那一份。
+                if (!nearHoldsFog)
+                {
+                    uint  segXMaxRaw = raw[k_SlotSegXMax];
+                    bool  zeroStateOk = segXMaxRaw == 0u;
+                    float dMaxKm = longestMeters * 1.0e-3f;
+                    // 两个错答案都**算**出来，不写死。它们相差 2400 倍，而本门的地板
+                    // 是 0 —— 也就是说这道门不是「摆在两者之间」，是摆在两者之下，
+                    // 靠的是零态的恒等性而不是一个挑出来的阈值。
+                    float wrongAtmX  = k_SigmaAtmGroundPerKm * dMaxKm;                       // A 没生效
+                    float wrongFogX  = ((globalFogOn ? fog.extinctionPerKm : 0f) + volSigmaSum) * dMaxKm; // 层权重零态没生效
+                    sb.AppendLine($"{Mark(zeroStateOk)}判据⑫c 零态精确性（作用域：UsesNearLayer = false）："
+                                + $"注入表 x 的定点读数 max = {segXMaxRaw} 刻度，必须**恰好** 0"
+                                + $"（缩放 1e9 ⇒ 半刻度 5e-10 ⇒ 最长段 {longestMeters:F3} m 上 σ < 1.4e-7 /km）。"
+                                + (zeroStateOk ? "" : $" 折合 σ 下界 {Sci(sigmaLower)} /km。")
+                                + " 它拒绝两个错答案，都是算出来的：①修法 A 没生效、大气还留在近层 ⇒ "
+                                + $"x = σ_atm {Sci(k_SigmaAtmGroundPerKm)} × Δ_max = {Sci(wrongAtmX)} = "
+                                + $"{wrongAtmX * k_SegXScale:N0} 刻度；②层权重零态没生效、雾漏进近层 ⇒ "
+                                + $"x = {Sci(wrongFogX)} = {wrongFogX * k_SegXScale:N0} 刻度"
+                                + $"（是①的 {wrongFogX / Mathf.Max(wrongAtmX, 1e-30f):0.#} 倍）。"
+                                + "①才是本门存在的理由 —— 旧门（≤ 2 × 地表大气灰度）对它是绿的。");
+                }
+                else
+                {
+                    sb.AppendLine("  ⓘ 判据⑫c 未覆盖（作用域外）：UsesNearLayer = true ⇒ 近层里本来就该有雾，"
+                                + "「注入表恒为零」在这一档是假的。这一档的上界由⑫b 判、下端由⑫ 判 —— "
+                                + "两档合起来才把两种构成都盖住。"
+                                + "要覆盖本格：把 fog.mode 切回 AerialPerspective 再跑一次。");
+                }
             }
 
             // ⑫b 一道**紧**门。⑫ 那道推导区间宽 3.6e4 倍，挡不住一个 1000 倍的单位错；
@@ -2099,28 +2205,31 @@ namespace Vista.EditorTools
                 sb.AppendLine($"  AP 的接手点应当是 handoff = {d.handoffMeters:F3} m，"
                             + $"不是 far = {d.farMeters:F1} m（差 {d.farMeters - d.handoffMeters:F3} m）。");
 
-                // 这条曾经记的是「**雾**在 [0, D] 上被两层各算一遍」，并写着「归 #25」。
-                // #25 用 σ 逐点互补分摊（σ_AP = σ_fog·w，σ_froxel = σ_fog·(1−w)）把雾那
-                // 一半解决了 —— 但**大气那一半没动**：注入 kernel 采的 σ_t 含
-                // Rayleigh + Mie + 臭氧（VolumetricFog.compute:511），而 AP LUT 恒从
-                // t = 0 积分且只让掉了雾（AtmosphereLut.compute:407），
-                // 合成端又把两个 T 乘起来（AerialPerspective.hlsl:220）。
-                // 于是 σ_atm 在 [0, D] 上仍然进了两遍指数。
+                // 这条曾经是一条 ⚠：「大气在 [0, handoff] 上被两层各积一遍」。
+                // #25 用 σ 逐点互补分摊解决了雾那一半，大气那一半直到 #25b 才修 ——
+                // 修法 A：近层**只**注入雾（VistaScatterSample 里的 extinctionFog /
+                // scatteredFog），[0, D] 上的大气整段归 AP。当时的病灶是三处源文件对
+                // 同一个量持相反的信念、且互为对方的理由，所以这里保留一条**活的**读数：
+                // 修好的东西留一个数比留一句「已修复」更难悄悄退化 —— 它现在盯的是
+                // A 留下的两处残余，而不是那次双计。
                 //
-                // 三处源文件对这同一个量持相反的信念，且互为对方的理由 —— 那正是
-                // 这条注释长期停在「已归 #25」而没人再看的后果。所以现在把**当前**
-                // 数值印出来，让它每一帧自己报一次，而不是靠读注释想起来。
-                double tauAtm = 2.02e-2 * d.handoffMeters * 1.0e-3;   // 灰度 σ_atm，实测口径
-                sb.AppendLine($"  ⚠ 大气在 [0, handoff] 上仍被两层各积一遍（#25 只分摊了雾）："
-                            + $"灰度 σ_atm ≈ 2.02e-2 /km × {d.handoffMeters:F3} m ⇒ "
-                            + $"τ 重复 {Sci((float)tauAtm)}，透射率偏差 {tauAtm * 100.0:0.###}%"
-                            + (nearHoldsFog
-                                ? " —— **本帧是活的**（UsesNearLayer = true，两层都在积）。"
-                                : " —— 本帧是潜伏的：UsesNearLayer = false，合成端直接短路，"
-                                  + "近层表建了但没人采，画面上一个像素都没错。")
-                            + $" 蓝光约为灰度的 1.9 倍。handoff 被 shadow distance 顶到 500 m 时"
-                            + "灰度 ~1.0%、蓝光 ~1.9%，越过本项目 1% 的 Weber 门 —— "
-                            + "也就是说它现在没暴露只是因为 D 小，不是因为它无害。");
+                // 两处残余都是「近层的雾内散射缺了 σ_atm 那一点衰减」，同一个 τ：
+                //   ①[0, D] 上大气的太阳入散射从此没有级联阴影（AP 那份无阴影）
+                //     ⇒ 晴空里没有空气光柱。光柱本来就是雾的现象。
+                //   ②局部灯（#23）打在空气上的入散射只被雾的透射率衰减。
+                //     它不能像①那样让给 AP —— AP 不知道局部灯的存在，让出去是丢一整项。
+                double tauAtm = k_SigmaAtmGroundPerKm * d.handoffMeters * 1.0e-3;
+                sb.AppendLine($"  ⓘ 修法 A（#25b）的残余：灰度 σ_atm {Sci(k_SigmaAtmGroundPerKm)} /km"
+                            + $" × {d.handoffMeters:F3} m ⇒ τ = {Sci((float)tauAtm)}，"
+                            + $"即 {tauAtm * 100.0:0.###}% —— 这是①晴空无空气光柱、"
+                            + "②局部灯入散射少算的衰减，两者共用的量级。"
+                            + $"对照同一段里雾的 τ = {Sci((globalFogOn ? fog.extinctionPerKm : 0f) * (float)d.handoffMeters * 1e-3f)}"
+                            + "（高两个数量级），以及本项目 1% 的 Weber 门。"
+                            + $" handoff 被 shadow distance 顶到 500 m 时残余升到 "
+                            + $"{k_SigmaAtmGroundPerKm * 0.5 * 100.0:0.##}%（蓝光约 1.9 倍）—— "
+                            + "所以 D 被 shadow distance 夹住这件事同时也是这条近似的护栏，"
+                            + "这一行就是那道护栏的读数。"
+                            + (nearHoldsFog ? "" : " 本帧 UsesNearLayer = false ⇒ 近层不参与合成，残余为 0。"));
             }
 
             sb.AppendLine("ⓘ 注入**历史**表没有「写入路径」这回事：双缓冲的交换"
@@ -2128,7 +2237,9 @@ namespace Vista.EditorTools
                         + "FroxelInjection 指向的那张，下一帧交换后它就成了历史。"
                         + "所以要覆盖的是「读到的是不是上一帧那张」—— 判据⑬（静止恒等性）、"
                         + "⑭b（在线掩码与 CPU 状态双向一致）、⑮（六条失效路径 + 计数守恒）盯的就是这一条。\n"
-                        + "  积分表的 RenderGraph 写入路径由判据⑩⑪⑫覆盖，画面侧由 Debug View 的四个档位覆盖。");
+                        + "  积分表的 RenderGraph 写入路径由判据⑩⑪⑫覆盖，画面侧由 Debug View 的四个档位覆盖。\n"
+                        + "  但那条覆盖**只在 UsesNearLayer = true 的帧成立**：零态下积分表恒零，"
+                        + "⑪c 转而判「不许凭空造介质」，写入路径的执行性无覆盖 —— 而那一档它也没有消费者。");
             sb.AppendLine("ⓘ 未覆盖（推迟到 #27）：判据⑯ 收敛性 —— 「累积真的降了噪、且没有引入偏差」。"
                         + "三条理由：①#27 本来就持有残影/收敛这一项，且带一个跨布景对照（本节没有对照，"
                         + "而「一个跨布景稳定复现的差值只有在两个布景做同样工作时才是尺子噪声」）；"

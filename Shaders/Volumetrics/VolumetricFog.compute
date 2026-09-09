@@ -484,31 +484,40 @@ float4 VistaFroxelInject(float2 pixelCenter, float slice)
     //
     // diag 在这里是丢掉的：所有的写都是死代码，编译器会连位图的八个选择一起消掉。
     // 判据探针（FroxelLocalLightProbe）拿的是同一个函数，只是把 diag 读出来。
+    // 太阳那一项只取**雾的**入散射（修法 A，#25b）：[0, D] 上大气的入散射与消光
+    // 由 AP LUT 全包，AP 恒从 t = 0 积分，近层再算一遍就是让 σ_atm 在合成端
+    // T_near · T_ap 里过两遍指数。理由与代价写在 VistaScatterSample.scatteredFog 上。
+    //
+    // 局部灯那一项**保留大气的 σ_s**（VistaLocalLightMediumFrom 取的是
+    // smp.scatteringRayleigh / scatteringMie）：AP 里没有局部灯，剥掉它不是去重、
+    // 是丢一整项。这两项在这一行里方向相反，正是因为「AP 有没有对应的那一份」
+    // 不同 —— 判去重还是判丢失，看的是另一层有没有，不是这一层有没有。
     VistaLocalLightDiag llDiag = VistaLocalLightDiagInit();
-    float3 scattered = fs.smp.scattered + VistaAccumulateLocalLights(
+    float3 scattered = fs.smp.scatteredFog + VistaAccumulateLocalLights(
         fs.uv, fs.posWS, fs.rayDir, VistaLocalLightMediumFrom(fs.smp, fs.fog), llDiag);
 
     // ---- 存什么 ----
     //  rgb: 散射源项 σ_s·J，**预曝光**（× VISTA_EXPOSURE）。与 AP LUT 同一条约定，
     //       理由同样是 fp16 的 65504 天花板：浓雾对着低太阳时源项到 3.7e5 cd/m²。
-    //  a:   灰度消光 σ_t (1/km)。
+    //  a:   灰度消光 σ_t (1/km)，**只有雾**（修法 A，#25b）。
     //
     //  ---- 为什么消光存灰度而不是 RGB ----
     //  一个 float4 就够，而分通道要 RGBA16F × 2（注入 + 历史 + 积分三张表全部翻倍）。
-    //  代价是彩色消光被平均掉，包络已经量过：
-    //    · 默认档 D = 61.374 m：Rayleigh τ_blue = 2.0e-3 vs 灰度 1.07e-3
-    //      ⇒ 透射率相差 0.096%，远在 1% 的 Weber 门之下；
-    //    · clamp 到 shadow distance 的极端档 D = 500 m：τ_blue = 16.6e-3 vs 灰度 8.75e-3
-    //      ⇒ 0.78%，仍在门内（这是「各通道对灰度均值」的差，不是蓝红之间的差 1.4%）；
-    //    · 雾自己的 σ_t 由 densityTint 决定，中性色时**精确**为 0 误差。
-    //  也就是说这个近似的失效点在 D 远大于 500 m 时，而 D 的上限本身被
-    //  级联阴影距离压着（超出就没有光柱可注入了）。远处的彩色消光由 AP LUT 负责，
-    //  它存的是分通道透射率。
+    //  代价是彩色消光被平均掉。这条包络在修法 A 之后**变松了一整个数量级**：
+    //  原先要界的是「大气 + 雾」，大气的 Rayleigh 是本项目里彩色差最大的那一项
+    //  （τ_blue/τ_grey ≈ 1.9），D = 500 m 时它单独就到 0.78%、逼着 1% 的门；
+    //  现在近层里只剩雾，而雾的 σ_t 由 densityTint 决定 —— 中性色时**精确**为 0 误差，
+    //  染色时误差正比于 tint 的通道差，是美术自己能看到的量。
+    //  大气的彩色消光整个归了 AP LUT，它存的本来就是分通道透射率。
     //
-    //  注意：这里的 σ_t **含大气**（Rayleigh + Mie + 臭氧），不只有雾。
-    //  D = 500 m 时蓝光的大气 τ 是 16.6e-3 = 1.66%，已经越过 1% 的门 ——
-    //  近层体只算雾、把大气整段留给 AP 是不成立的。
-    float greyExtinction = dot(fs.smp.extinction, (1.0 / 3.0).xxx);
+    //  ---- 这里曾经写着什么 ----
+    //  「注意：这里的 σ_t **含大气**……近层体只算雾、把大气整段留给 AP 是不成立的。」
+    //  那句话把「不成立」的理由记成了「大气的 τ 越过 1% 的门」—— 越过门说明这一段
+    //  大气不能**被忽略**，但它推不出「必须由近层来算」：AP 已经从 t = 0 算过它了。
+    //  真正的问题从来是两层都算，而不是哪一层算。同一份注释还与
+    //  AtmosphereLut.compute 里那句「近层体里根本没有大气介质」互相矛盾，
+    //  两边各自引用对方当理由，谁也没有去核对另一边的代码。
+    float greyExtinction = dot(fs.smp.extinctionFog, (1.0 / 3.0).xxx);
     return float4(scattered * VISTA_EXPOSURE, greyExtinction);
 }
 

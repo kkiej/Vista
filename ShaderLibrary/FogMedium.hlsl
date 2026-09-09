@@ -108,8 +108,15 @@ CBUFFER_END
 //  开始积分的（AtmosphereLut.compute 里 `float tPrev = 0.0;`）。
 //  「把 AP 的 near 推到 D」只改变切片怎么分布，**不改变积分起点**，
 //  所以两层同时开的话，[0, D] 这一段的雾会被算两遍。
-//  （被算两遍的只有**雾**：froxel 注入的是 VistaFogSample，AP 走的是
-//   VistaEvaluateScatterSample = 大气 + 雾。大气那一份只有 AP 有，不重复。）
+//
+//  （#25 当时在这里写的是：「被算两遍的只有**雾**：froxel 注入的是 VistaFogSample，
+//    AP 走的是 VistaEvaluateScatterSample = 大气 + 雾。大气那一份只有 AP 有，
+//    不重复。」—— 前半句是对的，后半句是**错的**：froxel 注入端存的不是
+//    VistaFogSample，而是 VistaEvaluateScatterSample 的输出（smp.extinction），
+//    那里面同样含大气。这句话的错法很典型：它描述的是**该传什么**，
+//    而不是注入端**实际存了什么**，两者中间隔着一个函数返回值。
+//    大气因此也被算了两遍，量级见 AerialPerspective.hlsl 的恒等式那一节。
+//    #25b 的修法 A 让注入端改存 extinctionFog / scatteredFog，这句话才成为真的。）
 //
 //  ---- 分法：一个权重，两边互补 ----
 //      AP 的雾    × w(t)

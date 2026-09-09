@@ -261,6 +261,24 @@ struct VistaScatterSample
 {
     float3 scattered;   // 该点的散射源项（已含相位、到太阳的透射率、星球阴影、多次散射、雾）
 
+    // ---- 雾那一半，单独再给一份（#25b / 修法 A）----
+    //
+    // scattered 是「大气 + 雾」，scatteredFog 是其中雾的那一项。**不是**两份实现：
+    // 下面只写了一次雾的表达式，算进一个局部量之后分给两个字段。
+    //
+    // 存在的理由是近层 froxel 体与 AP LUT 的分工。AP 恒从 t = 0 积分
+    // （AtmosphereLut.compute 里 `float tPrev = 0.0`），所以 [0, D] 上的**大气**
+    // 由 AP 全包；近层体若也把大气算进去，合成端 T_near · T_ap 就把 σ_atm
+    // 在这一段上过了两遍指数。#25 用 σ 逐点互补分摊解决了雾那一半，大气那一半
+    // 只能靠「近层根本不碰大气」——因为大气的分摊权重不存在：AP 没有对应的 1−w。
+    //
+    // 代价（已知、量过、不藏）：[0, D] 上大气的单次散射从此拿不到级联阴影，
+    // 只有 AP 那份无阴影的。也就是**晴空里没有空气光柱**。
+    // 量级：σ_s,atm 灰度 ≈ 1.8e-2 /km，D = 50 m ⇒ τ = 9e-4，即天空亮度的 0.09%，
+    // 在 1% 的 Weber 门之下一个数量级；同一段里雾 σ_t = 2.5 /km 给的是 τ = 0.125，
+    // 高两个数量级。光柱本来就是雾的现象，不是空气的。
+    float3 scatteredFog;
+
     // 大气两个组分的散射系数 σ_s（1/km），**不含雾**（雾的那一份在调用方手里的
     // VistaFogSample.scattering 上）。两个消费者：
     //   · MS LUT 要的是两者之和（入射亮度恒为 1 时的散射传递量，见 :637 那一次累加）；
@@ -272,10 +290,17 @@ struct VistaScatterSample
     // 又让「这一点的 σ_s 是多少」有了两份来源。分叉的症状是**局部灯的光锥浓度
     // 与太阳的雾浓度对不上**，而那看起来像相位或强度写错了。
     // 拆成两个字段后 MS LUT 那一处只多一次加法（编译器会把它折进已有的累加）。
+    //
+    // 注意这两份**在修法 A 之后仍然给近层用**：局部灯打在空气上的入散射，AP 里
+    // 一个字都没有（AP 不知道局部灯的存在）。近层若也把它剥掉，这一项就是被
+    // **丢掉**，不是被去重 —— 与大气的太阳项性质完全不同，那一项 AP 有。
+    // 残余近似：这部分入散射在 [0, D] 上只被**雾的**透射率衰减，缺了 σ_atm 的
+    // 那一点（D = 50 m 时 0.1%）。同一个数量级下换掉一整项才是更坏的交易。
     float3 scatteringRayleigh;
     float3 scatteringMie;
 
-    float3 extinction;  // 已兜底 >= 1e-9，可直接作除数
+    float3 extinction;      // 大气 + 雾，已兜底 >= 1e-9，可直接作除数
+    float3 extinctionFog;   // 只有雾。近层体存的就是它 —— 理由同 scatteredFog
 };
 
 // ----------------------------------------------------------------------------
@@ -393,14 +418,17 @@ VistaScatterSample VistaEvaluateScatterSample(
                 * (earthShadow * transmittanceToSun * phaseTimesScattering)
                 + s.sunIlluminance * multiScattered;
 
-    // 雾的直射 + 环境项，一次累加。
+    // 雾的直射 + 环境项。表达式只写一次，算进 fogTerm 之后分给两个字段 ——
+    // scattered 里的雾与 scatteredFog **不是两份实现**，是同一个局部量的两个去处。
     // 与 #18b 之前不是逐位相同（雾那一项的结合顺序变了，fp32 相对扰动 ~1e-7），
     // 但晴空是逐位相同的 —— fog.scattering = 0 时这整项精确为 0。
     // 提取的收益（J 只有一份实现）远大于这个扰动，它比 fp16 的 LUT 存储精度还小两个数量级。
-    o.scattered += fog.scattering * VistaFogSourceRadiance(
+    float3 fogTerm = fog.scattering * VistaFogSourceRadiance(
         fog, rayDir, sunDir, transmittanceToSun, earthShadow,
         VistaFogTransmittanceToSun(fog, sunDir.y),
         s.sunIlluminance, s.fogAmbientRadiance, s.applyPhase);
+    o.scattered   += fogTerm;
+    o.scatteredFog = fogTerm;
 
     // 不含雾：MS LUT 是静态的、球对称参数化的大气量，见 FogMedium.hlsl。
     // 逐组分转出去（而不是在这里求和）的理由见结构体那里 —— #23 的局部灯要分开的两份。
@@ -408,6 +436,20 @@ VistaScatterSample VistaEvaluateScatterSample(
     o.scatteringMie      = medium.scatteringMie;
     // 大气顶附近密度指数衰减到接近 0，除法要兜底
     o.extinction = max(medium.extinction + fog.extinction, 1e-9);
+    // 雾那一份**不兜底**：它没有除数消费者（上面那个 max 是为除法准备的），
+    // 而近层体在零态下要精确读到 0 —— 兜一个底进去，「近层没有介质」就变成了
+    // 「近层有一点点介质」。失能态 = 零态。
+    //
+    // 但这条选择**没有判据背书**，说清楚免得下一个人以为有：⑫c 那道门判的是
+    // 定点刻度恰好为 0，缩放 1e9、最长段 3.7 m ⇒ 一个 1e-9 的底只值 3.7e-3 个刻度，
+    // 舍入之后还是 0，⑫c 照样绿。它能抓的是**大气**漏进来那一档（8e-5 ⇒ 8 万刻度，
+    // #25b 实测 7.5 万），抓不到一个贴着定点地板的兜底。
+    // 所以这里写的是一条源码级约定，不是一条被量到的性质 ——
+    // 「一条只写在注释里的恒等式不会自己失败」那句话对本行同样成立。
+    //
+    // #25b 修法 A：近层**只**注入雾。[0, D] 上的大气整段归 AP，
+    // 理由与两处残余写在 AerialPerspective.hlsl 的「内散射有两处已知近似」。
+    o.extinctionFog = fog.extinction;
     return o;
 }
 
