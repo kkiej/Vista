@@ -799,6 +799,55 @@ void FroxelIntegralVerify(uint3 id : SV_DispatchThreadID)
 #define VISTA_PROBE_REPROJ_COVER_COUNT    31u  // 角色 3 + 4：线程数
 #define VISTA_PROBE_REPROJ_JITTER_SPREAD  32u  // 角色 1：抖动引起的相对亮度散布 max，×1e6
 
+// ---- #27 追加：抖动散布**按亮度分层**（111~128，仍是角色 1）----
+//  为什么加这一批：32 号那个全局 max 在配置一个字没改的情况下，24 次运行里
+//  读到过 3.648e-1 一直到 1.000e+0（其中 11 次精确饱和在 1.0）。一把跨度 ×2.7
+//  的尺子摆不出门；更硬的一条是——它饱和到 1.000 时，报表印出的可执行结论是
+//  「luminanceRejectStart 必须 > 1.000」，而那个字段是 [Range(0, 1)]。
+//  **一条在它红的时候要求字段范围外的值的判据，不是摆得太松，是无法被满足。**
+//
+//  病根的候选（这一批就是去证伪/证实它的）：rel 的分母只有 1e-6 的绝对地板，
+//  于是一格只要一次抽样落进阴影/局部灯半径外（lA≈0）而另一次落在外面，
+//  rel 就**精确等于 1** —— 量到的是「有没有哪一格跨过一条明暗边界」，
+//  不是「抖动制造了多大亮度变化」，而那一格的辐亮度约等于 0，
+//  历史被拒掉在画面上没有代价。
+//
+//  所以这一批**只印不判**（第一阶段）：先把「max 住在哪个亮度上」变成读数。
+//  门等看到分布之后再定——「不知道要守什么之前先写一道门」正是要避免的东西。
+//
+//  32 号**保持原样不动**：那 24 次历史读数要能与新读数对得上，
+//  换掉它等于把唯一的时间序列也一起丢掉。
+#define VISTA_PROBE_JITTER_BUCKET_MAX     111u  // 111~118：按 log2(lum) 分的 8 个倍频程桶，各桶 max rel ×1e6
+#define VISTA_PROBE_JITTER_BUCKET_COUNT   119u  // 119~126：各桶落进多少格（和必须 == ONLINE_COUNT）
+#define VISTA_PROBE_JITTER_ARGMAX_PACKED  127u  // (relQ20 << 12) | lumCode12：max 连同它所在的亮度一起取
+#define VISTA_PROBE_JITTER_LUM_MAX        128u  // 全局 max(lA, lB)，log2 编码 ×1e6（见 VistaProbeLumLog2）
+#define VISTA_PROBE_JITTER_BUCKETS        8u
+
+// ---- #27 第二次重建：rel 自己的直方图（129~144，仍是角色 1）----
+//  上面那批**按亮度分层**的结果是：16384 格全部落进最亮的那一个桶，下面七个桶全空
+//  （三次运行一致，全局 max lum ≈ 4.2，最暗的格子也 ≥ 0.1）。
+//  于是它做成了一件事、没做成另一件：
+//   · 做成了：把「max 被 lA≈0 的黑格子占住」这条假设**证伪**了 ——
+//     离 1e-6 那个分母地板还有六个数量级，而 max 落在一个亮度约为全场 1/3 的
+//     **普通亮格子**上。rel≈0.8 是抖动造出来的**真实**相对亮度差，不是尺子伪影。
+//   · 没做成：它仍然只给 max，回答不了「死区该摆哪儿」。
+//
+//  真正的病灶比分母地板更靠前：**⑮b 从一开始就用错了统计量。**
+//  死区规则问的是「**有多少格**的 rel 超过 luminanceRejectStart」，
+//  而 32 号给的是 16384 格上的 max。max 无论分母有没有地板，都必然被
+//  1/16384 的极端值定住 —— **max 回答不了阈值该摆哪儿，分位数才能。**
+//
+//  所以这一批量 rel 自己的分布：16 个宽 0.0625 的线性桶。
+//  桶宽这么选是因为 **0.25 正好落在桶 4 的下边界上** ⇒
+//  「rel ≥ 当前死区下端的格子占几成」是一个**精确**的求和，不用插值。
+//  死区下端若被改到非边界值，报表给上下界而不是一个假的精确数。
+#define VISTA_PROBE_JITTER_REL_HIST       129u  // 129~144：rel 落进 [b/16, (b+1)/16) 的格数
+#define VISTA_PROBE_JITTER_REL_BUCKETS    16u
+
+// 两个编码函数（VistaProbeLumBucket / VistaProbeLumLog2）不在这里，
+// 而在 VistaProbeFixed 旁边：它们要用 VISTA_PROBE_FIXED_MAX，
+// 而那个宏在本文件里定义得更靠后。
+
 // ---- #22b 追加：抖动源本身的统计（判据⑰⑱⑲⑳ + 档位接线）----
 //  由**另一个核**（FroxelJitterProbe）写，槽位区间与上面完全不重叠。
 //  那个核一张表都不读 —— 抖动偏移是下标的纯函数 —— 所以它**不依赖体积的 xy 尺寸**，
@@ -995,6 +1044,35 @@ void FroxelIntegralVerify(uint3 id : SV_DispatchThreadID)
 uint VistaProbeFixed(float v, float scale)
 {
     return (uint)clamp(v * scale, 0.0, VISTA_PROBE_FIXED_MAX);
+}
+
+// 亮度 -> 桶（#27，配合 VISTA_PROBE_JITTER_BUCKET_MAX）。
+//
+// 第一版按 **log10** 分（1e-7 … 1e-1），实测结果是 16384 格全部挤进最亮那一个桶、
+// 其余七个全空 —— 网格比被测量的实际跨度粗了太多。实测跨度是 [0.1, 4.2]，
+// 约 5.4 个倍频程，而十进制网格在那段上只有**一格**。
+// 「一把刻度间隔比被测跨度还大的尺子，读出来的是一个常数」。
+//
+// 改成 **log2**（倍频程），中心摆在 1：桶 b 收 lum ∈ [2^(b-4), 2^(b-3))，
+// 桶 0 收 lum < 2^-4 = 0.0625，桶 7 收 lum ≥ 2^3 = 8。
+// 今天这份数据会摊到桶 0~6 上。网格仍是**绝对**的（不随全局 max 走）——
+// 相对分桶要先知道 max，那要么多一趟 dispatch、要么用上一帧的值。
+//
+// lum 可以精确为 0（全遮住且无局部灯）⇒ log2(0) = -inf，(int) 转换未定义，
+// 所以先兜 1e-30 —— 兜底值落在桶 0，与「它本来就该进桶 0」一致。
+uint VistaProbeLumBucket(float lum)
+{
+    int b = (int)floor(log2(max(lum, 1.0e-30))) + 4;
+    return (uint)clamp(b, 0, (int)VISTA_PROBE_JITTER_BUCKETS - 1);
+}
+
+// 亮度的 log2 定点编码。直接存线性值不行：预曝光后的源项跨度未知，
+// ×1e6 会让 1e-4 以下的读数全塌成 0，而**这一批要看的正是那一端**。
+// 偏移 +64 让编码非负；1e-20 的兜底对应 code = 0.6e6（不是 0），
+// 于是「一格都没写过」（初值 0）与「读到极暗」在报表上仍然分得开。
+uint VistaProbeLumLog2(float lum)
+{
+    return (uint)clamp((log2(max(lum, 1.0e-20)) + 64.0) * 1.0e6, 0.0, VISTA_PROBE_FIXED_MAX);
 }
 
 // 探针网格 -> froxel 索引。取每格中心，避免只采到边界那一列。
@@ -1252,6 +1330,40 @@ void FroxelReprojProbe(uint3 id : SV_DispatchThreadID)
         float rel = saturate(abs(lA - lB) / max(max(lA, lB), 1e-6));
         InterlockedMax(_VistaFroxelShadowProbeRW[VISTA_PROBE_REPROJ_JITTER_SPREAD],
             VistaProbeFixed(rel, 1.0e6));
+
+        // ---- #27：同一个 rel，按亮度分层再记一遍 ----
+        //  上面那个全局 max 已经被证明摆不出门（理由写在 VISTA_PROBE_JITTER_BUCKET_MAX
+        //  的声明处）。这里**不改**那一格，只在旁边把同一个 rel 按 max(lA, lB)
+        //  所在的十进制桶分开记 —— 于是「max 住在哪个亮度上」从一个猜测变成一个读数。
+        //
+        //  分母用的 lum 与上面那一行**逐字同源**（同一个 max(lA, lB)）：
+        //  分桶用一个量、算 rel 用另一个量的话，桶号与读数会指着不同的格子。
+        float lum = max(lA, lB);
+        uint  bucket = VistaProbeLumBucket(lum);
+        InterlockedMax(_VistaFroxelShadowProbeRW[VISTA_PROBE_JITTER_BUCKET_MAX + bucket],
+            VistaProbeFixed(rel, 1.0e6));
+        InterlockedAdd(_VistaFroxelShadowProbeRW[VISTA_PROBE_JITTER_BUCKET_COUNT + bucket], 1u);
+
+        //  argmax：把 rel 放进高 20 位、亮度放进低 12 位，于是一次 InterlockedMax
+        //  同时取回「最大的 rel」和「它那一格有多亮」。低位参与比较是无害的 ——
+        //  rel 相同时它按亮度取大，而那是一个更保守（更亮）的代表格。
+        //  这条是 ⑫c 那个「探针没记录 x_max 落在哪一段」的直接补课。
+        uint relQ    = (uint)clamp(rel * 1048575.0, 0.0, 1048575.0);
+        uint lumCode = (uint)clamp((log2(max(lum, 1.0e-20)) + 64.0) * 32.0, 0.0, 4095.0);
+        InterlockedMax(_VistaFroxelShadowProbeRW[VISTA_PROBE_JITTER_ARGMAX_PACKED],
+            (relQ << 12) | lumCode);
+        InterlockedMax(_VistaFroxelShadowProbeRW[VISTA_PROBE_JITTER_LUM_MAX],
+            VistaProbeLumLog2(lum));
+
+        //  ---- rel 自己的直方图 ----
+        //  这一格量的**就是**死区规则要判的那个量，不是它的代理：
+        //  规则在 rel > luminanceRejectStart 时降权，所以「越线的格子占几成」
+        //  就是这条规则当前设定的代价本身。
+        //  rel 已经过 saturate ⇒ 落在 [0,1]；rel == 1.0 时 (int)(16.0) == 16，
+        //  由 clamp 收进桶 15（那一格是「≥ 0.9375」的含端点桶，报表上点名）。
+        uint relBucket = (uint)clamp((int)(rel * (float)VISTA_PROBE_JITTER_REL_BUCKETS),
+                                     0, (int)VISTA_PROBE_JITTER_REL_BUCKETS - 1);
+        InterlockedAdd(_VistaFroxelShadowProbeRW[VISTA_PROBE_JITTER_REL_HIST + relBucket], 1u);
         return;
     }
 

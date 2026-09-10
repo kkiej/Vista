@@ -158,7 +158,19 @@ namespace Vista.EditorTools
         const int k_SlotVolOutsideLeak = 109;
         const int k_SlotVolSigmaMax    = 110;
 
-        const int k_SlotTotal         = 111;
+        // ================================================================ #27 抖动散布分层（111~144）
+        // 仍由 FroxelReprojProbe 的**角色 1** 写，与 32 号那一格同一行代码里的同一个 rel。
+        // 32 号保留不动 —— 24 次历史读数要能与新读数对得上。
+        // 语义与摆放理由写在 VolumetricFog.compute 的 VISTA_PROBE_JITTER_BUCKET_MAX 声明处。
+        const int k_SlotJitBucketMaxBase   = 111;   // 111..118：8 个倍频程亮度桶，各桶 max rel ×1e6
+        const int k_SlotJitBucketCntBase   = 119;   // 119..126：各桶的格数，和必须 == ONLINE_COUNT
+        const int k_SlotJitArgmaxPacked    = 127;   // (relQ20 << 12) | lumCode12
+        const int k_SlotJitLumMax          = 128;   // 全局 max(lA, lB)，log2 编码 ×1e6
+        const int k_JitBuckets             = 8;
+        const int k_SlotJitRelHistBase     = 129;   // 129..144：rel 落进 [b/16, (b+1)/16) 的格数
+        const int k_JitRelBuckets          = 16;
+
+        const int k_SlotTotal         = 145;
 
         const uint k_FlagCascade   = 1u;
         const uint k_FlagShadowmap = 2u;
@@ -1349,15 +1361,27 @@ namespace Vista.EditorTools
                         sb.AppendLine("  ⓘ 散布量的是**同一个 froxel 两次独立抖动抽样**的相对亮度差的 max，"
                                     + "不是「历史与本帧之差」—— 后者混着相机运动与场景变化，"
                                     + "而这个数是用来摆死区下端的，被污染的上界会把死区顶得过高。");
-                        // 可执行的输出：这一格真正告诉美术的是「下端不能拖到哪儿以下」。
-                        // 只印裕度的话，那个数字要读者自己反算才知道能调到哪里。
-                        sb.AppendLine($"  ⓘ 由此得出的可执行下限：本布景里 luminanceRejectStart 必须 > {Sci(spread)}"
-                                    + $"（当前 {settings.luminanceRejectStart:F3}，只有 ×{(spread > 0f ? deadStart / spread : 0f):F2} 的余量）——"
-                                    + "这个下限随布景走（雾越浓、明暗对比越大，散布越大），换布景要重量。");
+                        // 这一行原来印的是「本布景里 luminanceRejectStart 必须 > spread」。
+                        // 那条**结论已经撤回**（#27）：同一配置下 24 次运行读到 3.648e-1 ~
+                        // 1.000e+0，跨度 ×2.7；其中 11 次精确饱和在 1.0，而那时这句话要求
+                        // 的是一个 [Range(0, 1)] 字段取不到的值 ——「一条在它红的时候要求
+                        // 字段范围外的值的判据，不是摆得太松，是无法被满足」。
+                        // 换成指向下面那张分层表，而不是继续印一个摆不出参数的数。
+                        sb.AppendLine($"  ⓘ 这个 max 不再被当作可执行下限（当前 luminanceRejectStart"
+                                    + $" = {settings.luminanceRejectStart:F3}）。理由：它是 16384 格上的"
+                                    + "全局 max，而 rel 的分母只有 1e-6 的绝对地板 ⇒ 一格只要一次抽样"
+                                    + "落进阴影/局部灯半径外（lA≈0）、另一次落在外面，rel 就精确等于 1。"
+                                    + "该往哪儿摆看下面的**按亮度分层**表。");
+                        if (raw[k_SlotReprojJitterSpread] >= (uint)k_ReprojJitterScale)
+                            sb.AppendLine("  ⚠ 本帧读数**精确饱和在 1.000**（saturate 的上限）。"
+                                        + "饱和的 max 连「上界」都不是 —— 真值可能远低于 1，"
+                                        + "也可能是若干格同时贴顶。这一格今天只剩「存在某格跨过了明暗边界」这一条信息。");
                         if (!deadbandOk)
                             sb.AppendLine($"  ⚠ 症状：{k_JitterDeadbandSymptom}。"
                                         + "死区下端拖到散布之下时，这条失效规则会把抖动噪声判成"
-                                        + "「场景变了」而降权 —— 亲手毁掉它本该保护的累积。");
+                                        + "「场景变了」而降权 —— 亲手毁掉它本该保护的累积。"
+                                        + "**但这条症状是否真的发生，今天没有被这一格证明**："
+                                        + "毁掉的若是一格辐亮度≈0 的雾，画面上没有代价。");
                         sb.AppendLine($"  ⓘ 定点分辨率 {Sci(1f / k_ReprojJitterScale)}，"
                                     + $"实测占 {raw[k_SlotReprojJitterSpread]} 个刻度"
                                     + (raw[k_SlotReprojJitterSpread] < 8u
@@ -1369,6 +1393,129 @@ namespace Vista.EditorTools
                         sb.AppendLine("ⓘ 判据⑮b 空判据：jitterMode = Off ⇒ 抖动幅度 0 ⇒ 两次抽样逐位相同 ⇒ "
                                     + $"散布恒为 0（实测 {Sci(spread)}），死区下端无论摆哪儿都 > 0。"
                                     + "这一格今天没有区分力，点名它。");
+                    }
+
+                    // ---------------------------------------------------------- #27 散布按亮度分层
+                    // 这一批**只印不判**（第一阶段）。门等看到分布之后再定 ——
+                    // 「不知道要守什么之前先写一道门」正是要避免的东西，而上面那一格
+                    // 就是这么坏掉的：它先有了 max、才去想 max 该守什么。
+                    //
+                    // 唯一的例外是下面那条计数守恒：它守的不是被测现象，是**这张表自己**
+                    // （桶号算错 / 槽位串了 / 角色 1 没跑满）。一张自己都没被验过的表
+                    // 不能拿去推翻另一条判据。
+                    {
+                        uint bucketSum = 0u;
+                        for (int b = 0; b < k_JitBuckets; b++)
+                            bucketSum += raw[k_SlotJitBucketCntBase + b];
+                        uint online = raw[k_SlotReprojOnlineCount];
+                        bool bucketConserved = bucketSum == online && online > 0u;
+                        sb.AppendLine($"{Mark(bucketConserved)}判据⑮c 亮度分桶计数守恒："
+                                    + $"八桶之和 {bucketSum} == 角色 1 线程数 {online}");
+                        sb.AppendLine("  ⓘ 它抓的是这张表**自己**的接线（桶号算错 ⇒ 某桶恒 0、和偏小；"
+                                    + "槽位基址串了 ⇒ 和读成别的批次的数）。"
+                                    + "clamp 让桶号不可能越界，所以和**只会等于或小于** online ——"
+                                    + "「和大于」这一侧是不可达的，这一格实际只有一个方向能红，如实说出来。");
+
+                        uint packed   = raw[k_SlotJitArgmaxPacked];
+                        float argRel  = (packed >> 12) / 1048575f;
+                        float argLum  = Mathf.Pow(2f, (packed & 0xFFFu) / 32f - 64f);
+                        float jitLumMax = raw[k_SlotJitLumMax] > 0u
+                                        ? Mathf.Pow(2f, raw[k_SlotJitLumMax] / 1.0e6f - 64f)
+                                        : 0f;
+                        sb.AppendLine($"  按亮度分层（lum = max(lA, lB)，预曝光后的注入亮度；全局 max lum = {Sci(jitLumMax)}）：");
+                        for (int b = k_JitBuckets - 1; b >= 0; b--)
+                        {
+                            uint  cnt = raw[k_SlotJitBucketCntBase + b];
+                            float mx  = raw[k_SlotJitBucketMaxBase + b] / k_ReprojJitterScale;
+                            string range = b == k_JitBuckets - 1 ? "≥ 8"
+                                         : b == 0               ? "< 0.0625"
+                                         : $"[{Mathf.Pow(2f, b - 4):0.####}, {Mathf.Pow(2f, b - 3):0.####})";
+                            string rel = cnt == 0u
+                                       ? "（空桶，无读数）"
+                                       : Sci(mx) + (mx >= 1f ? "  ← 饱和" : "");
+                            string share = online > 0u ? $"{100f * cnt / online,5:F1}%" : "  n/a";
+                            sb.AppendLine($"    lum {range,-16}  格数 {cnt,6} ({share})   max rel {rel}");
+                        }
+                        sb.AppendLine($"  ⓘ 全局 max 落在：rel {Sci(argRel)} @ lum {Sci(argLum)}"
+                                    + (jitLumMax > 0f ? $"（= 全局最亮的 {Sci(argLum / jitLumMax)} 倍）" : "")
+                                    + " —— 这一行是 ⑫c 那个「探针没记录 x_max 落在哪一段」的补课，"
+                                    + "打包法：rel 占高 20 位、亮度占低 12 位，一次 InterlockedMax 同时取回两者。");
+                        sb.AppendLine("  ⓘ 桶边界是**绝对**倍频程（2^(b−4)），不是相对全局 max：相对分桶要先知道全局 max，"
+                                    + "而那要么多一趟 dispatch、要么用上一帧的值（多一份状态 + 一帧延迟）。"
+                                    + "第一版按十进制分，实测 16384 格**全部挤进一个桶**（跨度只有 5.4 个倍频程，"
+                                    + "十进制网格在那段上只有一格）—— 改的是桶边界而不是结论，"
+                                    + "这正是那条「网格暂定」的预案兑现的样子。");
+                        sb.AppendLine("  ⓘ 这张表已经结清了一件事：它**证伪**了「max 被 lA≈0 的黑格子占住、"
+                                    + "分母撞上 1e-6 地板」这条假设 —— 最暗的格子离那个地板还有六个数量级，"
+                                    + "而 max 落在一个普通亮格子上。也就是说 rel≈0.8 是抖动造出来的**真实**"
+                                    + "相对亮度差。它回答不了的是「该摆哪儿」，那由下面的 rel 直方图回答。");
+                    }
+
+                    // ---------------------------------------------------------- #27 rel 直方图
+                    // 这一批量的**就是**死区规则要判的那个量，不是它的代理：
+                    // 规则在 rel > luminanceRejectStart 时降权 ⇒「越线的格子占几成」
+                    // 就是这条规则当前设定的代价本身。
+                    {
+                        uint relSum = 0u;
+                        for (int b = 0; b < k_JitRelBuckets; b++)
+                            relSum += raw[k_SlotJitRelHistBase + b];
+                        uint online = raw[k_SlotReprojOnlineCount];
+                        bool relConserved = relSum == online && online > 0u;
+                        sb.AppendLine($"{Mark(relConserved)}判据⑮d rel 直方图计数守恒："
+                                    + $"十六桶之和 {relSum} == 角色 1 线程数 {online}");
+                        sb.AppendLine("  ⓘ 与⑮c 是**两道**门而不是一道：它们守的是两批互不相干的槽位"
+                                    + "（119..126 与 129..144）。合成一条的话，rel 这一批的接线错误会被"
+                                    + "亮度那一批的绿盖住 ——「一道对被测改动免疫的门不是这个改动的回归护栏」。");
+
+                        // 用⑮b 那一行同一个 deadStart（ResolveLuminanceReject 的输出），
+                        // 不在这里重算一遍 Clamp01(settings.luminanceRejectStart)：
+                        // 同一个量有两份实现时，两份迟早会分叉，而分叉那天报表上会同时印出
+                        // 两个都「自洽」的数。
+                        float edge = deadStart * k_JitRelBuckets;
+                        int   bLo  = Mathf.Clamp(Mathf.FloorToInt(edge), 0, k_JitRelBuckets - 1);
+                        bool  onEdge = Mathf.Abs(edge - Mathf.Round(edge)) < 1e-4f;
+
+                        sb.AppendLine($"  rel 直方图（{k_JitRelBuckets} 桶 × {1f / k_JitRelBuckets:0.####}）：");
+                        for (int b = k_JitRelBuckets - 1; b >= 0; b--)
+                        {
+                            uint cnt = raw[k_SlotJitRelHistBase + b];
+                            string range = b == k_JitRelBuckets - 1
+                                         ? $"[{b / (float)k_JitRelBuckets:0.0000}, 1.0000]"
+                                         : $"[{b / (float)k_JitRelBuckets:0.0000}, {(b + 1) / (float)k_JitRelBuckets:0.0000})";
+                            string share = online > 0u ? $"{100f * cnt / online,5:F1}%" : "  n/a";
+                            string flag = b == bLo ? $"  ← 死区下端 {deadStart:F4} 落在这一桶" : "";
+                            sb.AppendLine($"    rel {range}  格数 {cnt,6} ({share}){flag}");
+                        }
+
+                        uint aboveIncl = 0u, aboveExcl = 0u;
+                        for (int b = bLo; b < k_JitRelBuckets; b++) aboveIncl += raw[k_SlotJitRelHistBase + b];
+                        for (int b = bLo + 1; b < k_JitRelBuckets; b++) aboveExcl += raw[k_SlotJitRelHistBase + b];
+
+                        if (online == 0u)
+                        {
+                            sb.AppendLine("  ⓘ 角色 1 线程数为 0，本帧无读数。");
+                        }
+                        else if (onEdge)
+                        {
+                            sb.AppendLine($"  ⓘ **当前死区设定的代价：rel ≥ {deadStart:F4} 的格子有 {aboveIncl} / {online}"
+                                        + $" = {100f * aboveIncl / online:F3}%** —— 这些格子本帧被 LUMINANCE 规则降权，"
+                                        + "而它们的「亮度变了」全部是抖动自己造的。"
+                                        + $"死区下端正好落在桶 {bLo} 的下边界上，所以这是一个**精确**求和，没有插值。");
+                        }
+                        else
+                        {
+                            sb.AppendLine($"  ⓘ **当前死区设定的代价：rel ≥ {deadStart:F4} 的格子在 "
+                                        + $"[{aboveExcl}, {aboveIncl}] 之间 = "
+                                        + $"[{100f * aboveExcl / online:F3}%, {100f * aboveIncl / online:F3}%]**。"
+                                        + $"给的是区间不是一个数：死区下端落在桶 {bLo} **内部**，"
+                                        + "桶内的分布这把尺子看不见。"
+                                        + "「读数落在尺子刻度之间时要报成上下界，不是报成一个精确数」。"
+                                        + $"要精确读，把 luminanceRejectStart 摆到 {1f / k_JitRelBuckets:0.####} 的整数倍上。");
+                        }
+                        sb.AppendLine("  ⓘ 这一行**仍然只印不判**。它给的是代价，不是「代价太大」——"
+                                    + "「多少百分比算太多」需要一个画面上的判据（同一格丢失历史之后噪声涨了多少），"
+                                    + "那是判据⑯（收敛性）的活，⑯还没实现。"
+                                    + "在那之前把一个百分比阈值写成门，就是又一次「不知道要守什么之前先写一道门」。");
                     }
                 }
             }

@@ -60,7 +60,7 @@ namespace Vista
         /// 必须与这里逐位相等），所以三个数（这里、shader 的下标上限、Editor 的镜像）
         /// 里任意一个漏改都会在报表第一格红掉，而不是变成静默丢弃的写。
         /// </summary>
-        public const int k_ShadowProbeSlots = 111;
+        public const int k_ShadowProbeSlots = 145;
 
         // 探针里三个走 InterlockedMin 的槽位
         // （SHADOW_MIN = 0, SHADOWMAP_MIN = 8, SEG_X_MIN = 17）。
@@ -92,6 +92,12 @@ namespace Vista
         // == 1e6）。与 89 号同款理由必须登记：漏登记 ⇒ 初值 0 ⇒ 判据(b) 每帧红，
         // 红的理由是尺子自己坏了。体数为 0 时它保持 0xFFFFFFFF —— 报表按
         // 「未覆盖」处理，不把初值当读数印。
+        //
+        // #27 追加的 34 格（111~144：亮度分层 18 格 + rel 直方图 16 格）全部是
+        // Max / Add，没有新的 min 槽位。这一句同样是**结论**：那批里有一格
+        // JITTER_LUM_MAX 是「全局最亮」，方向是 max；如果哪天想加一格
+        // 「全局最暗」，它必须走 Min 并且登记到下面 —— 而 0 在那一格里是
+        // 合法读数（froxel 可以精确全黑），漏登记不会露出任何症状。
         static readonly int[] k_ShadowProbeMinSlots = { 0, 8, 17, 89, 96, 107 };
 
         readonly ComputeShader m_Cs;
