@@ -74,7 +74,8 @@ namespace Vista
         [Min(0.1f)] public float noiseScaleMeters = 8f;
 
         [Tooltip("噪声漂移速度（米/秒，世界空间）。雾的翻滚感。\n"
-               + "调大要留意时间重投影的亮度死区（报表判据⑮b）。")]
+               + "调大要留意时间重投影的亮度死区：看报表里的 rel 直方图（判据⑮d 那一段），"
+               + "「rel ≥ luminanceRejectStart 的格子占几成」就是这条死区当前设定的代价。")]
         public Vector3 noiseVelocityMeters = new Vector3(0.3f, 0.05f, 0.2f);
 
         // --------------------------------------------------------------------
