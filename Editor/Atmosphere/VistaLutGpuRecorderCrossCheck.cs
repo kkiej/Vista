@@ -207,6 +207,23 @@ namespace Vista.Editor
         /// 一个恒为「不可判定」的对照等于没有对照。
         const int k_ResponseControlIdx = 2;
 
+        /// D 档（注入关）相对 A 档必须省下的**比例**：近层两趟的耗时至少掉到三成以下。
+        ///
+        /// 为什么门摆在比例而不是毫秒：毫秒阈值绑死本机（3060）与本场景的构图，
+        /// 换台机器就得重标一次，而没人会记得去重标 —— 一条过时的毫秒门要么恒绿要么恒红。
+        /// 比例则只要求「关掉它确实不跑了」，与绝对速度无关。
+        ///
+        /// 为什么是 0.3 而不是 0：关掉 enableInjection 之后那两个 marker 本应
+        /// 一个样本都没有，理想值就是 0。但**不能**把门摆在「必须恰好为零」——
+        /// 若 recorder 在某一帧抓到一点残留（换档那一帧的 pass 还在图里），
+        /// 一个严格的零会把一次正确的运行判红。0.3 的意思是「至少掉了七成」，
+        /// 而实现若真的没关掉，比值会在 1.0 附近 —— 两种情形隔着三倍，不会误判。
+        const double k_MaxNoInjectionResidual = 0.30;
+
+        /// 「切档省下的占近层总成本的比例」低于这个数时，报告要明说切档几乎没省钱。
+        /// 这是一条**只报不判**的线，理由写在档位对照那一节里。
+        const double k_ModeSavingNotable = 0.10;
+
         /// 翻给 debugView 的档位。选 IntegralRgb 而不是 SingleSlice：
         /// 后者要一个合法的切片下标，而那是另一个可能配错的量 ——
         /// 验证名字的这一步不该再引入第二个失败来源。
@@ -287,20 +304,53 @@ namespace Vista.Editor
         /// 而 CPU 侧记的是录制命令的时间，它对派发规模基本不敏感 —— 拿它当证据会削弱判据。
         static Stat[] s_StatGpuB;
 
-        /// 当前是不是在 B 档。它同时是「已经翻过旗」的标记，
-        /// 所以 Tick 尾部不会翻第二次（那会一路除到下界 2 再也退不出来）。
-        static bool s_PhaseB;
+        /// C 档（<c>fog.mode = AerialPerspective</c>，divisor 已还原）的冻结读数。
+        /// D 档（<c>enableInjection = false</c>，mode 已还原）的冻结读数。
+        /// 两者一起构成 #27 第 1 项的性能对照，见 <see cref="BeginModePhase"/>。
+        static Stat[] s_StatGpuC;
+        static Stat[] s_StatGpuD;
+
+        /// 当前档位。0 = A（出货）、1 = B（divisor 减半）、2 = C（AP 档）、3 = D（注入关）。
+        ///
+        /// 原来是一个 bool（<c>s_PhaseB</c>）。改成序号而不是再加两个 bool：
+        /// 三个互斥的 bool 能表示 8 种状态，其中 5 种是非法的，而没有任何一行代码
+        /// 会在它们出现时报错 —— 那类状态机是靠「谁也没写出那种组合」维持正确的。
+        static int s_Phase;
+        const int k_PhaseA = 0, k_PhaseDiv = 1, k_PhaseApMode = 2, k_PhaseNoInj = 3;
 
         /// 翻旗前的原值。null = 没翻过，<see cref="RestoreDivisor"/> 不要复位 ——
         /// 与 <see cref="s_DebugViewSaved"/> 同一条理由：复位一个没动过的字段会把资产标脏。
         static int? s_DivisorSaved;
 
+        /// 同上，另外两个旋钮：雾的档位与近层注入开关。
+        /// 这两个与 divisor 一样**会被存盘**，所以它们的复位同样要进 <see cref="Cleanup"/>
+        /// 的兜底路径（用户手停 play / 看门狗中止都会落到那里）。
+        /// 漏掉的症状比 divisor 更难归因：场景的雾档位被静默留在 AerialPerspective 上，
+        /// 画面只是「近处的雾淡了一点」，没有任何报错。
+        static VistaFogSettings.Mode? s_ModeSaved;
+        static bool? s_InjectionSaved;
+
         /// 两档各自的 divisor。报告正文打 <c>s_DivA</c> 而不是现场读 fogCfg ——
         /// 打印发生在复位之后，现场读到的是被还原的值，正文会宣称一个与 B 档读数不符的配置。
         static int s_DivA, s_DivB;
 
+        /// C/D 两档起采样那一刻读到的 divisor 与 A 档不符时记在这里。
+        ///
+        /// 为什么要专门留一个字段：C/D 是拿来**和 A 比**的，前提是除了那一个旋钮之外
+        /// 两边配置相同。若 <see cref="RestoreDivisor"/> 没生效（资产被别处改过、
+        /// feature.current 换了实例），C/D 会跑在减半的 divisor 上，
+        /// 于是「切档省了多少」那一栏里混进了一笔与切档毫无关系的四倍工作量 ——
+        /// 而那个数看起来完全正常。不可判定必须是缺口，所以这里记下来并让它进门。
+        static string s_DivMismatch;
+
         /// 旋钮翻不动的原因。非 null ⇒ 这道门报**不可判定**，不报通过。
         static string s_ResponseSkipReason;
+
+        /// C/D 两档翻不动的原因，与 <see cref="s_ResponseSkipReason"/> 同一条约定。
+        /// 分开存而不是复用一个：divisor 翻不动（已经是下界 2）与 mode 翻不动
+        /// （feature 取不到）是两件独立的事，共用一个字段会让先发生的那个把后一个吞掉，
+        /// 报告里则表现为「另一节莫名其妙地引用了一条不相干的原因」。
+        static string s_ModeSkipReason, s_InjSkipReason;
 
         /// 整个 run（含两档）的起始帧。<c>s_StartFrame</c> 在进 B 档时会被重新基准化，
         /// 拿它算「实际经过 N 帧」会只报后半程，把报告头上那个数字变成一句假话。
@@ -345,9 +395,10 @@ namespace Vista.Editor
             // 报告里的除法分支会接住（并把假设写出来）。
             EditorApplication.ExecuteMenuItem("Window/General/Game");
 
-            Debug.Log($"[Vista] 交叉验证已武装：进 play 模式，丢弃前 {k_WarmupFrames} 帧，"
-                    + $"采样 {k_SampleFrames} 帧；随后把 screenDivisor 减半再跑一档同样长度"
-                    + "（旋钮响应测试，退出时自动还原），两档跑完自动退出并打报告。");
+            Debug.Log($"[Vista] 交叉验证已武装：进 play 模式，四档依次跑，每档丢弃前 {k_WarmupFrames} 帧、"
+                    + $"采样 {k_SampleFrames} 帧 —— A 出货配置、B screenDivisor 减半（旋钮响应）、"
+                    + "C 雾档位切 AerialPerspective、D 关近层注入（#27 第 1 项的性能对照）。"
+                    + $"三个旋钮退出时自动还原，四档跑完自动退出并打报告（约 {4 * (k_WarmupFrames + k_SampleFrames)} 帧）。");
             EditorApplication.EnterPlaymode();
         }
 
@@ -369,14 +420,21 @@ namespace Vista.Editor
                 s_RunStartFrame = s_StartFrame;
                 s_Running = true;
                 s_Started = false;
-                s_PhaseB = false;
+                s_Phase = k_PhaseA;
                 s_DivisorSaved = null;
+                s_ModeSaved = null;
+                s_InjectionSaved = null;
                 s_DivA = 0;
                 s_DivB = 0;
+                s_DivMismatch = null;
                 s_StatGpu = null;
                 s_StatCpu = null;
                 s_StatGpuB = null;
+                s_StatGpuC = null;
+                s_StatGpuD = null;
                 s_ResponseSkipReason = null;
+                s_ModeSkipReason = null;
+                s_InjSkipReason = null;
                 s_NameProbeTriggered = false;
                 s_NameProbeClosed = false;
                 s_RebakeTriggered = false;
@@ -502,10 +560,17 @@ namespace Vista.Editor
                 // 记下这一档实际在跑的 divisor。**在这里**取，而不是在报告里现场读：
                 // 报告打印发生在旋钮复位之后，现场读到的是还原值 ——
                 // 于是正文会宣称一个与 B 档读数不符的配置，一份自相矛盾的报告。
+                //
+                // C/D 两档不记新值，而是**核对**它有没有回到 A 档那个数：
+                // 它们是拿来和 A 比的，divisor 不同则整个对照失去意义（见 s_DivMismatch）。
                 {
                     var fogCfg = VistaAtmosphereFeature.current?.volumetricFog;
                     int div = fogCfg != null ? Mathf.Clamp(fogCfg.screenDivisor, 2, 16) : 0;
-                    if (!s_PhaseB) s_DivA = div; else s_DivB = div;
+                    if (s_Phase == k_PhaseA) s_DivA = div;
+                    else if (s_Phase == k_PhaseDiv) s_DivB = div;
+                    else if (div != s_DivA && s_DivMismatch == null)
+                        s_DivMismatch = $"{(s_Phase == k_PhaseApMode ? "C" : "D")} 档起采样时 "
+                                      + $"screenDivisor = {div}，而 A 档是 {s_DivA} —— 复位没生效";
                 }
 
                 s_Started = true;
@@ -514,19 +579,40 @@ namespace Vista.Editor
 
             if (elapsed < k_WarmupFrames + k_SampleFrames) return;
 
-            if (!s_PhaseB)
+            // 四档依次：A（出货）→ B（divisor 减半）→ C（AP 档）→ D（注入关）。
+            //
+            // 翻旗失败时**继续往下翻**而不是直接出报告：B 档翻不动（divisor 已在下界）
+            // 与 C/D 能不能跑是两件互不相干的事。让前者否决后者，等于把一道门的
+            // 「不可判定」升格成另外两道门的「没跑」—— 而报告上那两节会显示成缺口，
+            // 看起来像它们自己失败了，成因却在三十行之外的另一道门里。
+            switch (s_Phase)
             {
-                s_StatGpu = new Stat[k_PassNames.Length];
-                s_StatCpu = new Stat[k_PassNames.Length];
-                Capture(s_StatGpu, s_StatCpu);
+                case k_PhaseA:
+                    s_StatGpu = new Stat[k_PassNames.Length];
+                    s_StatCpu = new Stat[k_PassNames.Length];
+                    Capture(s_StatGpu, s_StatCpu);
+                    if (BeginResponsePhase(frame)) return;
+                    if (BeginModePhase(frame)) return;
+                    if (BeginNoInjectionPhase(frame)) return;
+                    break;
 
-                // 翻旗成功就地返回：下面那一段（复位 + 报告 + 退出）要等 B 档跑完。
-                if (BeginResponsePhase(frame)) return;
-            }
-            else
-            {
-                s_StatGpuB = new Stat[k_PassNames.Length];
-                Capture(s_StatGpuB, null);
+                case k_PhaseDiv:
+                    s_StatGpuB = new Stat[k_PassNames.Length];
+                    Capture(s_StatGpuB, null);
+                    if (BeginModePhase(frame)) return;
+                    if (BeginNoInjectionPhase(frame)) return;
+                    break;
+
+                case k_PhaseApMode:
+                    s_StatGpuC = new Stat[k_PassNames.Length];
+                    Capture(s_StatGpuC, null);
+                    if (BeginNoInjectionPhase(frame)) return;
+                    break;
+
+                default:
+                    s_StatGpuD = new Stat[k_PassNames.Length];
+                    Capture(s_StatGpuD, null);
+                    break;
             }
 
             // 复位排在报告**之前**：报告里没有一个数字是现场读配置得来的
@@ -534,6 +620,8 @@ namespace Vista.Editor
             // 反过来把复位放在报告之后，一旦报告里抛出任何异常，
             // 旋钮就永远停在测试值上 —— 一个量性能的工具把被量对象改了还不还回去。
             RestoreDivisor();
+            RestoreMode();
+            RestoreInjection();
             Report(frame - s_RunStartFrame);
             Cleanup();
             EditorApplication.ExitPlaymode();
@@ -553,17 +641,11 @@ namespace Vista.Editor
 
         /// <summary>
         /// 把 screenDivisor 减半并重新开一轮预热 + 采样。返回 false 表示这道门**不可判定**
-        /// （原因写进 <see cref="s_ResponseSkipReason"/>），调用方应当直接出报告。
+        /// （原因写进 <see cref="s_ResponseSkipReason"/>），调用方应当直接翻下一个旋钮。
         ///
-        /// 为什么要重新预热满 45 帧、而不是接着采：改 divisor 会让
-        /// <c>VistaFroxelVolume.Prepare</c> 认出 desc 变了并**重新分配**三张 3D 表，
-        /// 于是时间重投影的历史整个失效。紧接着那几帧的注入/积分都跑在
-        /// 「历史无效」的分支上，把它们算进中位数，量到的是一次性的重建成本，
-        /// 不是 B 档的稳态 —— 而这道门比的正是两个稳态。
-        ///
-        /// 手段是把 <c>s_StartFrame</c> 重新基准化，让上面那段预热+起 recorder 的代码
-        /// 原样再跑一遍。不另写一份的理由与「两份真相」是同一条：
-        /// 复制出来的第二份预热逻辑会在改预热帧数时漏掉一边。
+        /// 重建采样环与重新预热的理由见 <see cref="RestartSampling"/>——
+        /// 三处翻旗共用那一份，不各写一遍：复制出来的第二份预热逻辑
+        /// 会在改预热帧数时漏掉一边。
         /// </summary>
         static bool BeginResponsePhase(int frame)
         {
@@ -593,15 +675,119 @@ namespace Vista.Editor
 
             s_DivisorSaved = s_DivA;
             fog.screenDivisor = target;
+            RestartSampling(frame, k_PhaseDiv);
+            return true;
+        }
 
-            // 环要整批重建：B 档的样本必须一个不掺 A 档的。
-            // 只清不重建也行不通 —— 下面那段预热代码会 new 一批新的覆盖上去，
-            // 旧的不 Dispose 就是 300 帧容量 ×15×2 个 native 句柄泄漏。
+        /// <summary>
+        /// 把采样环整批重建、时基归零、进下一档。三处翻旗共用这一份。
+        ///
+        /// 环必须**整批重建**：下一档的样本不能掺一个上一档的。
+        /// 只清不重建也行不通 —— 下面那段预热代码会 new 一批新的覆盖上去，
+        /// 旧的不 Dispose 就是 512 帧容量 ×15×2 个 native 句柄泄漏。
+        ///
+        /// 为什么每一档都要重新预热满 45 帧、而不是接着采：这三个旋钮
+        /// （divisor / 雾档位 / 注入开关）每一个都会让近层的时间重投影历史失效 ——
+        /// divisor 改 desc 尺寸触发重新分配，另外两个直接让体停转或停用。
+        /// 紧接着那几帧跑在「历史无效」的分支上，把它们算进中位数，
+        /// 量到的是一次性的重建成本，不是那一档的稳态 —— 而这些门比的正是稳态。
+        /// </summary>
+        static void RestartSampling(int frame, int nextPhase)
+        {
             Dispose(ref s_Gpu);
             Dispose(ref s_Cpu);
             s_Started = false;
             s_StartFrame = frame;
-            s_PhaseB = true;
+            s_Phase = nextPhase;
+        }
+
+        /// <summary>
+        /// 进 C 档：<c>fog.mode = AerialPerspective</c>，divisor 先还原回出货值。
+        ///
+        /// ── 这一档问的是什么 ──
+        /// 「把雾档位从 Froxel 切到 AP，GPU 上少花多少」。这是 #27 第 1 项里
+        /// 用户点名要的那份性能对照，也是任何一个接手这套雾的人第一个会问的问题。
+        ///
+        /// ── 为什么它单独成一档、而不是拿 D 档（注入关）去代表 AP 档 ──
+        /// 因为这两件事在本实现里**不是同一件事**，而这个差别正是本节要量的东西：
+        /// <c>VistaAtmospherePass.cs:250</c> 的 froxelEnabled 只看 enableInjection
+        /// 与相机类型，**根本不看 fog.mode**；mode 只在 :490 决定合成时采不采近层的表
+        /// （那一行的注释自己就写着「档 D 下 froxel 体可能仍然分配着，但它不参与合成」）。
+        /// 也就是说切到 AP 档之后，注入与积分照跑，产物直接扔掉。
+        /// 若拿 D 档冒充 AP 档，报出来的「切档省了 X 毫秒」是一个**在产品里拿不到**的数。
+        ///
+        /// 所以三档一起才能把话说全：
+        ///   A − C ＝ 切档**实际**省下的
+        ///   A − D ＝ 近层这一整套一共值多少
+        ///   C − D ＝ 切了档还在白交的钱
+        ///
+        /// ── 为什么先 RestoreDivisor ──
+        /// C/D 是拿来和 A 比的。若还停在 B 档减半的 divisor 上，近层的线程数是 A 的四倍，
+        /// 于是「切档省了多少」那一栏会变成「切档 + divisor 复原」两件事之和 ——
+        /// 一个混了两个自变量的差值，符号都未必对。
+        /// </summary>
+        static bool BeginModePhase(int frame)
+        {
+            RestoreDivisor();
+
+            var fog = VistaAtmosphereFeature.current?.fog;
+            if (fog == null)
+            {
+                s_ModeSkipReason = "VistaAtmosphereFeature.current?.fog 取不到，档位翻不动";
+                return false;
+            }
+
+            if (fog.mode != VistaFogSettings.Mode.Froxel)
+            {
+                // A 档本来就不是 Froxel ⇒ 没有「切档」可言。不硬把它先设成 Froxel 再切回来：
+                // 那量到的是一个本次运行里根本不存在的配置差，而报告会把它写成
+                // 「本机切档省下 X」—— 一个针对别人的场景、却署着本场景名字的结论。
+                s_ModeSkipReason = $"A 档的 fog.mode 是 {fog.mode}，不是 Froxel，"
+                                 + "本次没有「Froxel → AP」这个方向可翻";
+                return false;
+            }
+
+            s_ModeSaved = fog.mode;
+            fog.mode = VistaFogSettings.Mode.AerialPerspective;
+            RestartSampling(frame, k_PhaseApMode);
+            return true;
+        }
+
+        /// <summary>
+        /// 进 D 档：<c>enableInjection = false</c>，档位还原回 Froxel。
+        ///
+        /// 档位要还原：D 档与 A 档之间**只能差一个**自变量，否则 A − D 不是
+        /// 「近层的成本」而是「近层的成本 + 合成分支的差」。注入关掉之后
+        /// froxelEnabled 为 false，合成那边的 nearLayer 也随之为 false
+        /// （<c>nearLayer = froxelEnabled &amp;&amp; ...</c>），所以档位留在 Froxel
+        /// 不会让它去采一张不存在的表 —— 这一点是照着 :490 那一行写的，不是推测。
+        ///
+        /// 这一档同时是本节唯一一道**会红的门**：A − D 必须显著大于 0。
+        /// 它与 divisor 那道门同构 —— 判的不是「多少毫秒」，而是
+        /// 「上面那些毫秒数与近层之间有没有因果关系」。若关掉注入一分钱不省，
+        /// 那么注入/积分那两行量到的就不是近层。
+        /// </summary>
+        static bool BeginNoInjectionPhase(int frame)
+        {
+            RestoreDivisor();
+            RestoreMode();
+
+            var vf = VistaAtmosphereFeature.current?.volumetricFog;
+            if (vf == null)
+            {
+                s_InjSkipReason = "VistaAtmosphereFeature.current?.volumetricFog 取不到，注入开关翻不动";
+                return false;
+            }
+
+            if (!vf.enableInjection)
+            {
+                s_InjSkipReason = "A 档的 enableInjection 本来就是关的，没有可关的东西";
+                return false;
+            }
+
+            s_InjectionSaved = vf.enableInjection;
+            vf.enableInjection = false;
+            RestartSampling(frame, k_PhaseNoInj);
             return true;
         }
 
@@ -616,6 +802,24 @@ namespace Vista.Editor
             var fog = VistaAtmosphereFeature.current?.volumetricFog;
             if (fog != null) fog.screenDivisor = s_DivisorSaved.Value;
             s_DivisorSaved = null;
+        }
+
+        /// <summary>把雾档位还回去。幂等，理由与 <see cref="RestoreDivisor"/> 逐字相同。</summary>
+        static void RestoreMode()
+        {
+            if (!s_ModeSaved.HasValue) return;
+            var fog = VistaAtmosphereFeature.current?.fog;
+            if (fog != null) fog.mode = s_ModeSaved.Value;
+            s_ModeSaved = null;
+        }
+
+        /// <summary>把近层注入开关还回去。幂等，同上。</summary>
+        static void RestoreInjection()
+        {
+            if (!s_InjectionSaved.HasValue) return;
+            var vf = VistaAtmosphereFeature.current?.volumetricFog;
+            if (vf != null) vf.enableInjection = s_InjectionSaved.Value;
+            s_InjectionSaved = null;
         }
 
         // ================================================================ 名字验证（预热期）
@@ -851,8 +1055,9 @@ namespace Vista.Editor
               .Append("　后端 ").Append(SystemInfo.graphicsDeviceType)
               .Append("　场景 ").AppendLine(UnityEngine.SceneManagement.SceneManager.GetActiveScene().name);
             sb.Append("　 采样 ").Append(k_SampleFrames).Append(" 帧（丢弃预热 ")
-              .Append(k_WarmupFrames).Append("）×2 档（出货配置 + 旋钮响应测试），实际经过 ")
-              .Append(elapsedFrames).AppendLine(" 帧；正文数字**全部**来自出货配置那一档");
+              .Append(k_WarmupFrames).Append("）×4 档（A 出货配置｜B screenDivisor 减半｜"
+                                           + "C 雾档位切 AP｜D 关近层注入），实际经过 ")
+              .Append(elapsedFrames).AppendLine(" 帧；正文数字**全部**来自 A 档");
             sb.Append("　 本次 play 期间强制 Application.runInBackground=true（原值 ")
               .Append(s_RunInBackgroundSaved ? "true" : "false")
               .AppendLine("，退出即还原，不写 ProjectSettings）—— 失焦时 play 循环不停走，否则采样会卡死");
@@ -923,6 +1128,9 @@ namespace Vista.Editor
 
             // 旋钮响应门的缺口计数。见「旋钮响应测试」一节的常量注释。
             int responseGap = 0;
+
+            // 档位对照（C/D 两档）的缺口计数。见「档位对照」一节。
+            int modeGap = 0;
 
             for (int i = 0; i < k_PassNames.Length; ++i)
             {
@@ -1282,6 +1490,193 @@ namespace Vista.Editor
                 }
             }
 
+            // ---- 档位对照：Froxel 档 vs AP 档 vs 近层全关（#27 第 1 项） ----
+            //
+            // 这一节回答的是「开这套近层雾，GPU 上一共花多少，切档能省回多少」。
+            // 它与上面那道旋钮响应门的关系是：那一道证明注入/积分那两行**测的是 froxel**，
+            // 这一节在此基础上把这笔钱拆成「切档能省的」与「切了档也省不掉的」两半。
+            //
+            // 三个差各有各的问题，缺一个都会让另外两个变得可以任意解释：
+            //   A − C ＝ 把 fog.mode 切到 AerialPerspective 实际省下的
+            //   A − D ＝ 近层这一整套（注入 + 积分）一共值多少
+            //   C − D ＝ 切了档、产物却被扔掉，仍然在付的那部分
+            // 只给 A − D 的话，读者会默认「切到 AP 档就省下这些」——
+            // 而在本实现里那句话是错的，错的方向还是乐观的那一侧。
+            sb.AppendLine("　 档位对照（A Froxel 档｜C AP 档｜D 近层全关，三档同一个 screenDivisor）");
+            {
+                int iInj = k_FroxelSteadyIdx[0], iInt = k_FroxelSteadyIdx[1];
+
+                if (s_DivMismatch != null)
+                {
+                    modeGap = 1;
+                    sb.Append("　　 **整节作废**：").AppendLine(s_DivMismatch);
+                    sb.AppendLine("　　 → 三档不在同一个配置上，任何差值都同时含着两个自变量。");
+                }
+                else if (s_StatGpu == null || s_StatGpuC == null || s_StatGpuD == null)
+                {
+                    modeGap = 1;
+                    sb.Append("　　 **不可判定**：")
+                      .AppendLine(s_ModeSkipReason ?? s_InjSkipReason ?? "C/D 档读数缺失（本次没有跑到）");
+                    if (s_ModeSkipReason != null && s_InjSkipReason != null)
+                        sb.Append("　　 （另一条：").Append(s_InjSkipReason).AppendLine("）");
+                    sb.AppendLine("　　 → 本次拿不到「近层一共花多少」，上面那个「每帧成本」"
+                                + "只能当作一个孤立数字，不能拿去谈「关掉能省多少」。");
+                }
+                else
+                {
+                    Stat injA = s_StatGpu[iInj],  intA = s_StatGpu[iInt];
+                    Stat injC = s_StatGpuC[iInj], intC = s_StatGpuC[iInt];
+                    Stat injD = s_StatGpuD[iInj], intD = s_StatGpuD[iInt];
+
+                    // D 档期望零样本，所以**不能**要求 D 有样本 —— 那正好把健康状态判成缺口。
+                    // A/C 两档则必须有：它们是分母。
+                    bool have = injA.count > 0 && intA.count > 0
+                             && injC.count > 0 && intC.count > 0
+                             && injA.medMs > 0.0 && intA.medMs > 0.0;
+                    // ---- 整机状态漂移的对照项 ----
+                    //
+                    // 与旋钮响应那一节同一个对照 pass（Sky-View LUT）、同一条理由，
+                    // 但这里更需要它：那一节只跨两档，这一节跨四档、前后差着一千多帧，
+                    // 热降频、后台导资源、另一个窗口开始渲染，都会让**所有**行一起变。
+                    //
+                    // 没有这一项的话，这一节报出来的 A − C 会把机器状态的漂移
+                    // 原封不动地写成「切档省下/多花了多少毫秒」——
+                    // 而那个数看起来完全正常，符号甚至可能是反的。
+                    // 本次首跑就撞上了：对照比值 1.35，而注入 A→C 涨了 77%，
+                    // 两个数一起说明「那 77% 里有多少是切档造成的」当时根本答不出来。
+                    //
+                    // 对照 pass 与三个旋钮全都无关（divisor/mode/injection 一个都不进 Sky-View LUT），
+                    // 所以它在四档之间**应当**是同一个数；它不是，就说明这四档不可比。
+                    Stat ctlA = s_StatGpu[k_ResponseControlIdx];
+                    Stat ctlC = s_StatGpuC[k_ResponseControlIdx];
+                    Stat ctlD = s_StatGpuD[k_ResponseControlIdx];
+                    bool ctlHave = ctlA.count > 0 && ctlC.count > 0 && ctlD.count > 0 && ctlA.medMs > 0.0;
+                    double rCtlC = ctlHave ? ctlC.medMs / ctlA.medMs : double.NaN;
+                    double rCtlD = ctlHave ? ctlD.medMs / ctlA.medMs : double.NaN;
+                    bool ctlSteady = ctlHave
+                        && System.Math.Abs(rCtlC - 1.0) <= k_ControlRatioTolerance
+                        && System.Math.Abs(rCtlD - 1.0) <= k_ControlRatioTolerance;
+
+                    if (!have)
+                    {
+                        modeGap = 1;
+                        sb.AppendLine("　　 **不可判定**：A 或 C 档没采到注入/积分的样本，差值算不出来。");
+                    }
+                    else if (!ctlSteady)
+                    {
+                        // 整节作废，与 divisor 不符同一个处置：三档不可比时，
+                        // 连那道看起来很稳的 D/A 门也一起不判 —— 它同样是一个跨档比值。
+                        // 「大概没问题」不是判据。
+                        modeGap = 1;
+                        sb.Append("　　 **整节作废**：对照 ").Append(k_PassNames[k_ResponseControlIdx])
+                          .Append(" 中位 A ").Append(ctlA.count > 0 ? ctlA.medMs.ToString("F3") : "—")
+                          .Append("　C ").Append(ctlC.count > 0 ? ctlC.medMs.ToString("F3") : "—")
+                          .Append("　D ").Append(ctlD.count > 0 ? ctlD.medMs.ToString("F3") : "—")
+                          .Append(" ms　比值 C/A ").Append(ctlHave ? rCtlC.ToString("F2") : "n/a")
+                          .Append("　D/A ").Append(ctlHave ? rCtlD.ToString("F2") : "n/a")
+                          .Append("（容差 |r−1| ≤ ").Append(k_ControlRatioTolerance.ToString("F2"))
+                          .AppendLine("）");
+                        sb.AppendLine("　　 → 对照 pass 不吃这三个旋钮里的任何一个，它变了就是整机状态变了。"
+                                    + "这时三档之间的任何差值都同时含着「旋钮」与「机器」两个自变量，"
+                                    + "归因不成立。让机器闲下来重跑一次。");
+                        // 数字照打，但明确标成不可引用：删掉它们会让「作废」与「没跑」
+                        // 在报告上长得一模一样，而这两件事该做的下一步不同。
+                        sb.Append("　　 （仅供参考，**不可引用**）近层合计 A ")
+                          .Append((injA.medMs + intA.medMs).ToString("F3"))
+                          .Append("　C ").Append((injC.medMs + intC.medMs).ToString("F3"))
+                          .Append("　D ").Append(((injD.count > 0 ? injD.medMs : 0.0)
+                                                + (intD.count > 0 ? intD.medMs : 0.0)).ToString("F3"))
+                          .AppendLine(" ms");
+                    }
+                    else
+                    {
+                        double nearA = injA.medMs + intA.medMs;
+                        double nearC = injC.medMs + intC.medMs;
+                        // D 档没有样本 ⇒ 这两趟没跑 ⇒ 成本就是 0。这里把「零样本」读成 0 ms
+                        // 是**有前提**的：前提是上面那一节已经证明这两个名字拼对了
+                        // （pass 名验证）。没有那一节，零样本与名字打错逐字相同。
+                        double nearD = (injD.count > 0 ? injD.medMs : 0.0)
+                                     + (intD.count > 0 ? intD.medMs : 0.0);
+
+                        sb.Append("　　 ").Append(k_PassNames[iInj].PadRight(30))
+                          .Append("中位 A ").Append(injA.medMs.ToString("F3"))
+                          .Append("　C ").Append(injC.medMs.ToString("F3"))
+                          .Append("　D ").Append(injD.count > 0 ? injD.medMs.ToString("F3") : "—（零样本）")
+                          .AppendLine(" ms");
+                        sb.Append("　　 ").Append(k_PassNames[iInt].PadRight(30))
+                          .Append("中位 A ").Append(intA.medMs.ToString("F3"))
+                          .Append("　C ").Append(intC.medMs.ToString("F3"))
+                          .Append("　D ").Append(intD.count > 0 ? intD.medMs.ToString("F3") : "—（零样本）")
+                          .AppendLine(" ms");
+                        sb.Append("　　 近层合计　　　　　　　　　　　 A ").Append(nearA.ToString("F3"))
+                          .Append("　C ").Append(nearC.ToString("F3"))
+                          .Append("　D ").Append(nearD.ToString("F3")).AppendLine(" ms");
+
+                        // ---- 门：关掉注入必须真的不跑了 ----
+                        double residual = nearD / nearA;
+                        bool injOff = residual <= k_MaxNoInjectionResidual;
+                        if (!injOff) modeGap = 1;
+                        sb.Append("　　 判据：D/A = ").Append(residual.ToString("F3"))
+                          .Append(" ≤ ").Append(k_MaxNoInjectionResidual.ToString("F2"))
+                          .Append(" —— ").AppendLine(injOff ? "通过" : "**不通过**");
+                        if (!injOff)
+                            sb.AppendLine("　　 → enableInjection 关掉之后这两趟还在跑（或者还在计时）。"
+                                        + "在查清之前，上面所有近层的毫秒数都不能归因给近层："
+                                        + "一个关不掉的开关说明这个 marker 底下不止近层这一件事。");
+
+                        // ---- 只报不判：切档省了多少 ----
+                        double savedByMode = nearA - nearC;
+                        double totalNear   = nearA - nearD;
+                        sb.Append("　　 A − C（切 AP 档省下）").Append(savedByMode.ToString("F3"))
+                          .Append(" ms　｜　A − D（近层总价）").Append(totalNear.ToString("F3"))
+                          .Append(" ms　｜　C − D（切了档仍在付）")
+                          .Append((nearC - nearD).ToString("F3")).AppendLine(" ms");
+
+                        if (totalNear > 1e-6)
+                        {
+                            double share = savedByMode / totalNear;
+                            sb.Append("　　 切档省下的占近层总价 ").Append(share.ToString("P0"));
+                            if (share < k_ModeSavingNotable)
+                            {
+                                // 这不是一次意外，是照着代码写死的行为，所以这里指名道姓给出行号：
+                                // 一条说得出「在哪一行」的结论，读者可以三十秒内自己证伪。
+                                sb.AppendLine("　　←**切档几乎不省钱**");
+                                sb.AppendLine("　　 → 成因不是测量误差，是实现如此："
+                                            + "VistaAtmospherePass.cs:250 的 froxelEnabled 只看 "
+                                            + "enableInjection 与相机类型，**不看 fog.mode**；"
+                                            + "mode 只在 :490 决定合成时采不采近层的表。"
+                                            + "于是 AP 档下注入与积分照跑，产物直接扔掉。");
+                                sb.AppendLine("　　 → 这一栏**只报不判**：把它做成门的话它今天必红，"
+                                            + "而一格恒红的判据不是判据。要让它能绿，"
+                                            + "得先改运行期行为（把 froxelEnabled 也挂上 UsesNearLayer），"
+                                            + "那是一次会改画面与生命周期的改动，得单独立项讨论；"
+                                            + "改完之后这一栏连同一道「切档必须省下九成」的门一起补上。");
+                            }
+                            else
+                            {
+                                sb.AppendLine("　　（切档确实省下了大部分近层成本）");
+                            }
+                        }
+                        else
+                        {
+                            sb.AppendLine("　　 近层总价 ≤ 0，占比不计算 —— 这与上面那道门互为印证，"
+                                        + "以那一道的结论为准。");
+                        }
+
+                        sb.AppendLine("　　 三档之间只差一个自变量：C 相对 A 只改 fog.mode，"
+                                    + "D 相对 A 只改 enableInjection（档位已还原），"
+                                    + "screenDivisor 三档一致（起采样时逐档核对过）。");
+                        // 对照项通过时也要把数打出来：一道只在失败时才留下痕迹的检查，
+                        // 与一道根本没跑的检查在报告上无法区分。
+                        sb.Append("　　 整机状态对照 ").Append(k_PassNames[k_ResponseControlIdx])
+                          .Append("：C/A ").Append(rCtlC.ToString("F2"))
+                          .Append("　D/A ").Append(rCtlD.ToString("F2"))
+                          .Append("（容差 |r−1| ≤ ").Append(k_ControlRatioTolerance.ToString("F2"))
+                          .AppendLine("）—— 四档之间机器状态没变过。");
+                    }
+                }
+            }
+
             // ---- 与模型 B 对账 ----
             // 只判**方向**，不判差值：两个模型量的不是同一件事，差多少没有先验。
             // 能判的是"A 不应该比 B 小"—— 帧内延迟不可能低于允许重叠的吞吐下界。
@@ -1559,7 +1954,12 @@ namespace Vista.Editor
                    // 旋钮响应门。它与上面每一道门的性质都不同：那些判的是
                    // 「读数自洽吗」，这一条判的是「读数与被测对象有因果关系吗」。
                    // 前者全绿而这一条红，意味着一份内部完全一致、却测错了东西的报告。
-                   && responseGap == 0;
+                   && responseGap == 0
+                   // 档位对照门。它判的是「关掉近层，近层就真的不花钱了」——
+                   // 与旋钮响应那一条同一类（因果），但方向相反：那一条证明加量会变贵，
+                   // 这一条证明关掉会变免费。两条一起才封住「这个 marker 底下是不是
+                   // 只有近层这一件事」，单独任何一条都留着一半的空间。
+                   && modeGap == 0;
             if (ok) Debug.Log("[Vista] 模型 A 交叉验证完成  |  " + flat);
             else Debug.LogWarning($"[Vista] 模型 A 交叉验证有缺口（稳态缺样本 {missing}，GPU 可用 "
                                 + $"{gpuUsable}/{k_SteadyIdx.Length}，出现次数不稳 {occUnstable}，"
@@ -1569,7 +1969,8 @@ namespace Vista.Editor
                                 + $"froxel 缺样本 {froxelMissing}，froxel 仅 CPU {froxelCpuOnly}，"
                                 + $"froxel 出现次数不稳 {froxelOccUnstable}，froxel 关着却在跑 {froxelUnexpected}；"
                                 + $"诊断 pass 泄漏进稳态 {absentLeak}；pass 名未验 {nameGap}；"
-                                + $"旋钮响应{(responseGap == 0 ? "通过" : "**未通过/不可判定**")}）"
+                                + $"旋钮响应{(responseGap == 0 ? "通过" : "**未通过/不可判定**")}；"
+                                + $"档位对照{(modeGap == 0 ? "通过" : "**未通过/不可判定**")}）"
                                 + "  |  " + flat);
         }
 
@@ -1593,6 +1994,12 @@ namespace Vista.Editor
             // 而它同样**会被存盘** —— 症状是近层雾的分辨率悄悄翻了四倍，
             // 下次有人量性能时得到一组比出货配置贵得多的数字，且没有任何线索指向这里。
             RestoreDivisor();
+            // 另外两个旋钮，同一条兜底。它们比 divisor 更需要这一句：divisor 停在测试值上
+            // 至少还会让下一次测量出现一组反常的数字，而雾档位被静默留在 AerialPerspective、
+            // 或者 enableInjection 被留在关上，画面只是「近处的雾淡了/没了」——
+            // 一个没有任何报错、也不会被任何判据抓到的、被存进资产的配置改动。
+            RestoreMode();
+            RestoreInjection();
             Dispose(ref s_NameProbe);
             s_NameProbeClosed = true;
         }
