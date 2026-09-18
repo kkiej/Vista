@@ -9,7 +9,12 @@ namespace Vista.Editor
     /// <summary>
     /// 模型 A：Play 模式下用 <see cref="ProfilerRecorder"/> 抓 RenderGraph 的逐 pass marker，
     /// 交叉验证 <c>VistaAtmosphereLutProfiler</c> 与 <c>VistaApCompositePerf</c>（模型 B）
-    /// 给出的数字。覆盖两张静态表 + 稳态五个 LUT pass + AP 合成（全屏光栅）。
+    /// 给出的数字。覆盖两张静态表 + 稳态五个 LUT pass + AP 合成（全屏光栅）
+    /// + 近层 froxel 的两趟出货 pass + 五趟只该在被请求时出现的自检/诊断 pass。
+    ///
+    /// **注意 froxel 那两趟没有第二个模型可对**：模型 B 只覆盖了大气的七张表与 AP 合成。
+    /// 所以下面 froxel 一节报的是**单模型数字**，它回答"多少毫秒"，回答不了"这个数对不对"。
+    /// 把它和上面两节混在一起看，会让对过账的数给没对过账的数背书。
     ///
     /// 两个模型测的**不是同一件事**，所以这不是"再量一遍看对不对"：
     ///   模型 B（Edit 模式立即提交、N 次背靠背摊销）测的是**吞吐** —— 相邻 dispatch
@@ -34,6 +39,9 @@ namespace Vista.Editor
     ///    读 recorder 不需要在渲染线程上，也不需要 per-frame 回调；
     /// ③ 这个工具一个字节的场景改动都不产生 —— 量性能的工具改被量的对象，
     ///    是这类 harness 最容易犯的错。
+    ///    **一处例外**，见 <see cref="k_NameProbeView"/>：预热期会把
+    ///    <c>debugView</c> 翻开一瞬再翻回去，那个字段序列化在 RendererFeature 资产上。
+    ///    这是整个工具唯一碰项目资产的动作，代价与换来的东西都写在那里。
     /// </summary>
     static class VistaLutGpuRecorderCrossCheck
     {
@@ -53,10 +61,19 @@ namespace Vista.Editor
         /// 容量取到 > 采样帧数，这样整段采样都在环里，不必中途读。
         const int k_Capacity = 512;
 
-        /// 与 <c>VistaAtmospherePass.cs</c> 里的 pass 名**逐字**一致。
-        /// 这里刻意硬编一份字符串而不是从 Runtime 侧导出常量：pass 名是给人看的调试标签，
-        /// 把它提成 API 会让"改名"变成破坏性改动。代价是这份表会走歧 ——
-        /// 所以下面把"marker 一个都没抓到"判成**失败**而不是"这次没数据"。
+        /// 与 <c>VistaAtmospherePass.cs</c> / <c>VistaFroxelDebugPass.cs</c> 里的 pass 名
+        /// **逐字**一致。这里刻意硬编一份字符串而不是从 Runtime 侧导出常量：
+        /// pass 名是给人看的调试标签，把它提成 API 会让"改名"变成破坏性改动。
+        ///
+        /// 代价是这份表会走歧。对**每帧都跑**的 pass，兜底是下面那条
+        /// 「marker 一个都没抓到 = 失败」。但对期望为 0 的那几个（两张静态表、
+        /// 四个探针、调试视图）这条兜底不成立 —— 零样本是它们的合法稳态，
+        /// 于是"名字打错了"和"它确实没跑"在报表上长得一模一样，
+        /// 那就是一个红不起来的红测。
+        ///
+        /// 所以补了一个**预热期的名字验证**（见 <see cref="k_NameProbeFrame"/>）：
+        /// 主动制造一帧让它们出现，看名字抓不抓得到，再让它们消失。
+        /// 名字的正确性从此是一个**测量结果**，不是一句声明。
         static readonly string[] k_PassNames =
         {
             "Vista Transmittance LUT",
@@ -67,6 +84,13 @@ namespace Vista.Editor
             "Vista Sky Reflection Copy",
             "Vista Aerial Perspective LUT",
             "Vista Aerial Perspective Composite",
+            "Vista Froxel Injection",
+            "Vista Froxel Integration",
+            "Vista Froxel Shadow Probe",
+            "Vista Froxel Reproj Probe",
+            "Vista Froxel Jitter Probe",
+            "Vista Froxel Local Light Probe",
+            "Vista Froxel Debug View",
         };
 
         /// 稳态五 pass（不含两张静态表、不含合成）在 k_PassNames 里的下标。
@@ -93,11 +117,194 @@ namespace Vista.Editor
         /// 这种退化只有计时器能抓到。所以这里把方向掉过来判。
         static readonly int[] k_StaticIdx = { 0, 1 };
 
+        /// 近层 froxel 的两趟**出货** pass。它们与稳态五 pass 分开的理由有三条：
+        ///
+        /// ① **没有第二个模型可对。** 模型 B（VistaAtmosphereLutProfiler / ApCompositePerf）
+        ///    只覆盖了大气七表与 AP 合成。把 froxel 加进「稳态五 pass 之和」，
+        ///    那个和就不再对应 0.170~0.198 ms 这个区间，对账当场失效 ——
+        ///    与 k_CompositeIdx ② 是同一条理由。
+        ///
+        /// ② **期望值依赖配置。** enableInjection 默认关着；关着的时候这两趟零样本是
+        ///    **完全正确**的状态。写死"每帧都该在"会在一个合法布景上红 ——
+        ///    「一道只看配置、不看运行期剔除的门，会在一个完全合法的布景上红」。
+        ///    所以下面先读 feature.volumetricFog.enableInjection 再定期望。
+        ///
+        /// ③ **成本随屏幕分辨率变**（体的 XY = 屏幕 / screenDivisor），
+        ///    与 LUT 那五个的定值口径不同，所以同样不能按出现次数相除。
+        static readonly int[] k_FroxelSteadyIdx = { 8, 9 };
+
+        /// 稳态里**应该一个样本都没有**的自检/诊断 pass：四个覆盖性探针 + 调试视图。
+        ///
+        /// 四个探针全在 <c>VistaAtmospherePass.cs:811</c> 的
+        /// <c>if (froxelVolume.probeRequested)</c> 里，而那个标记只有 Editor 自检会置、
+        /// 且 pass 自己在 816 行清掉（"一次请求只跑一帧"）。调试视图则由
+        /// <c>debugView != Off</c> 把整趟 pass 挡在 EnqueuePass 之前。
+        ///
+        /// 判定方向与 k_StaticIdx 相同：**有**样本才是 bug。有样本意味着
+        /// 诊断开销漏进了每一帧，而画面上完全看不出来。
+        static readonly int[] k_AbsentIdx = { 10, 11, 12, 13, 14 };
+
+        /// 名字验证：在这一帧（相对 play 起点）主动把四个探针请求出来、
+        /// 并把调试视图翻开，好让那五个"稳态里不该出现"的 marker 各出现一次。
+        ///
+        /// 取 5 而不是 0：froxelVolume 要等第一帧的 RecordRenderGraph 里 Prepare 过才存在，
+        /// 太早置标记会写到一个 null 上（然后静默什么都没发生 —— 那正是这个验证
+        /// 要消灭的失效形态）。
+        const int k_NameProbeFrame = 5;
+
+        /// 验证窗口关掉的帧。窗口要比 1 宽：探针那一帧与 Editor tick 不是同步的，
+        /// 卡一帧就会把"名字对"误判成"名字错"。
+        const int k_NameProbeEndFrame = 18;
+
+        /// 主动重烘两张静态表的帧。见 <see cref="TriggerStaticRebake"/>。
+        ///
+        /// 必须**严格晚于** <see cref="k_NameProbeFrame"/>：重烘会把 m_Luts 整个换掉，
+        /// 而四个探针是挂在 m_Luts 的近层体上的。反过来的症状是拿一格换四格。
+        /// 也要留足到 k_NameProbeEndFrame 的余量：烘在下一帧发生，收割还要再一个 tick。
+        const int k_NameProbeRebakeFrame = 10;
+
+        // ================================================================ 旋钮响应测试
+        //
+        //  近层 froxel 那两趟（注入/积分）是本报告里**唯一没有第二个模型可对**的数字：
+        //  LUT 那五趟能跟模型 B 对账，AP 合成能对一条包线，而 0.354 ms 这个数
+        //  只能自己担保自己。一个无法被证伪的读数不是测量，是一个印出来的字符串。
+        //
+        //  能拿到的唯一独立证据是**因果**：把一个已知会改变工作量的旋钮翻一档，
+        //  看这个读数动不动。screenDivisor 减半 ⇒ 体的 XY 各 ×2 ⇒ 线程数 ×4。
+        //  这是 UE5 用 r.VolumetricFog.GridPixelSize、HDRP 用 Volumetric Fog 的
+        //  screen fraction 做同一件事的那个旋钮。
+        //
+        //  所以这一节采两次：A 档（出货配置，报告正文用它）→ 翻旋钮 → B 档。
+        //  代价是 play 时长翻倍（约 690 帧 ≈ 12 s），换来的是把
+        //  「唯一的验证手段是改一个旋钮看它动不动」这句**注释**变成一道会红的门。
+
+        /// 翻的倍数：除数减半。选 2 而不是 4 是因为 divisor 的合法区间是 [2,16]，
+        /// 出货档 8 除以 4 得 2 正好压在下界上 —— 压在边界上的测试会在别人把
+        /// divisor 调到 4 的那天悄悄失效（4/4=1 被 clamp 回 2，实际只翻了一档）。
+        const int k_DivisorTestFactor = 2;
+
+        /// 注入耗时的最小响应比。线程数 ×4，时间比取 1.5 作门。
+        ///
+        /// 为什么不是 4：×4 是**线程数**比，不是时间比。占用率、缓存命中、
+        /// 每趟派发的固定开销都会把它压下来，拿 4 当门是拿一个不存在的模型定阈值。
+        /// 为什么是 1.5：这道门要抓的是「读数对被测对象根本没反应」——
+        /// 线程数翻两番而时间涨不到一半，说明这个数被某个与 froxel 无关的常数项主导，
+        /// 那时它不能被当作「近层雾的每帧成本」引用。
+        /// **不设上界**：偏高不代表仪器坏，而我手上没有能定出上界的模型。
+        const float k_MinInjectionResponse = 1.5f;
+
+        /// 对照项允许的偏离。对照涨了说明整机状态变了（热降频、编辑器自己在导资源），
+        /// 那时测量项的上涨不能归因给旋钮 —— 少了这一项，一次后台编译就能让门通过。
+        ///
+        /// 0.35 的来源：同一份构建连续两次运行，Sky-View 中位都是 0.155 ms、
+        /// Sky Reflection 中位都是 0.352 ms（#27 实测），也就是中位数在同配置下
+        /// 复现到 5% 以内。0.35 比它宽一个量级，只挡住「整机状态明显变了」。
+        const float k_ControlRatioTolerance = 0.35f;
+
+        /// 对照用哪一趟：Sky-View LUT。它每帧都跑、尺寸固定 192×108，
+        /// 与 froxel 的 divisor 没有任何关系。
+        /// 不拿静态表当对照：那两趟稳态里是 0 个样本，比值算不出来 ——
+        /// 一个恒为「不可判定」的对照等于没有对照。
+        const int k_ResponseControlIdx = 2;
+
+        /// 翻给 debugView 的档位。选 IntegralRgb 而不是 SingleSlice：
+        /// 后者要一个合法的切片下标，而那是另一个可能配错的量 ——
+        /// 验证名字的这一步不该再引入第二个失败来源。
+        ///
+        /// ── 为什么允许这个工具碰资产 ──
+        /// debugView 序列化在 RendererFeature 资产上，翻它会把资产标脏。本类别处
+        /// 立过"不改被量对象"的规矩（runInBackground 那里为此专门用了运行期属性）。
+        /// 这里破一次例，因为没有非持久化的等价物，而换来的是两件都没有门的事：
+        ///   ① "Vista Froxel Debug View" 这个名字被验；
+        ///   ② feature 注释里那句「Off 档整趟 pass 不被记录」第一次有判据 ——
+        ///      在此之前它只是一句注释，而「一条只写在注释里的恒等式不会自己失败」。
+        /// 复位放在 Cleanup()，手动停止 play 那条路径也会走到。
+        const FroxelDebugView k_NameProbeView = FroxelDebugView.IntegralRgb;
+
+        /// 名字验证那组 recorder 的环容量。窗口只有十几帧，但每个 Editor tick 都收割一次，
+        /// 所以这里只需要盖住「两个 tick 之间可能渲了几帧」，64 远远够。
+        const int k_NameProbeCapacity = 64;
+
         static ProfilerRecorder[] s_Gpu;
         static ProfilerRecorder[] s_Cpu;
         static int s_StartFrame;
         static bool s_Running;
         static bool s_Started;
+
+        /// 名字验证用的一组 recorder（只要 CPU 侧：这一步问的是"marker 在不在"，
+        /// 不是"多少毫秒"，起 GPU recorder 是白付采样开销）。
+        ///
+        /// 从进 play 的第一个 tick 就起，而不是等到 k_NameProbeFrame ——
+        /// 静态表烘得非常早，越早起越有机会抢到。
+        /// 但**实测（#27）证明抢不住**：域重载后的第一帧就烘完，而 recorder 是在
+        /// EnteredPlayMode 回调里起的，两者的先后没有任何保证 ——
+        /// 于是那两格恒为「没抓到」，一道恒红的门不是门。
+        /// 所以真正的解法不是抢时机，是 <see cref="TriggerStaticRebake"/> 自己造一次。
+        /// 这里仍然早起，因为它免费，而且早起时若恰好抢到就多一条独立证据。
+        static ProfilerRecorder[] s_NameProbe;
+        /// 每个 pass 名在验证窗口里是否至少出现过一次。
+        static bool[] s_NameSeen;
+        static bool s_NameProbeTriggered;
+        static bool s_NameProbeClosed;
+        /// 探针请求是否真的递进去了（froxelVolume 为 null 时递不进去）。
+        static bool s_ProbeRequestSent;
+
+        /// 触发那一刻 <c>enableInjection</c> 是不是开着。关着的时候四个探针
+        /// 根本不在图里，那一格必须报「不可判定」而不是「名字错」。
+        static bool s_NameProbeInjectionOn;
+
+        /// debugView 的原值。null = 本次没碰过它，Cleanup 不要复位 ——
+        /// 复位一个没动过的字段会把资产标脏，那正是这里要避免的。
+        static FroxelDebugView? s_DebugViewSaved;
+
+        /// 验证窗口里 debugView 是不是确实处在非 Off 档。
+        /// 与 <see cref="s_DebugViewSaved"/> 是两件事：那个在复位之后会被置回 null
+        /// （它的语义是「还欠一次复位」），拿它去判「调试 pass 该不该出现」，
+        /// 会在收摊之后永远读到 false —— 而报告正是在收摊之后才打印的。
+        static bool s_NameProbeDebugOn;
+
+        /// 重烘那一步是否已经执行过（与 s_NameProbeTriggered 同构，只是另一件事）。
+        static bool s_RebakeTriggered;
+
+        /// 重烘是否**真的发起了**。取不到 feature 时它留 false，
+        /// 于是静态表那两格报「不可判定」而不是「名字错」——
+        /// 不可判定必须是缺口，但它也不能是诬告：指着两个拼写正确的字符串说对不上，
+        /// 会让人去修一个不存在的 bug，那比不报还坏。
+        static bool s_RebakeRequested;
+
+        // ---------------------------------------------------------------- 旋钮响应测试的状态
+        //
+        //  A 档读数必须**冻结**下来再进 B 档：recorder 环在 B 档会被整批重建，
+        //  而报告正文是在两档都跑完之后才打印的。若报告仍然现场 Read(s_Gpu[i])，
+        //  正文里那一整页数字会在不知不觉间变成 B 档（divisor 减半）的数 ——
+        //  一份标着出货配置、内容却是测试配置的报告，比没有报告更危险。
+
+        /// A 档（出货配置）的冻结读数。报告正文的每一个数字都从这里取。
+        static Stat[] s_StatGpu;
+        static Stat[] s_StatCpu;
+
+        /// B 档（divisor 减半）的冻结读数。只要 GPU 侧：这一节问的是「工作量变了没」，
+        /// 而 CPU 侧记的是录制命令的时间，它对派发规模基本不敏感 —— 拿它当证据会削弱判据。
+        static Stat[] s_StatGpuB;
+
+        /// 当前是不是在 B 档。它同时是「已经翻过旗」的标记，
+        /// 所以 Tick 尾部不会翻第二次（那会一路除到下界 2 再也退不出来）。
+        static bool s_PhaseB;
+
+        /// 翻旗前的原值。null = 没翻过，<see cref="RestoreDivisor"/> 不要复位 ——
+        /// 与 <see cref="s_DebugViewSaved"/> 同一条理由：复位一个没动过的字段会把资产标脏。
+        static int? s_DivisorSaved;
+
+        /// 两档各自的 divisor。报告正文打 <c>s_DivA</c> 而不是现场读 fogCfg ——
+        /// 打印发生在复位之后，现场读到的是被还原的值，正文会宣称一个与 B 档读数不符的配置。
+        static int s_DivA, s_DivB;
+
+        /// 旋钮翻不动的原因。非 null ⇒ 这道门报**不可判定**，不报通过。
+        static string s_ResponseSkipReason;
+
+        /// 整个 run（含两档）的起始帧。<c>s_StartFrame</c> 在进 B 档时会被重新基准化，
+        /// 拿它算「实际经过 N 帧」会只报后半程，把报告头上那个数字变成一句假话。
+        static int s_RunStartFrame;
 
         /// <summary>
         /// 无帧进展的看门狗。这一段是一次实测事故换来的：<c>runInBackground</c> 关着的时候，
@@ -139,7 +346,8 @@ namespace Vista.Editor
             EditorApplication.ExecuteMenuItem("Window/General/Game");
 
             Debug.Log($"[Vista] 交叉验证已武装：进 play 模式，丢弃前 {k_WarmupFrames} 帧，"
-                    + $"采样 {k_SampleFrames} 帧后自动退出并打报告。");
+                    + $"采样 {k_SampleFrames} 帧；随后把 screenDivisor 减半再跑一档同样长度"
+                    + "（旋钮响应测试，退出时自动还原），两档跑完自动退出并打报告。");
             EditorApplication.EnterPlaymode();
         }
 
@@ -158,12 +366,36 @@ namespace Vista.Editor
                 SessionState.SetBool(k_ArmedKey, false);   // 一次性：手动再进 play 不会莫名开始采样
 
                 s_StartFrame = Time.frameCount;
+                s_RunStartFrame = s_StartFrame;
                 s_Running = true;
                 s_Started = false;
+                s_PhaseB = false;
+                s_DivisorSaved = null;
+                s_DivA = 0;
+                s_DivB = 0;
+                s_StatGpu = null;
+                s_StatCpu = null;
+                s_StatGpuB = null;
+                s_ResponseSkipReason = null;
+                s_NameProbeTriggered = false;
+                s_NameProbeClosed = false;
+                s_RebakeTriggered = false;
+                s_RebakeRequested = false;
+                s_ProbeRequestSent = false;
+                s_DebugViewSaved = null;
+                s_NameProbeDebugOn = false;
+                s_NameProbeInjectionOn = false;
+                s_NameSeen = new bool[k_PassNames.Length];
                 s_LastFrame = int.MinValue;
                 s_NoProgress = System.Diagnostics.Stopwatch.StartNew();
                 s_RunInBackgroundSaved = Application.runInBackground;
                 Application.runInBackground = true;
+
+                // 名字验证的 recorder 必须在**第一帧渲染之前**起。
+                // EnteredPlayMode 正好在那之前，而 EditorApplication.update 的第一个 tick
+                // 不保证 —— 两张静态表在第一帧就烘完，晚一个 tick 就永远抓不到它们了。
+                StartNameProbe();
+
                 EditorApplication.update -= Tick;
                 EditorApplication.update += Tick;
             }
@@ -201,6 +433,12 @@ namespace Vista.Editor
             }
 
             int elapsed = frame - s_StartFrame;
+
+            // 名字验证整个跑在预热期里，与采样窗口不重叠：它要主动制造几帧
+            // 「稳态里不该有」的活儿（四个探针 + 一趟调试全屏），那些活儿若落进采样窗口，
+            // 量到的就不是稳态了。预热 45 帧，窗口 5~18 帧，中间还剩 27 帧给
+            // 调试视图那趟 pass 的深度拷贝退场。
+            TickNameProbe(elapsed);
 
             if (!s_Started)
             {
@@ -261,21 +499,307 @@ namespace Vista.Editor
                     return;
                 }
 
+                // 记下这一档实际在跑的 divisor。**在这里**取，而不是在报告里现场读：
+                // 报告打印发生在旋钮复位之后，现场读到的是还原值 ——
+                // 于是正文会宣称一个与 B 档读数不符的配置，一份自相矛盾的报告。
+                {
+                    var fogCfg = VistaAtmosphereFeature.current?.volumetricFog;
+                    int div = fogCfg != null ? Mathf.Clamp(fogCfg.screenDivisor, 2, 16) : 0;
+                    if (!s_PhaseB) s_DivA = div; else s_DivB = div;
+                }
+
                 s_Started = true;
                 return;
             }
 
             if (elapsed < k_WarmupFrames + k_SampleFrames) return;
 
-            Report(elapsed);
+            if (!s_PhaseB)
+            {
+                s_StatGpu = new Stat[k_PassNames.Length];
+                s_StatCpu = new Stat[k_PassNames.Length];
+                Capture(s_StatGpu, s_StatCpu);
+
+                // 翻旗成功就地返回：下面那一段（复位 + 报告 + 退出）要等 B 档跑完。
+                if (BeginResponsePhase(frame)) return;
+            }
+            else
+            {
+                s_StatGpuB = new Stat[k_PassNames.Length];
+                Capture(s_StatGpuB, null);
+            }
+
+            // 复位排在报告**之前**：报告里没有一个数字是现场读配置得来的
+            // （见上面 s_DivA 的取值时机），所以复位不会污染正文；
+            // 反过来把复位放在报告之后，一旦报告里抛出任何异常，
+            // 旋钮就永远停在测试值上 —— 一个量性能的工具把被量对象改了还不还回去。
+            RestoreDivisor();
+            Report(frame - s_RunStartFrame);
             Cleanup();
             EditorApplication.ExitPlaymode();
+        }
+
+        // ================================================================ 旋钮响应测试
+
+        /// <summary>把当前环里的读数冻结到数组里。<paramref name="cpu"/> 可为 null。</summary>
+        static void Capture(Stat[] gpu, Stat[] cpu)
+        {
+            for (int i = 0; i < k_PassNames.Length; ++i)
+            {
+                gpu[i] = Read(s_Gpu[i]);
+                if (cpu != null) cpu[i] = Read(s_Cpu[i]);
+            }
+        }
+
+        /// <summary>
+        /// 把 screenDivisor 减半并重新开一轮预热 + 采样。返回 false 表示这道门**不可判定**
+        /// （原因写进 <see cref="s_ResponseSkipReason"/>），调用方应当直接出报告。
+        ///
+        /// 为什么要重新预热满 45 帧、而不是接着采：改 divisor 会让
+        /// <c>VistaFroxelVolume.Prepare</c> 认出 desc 变了并**重新分配**三张 3D 表，
+        /// 于是时间重投影的历史整个失效。紧接着那几帧的注入/积分都跑在
+        /// 「历史无效」的分支上，把它们算进中位数，量到的是一次性的重建成本，
+        /// 不是 B 档的稳态 —— 而这道门比的正是两个稳态。
+        ///
+        /// 手段是把 <c>s_StartFrame</c> 重新基准化，让上面那段预热+起 recorder 的代码
+        /// 原样再跑一遍。不另写一份的理由与「两份真相」是同一条：
+        /// 复制出来的第二份预热逻辑会在改预热帧数时漏掉一边。
+        /// </summary>
+        static bool BeginResponsePhase(int frame)
+        {
+            var fog = VistaAtmosphereFeature.current?.volumetricFog;
+            if (fog == null)
+            {
+                s_ResponseSkipReason = "VistaAtmosphereFeature.current 取不到，旋钮翻不动";
+                return false;
+            }
+
+            if (s_DivA <= 0)
+            {
+                s_ResponseSkipReason = "A 档的 screenDivisor 没取到，没有可翻的基准";
+                return false;
+            }
+
+            int target = s_DivA / k_DivisorTestFactor;
+            if (target < 2)
+            {
+                // 下界是 VistaVolumetricFogSettings.Resolve 里的 Clamp(2,16)。
+                // 不"往上翻"来凑一个能跑的方向：那是另一道门（线程数 ÷4，
+                // 阈值方向相反），而临时改判据方向去让一次运行出结果，
+                // 等于让门自己迎合被测对象。宁可报不可判定。
+                s_ResponseSkipReason = $"screenDivisor 已是 {s_DivA}，减半会越过下界 2，本次没有可翻的方向";
+                return false;
+            }
+
+            s_DivisorSaved = s_DivA;
+            fog.screenDivisor = target;
+
+            // 环要整批重建：B 档的样本必须一个不掺 A 档的。
+            // 只清不重建也行不通 —— 下面那段预热代码会 new 一批新的覆盖上去，
+            // 旧的不 Dispose 就是 300 帧容量 ×15×2 个 native 句柄泄漏。
+            Dispose(ref s_Gpu);
+            Dispose(ref s_Cpu);
+            s_Started = false;
+            s_StartFrame = frame;
+            s_PhaseB = true;
+            return true;
+        }
+
+        /// <summary>
+        /// 把 screenDivisor 还回去。幂等：没翻过就什么都不做。
+        /// Cleanup 里也调一次，接住「用户手动停 play」那条路径 ——
+        /// 与 <see cref="RestoreDebugView"/> 完全同构。
+        /// </summary>
+        static void RestoreDivisor()
+        {
+            if (!s_DivisorSaved.HasValue) return;
+            var fog = VistaAtmosphereFeature.current?.volumetricFog;
+            if (fog != null) fog.screenDivisor = s_DivisorSaved.Value;
+            s_DivisorSaved = null;
+        }
+
+        // ================================================================ 名字验证（预热期）
+
+        /// <summary>
+        /// 起一组**只测 CPU** 的 recorder，专门回答「这个 marker 名字存不存在」。
+        ///
+        /// 不起 GPU recorder：这一步问的是有无，不是多少毫秒，GPU 侧多一份采样开销
+        /// 换不回任何信息。也正因为它不产出时间数字，它落在预热期里不影响稳态测量。
+        /// </summary>
+        static void StartNameProbe()
+        {
+            s_NameProbe = new ProfilerRecorder[k_PassNames.Length];
+            try
+            {
+                for (int i = 0; i < k_PassNames.Length; ++i)
+                    s_NameProbe[i] = ProfilerRecorder.StartNew(
+                        ProfilerCategory.Render, k_PassNames[i], k_NameProbeCapacity,
+                        ProfilerRecorderOptions.SumAllSamplesInFrame
+                        | ProfilerRecorderOptions.WrapAroundWhenCapacityReached);
+            }
+            catch (System.Exception e)
+            {
+                // 这里**不**中止整个交叉验证：名字验证是附加的一层，
+                // 起不起得来与主采样能不能跑是两件事。主采样那边有自己的
+                // fail-fast（同一个 StartNew 会在那里再抛一次，带完整堆栈）。
+                // 报告里这一节会说「没跑成」——不可判定要露成缺口，不能静默当通过。
+                Debug.LogWarning("[Vista] 名字验证的 recorder 起不来，这一节跳过：" + e.Message);
+                Dispose(ref s_NameProbe);
+                s_NameProbeClosed = true;
+            }
+        }
+
+        /// <summary>
+        /// 预热期每个 tick 调一次。四段：收割 → 探针触发 → 重烘触发 → 到点收摊。
+        ///
+        /// 收割放在最前面且从 elapsed=0 就开始，是为了尽量抢在环被覆盖之前把样本捞出来。
+        /// 但那对两张静态表**不够** —— 实测（#27）：域重载后 Create() 重建 m_Luts，
+        /// 两张表在 play 的第一帧就烘完，而 recorder 是在 EnteredPlayMode 里起的，
+        /// 起点与那一帧的距离小到无法保证，结果是两格恒为「没抓到」。
+        /// 一格恒红的判据不是判据，它只会教人去改一个拼写正确的字符串。
+        /// 所以不靠抢时机，改为**自己造一次重烘**，见 TriggerStaticRebake。
+        /// </summary>
+        static void TickNameProbe(int elapsed)
+        {
+            if (s_NameProbeClosed) return;
+            if (s_NameProbe == null) { s_NameProbeClosed = true; return; }
+
+            HarvestNames();
+
+            if (!s_NameProbeTriggered && elapsed >= k_NameProbeFrame)
+            {
+                s_NameProbeTriggered = true;
+                TriggerNameProbe();
+            }
+
+            // 重烘**排在探针之后**，不合并成一步。Create() 会把 m_Luts 整个换掉，
+            // 而近层体是挂在 m_Luts 上的：同一 tick 里先重建再去置 probeRequested，
+            // 拿到的是一个还没分配好的体（froxelVolume 为 null），四个探针名会从
+            // 「已验证」退回「不可判定」—— 用一格的修复换掉四格，是净亏。
+            if (!s_RebakeTriggered && elapsed >= k_NameProbeRebakeFrame)
+            {
+                s_RebakeTriggered = true;
+                TriggerStaticRebake();
+            }
+
+            if (elapsed >= k_NameProbeEndFrame)
+            {
+                HarvestNames();                 // 触发之后的最后一次
+                RestoreDebugView();
+                Dispose(ref s_NameProbe);
+                s_NameProbeClosed = true;
+            }
+        }
+
+        /// <summary>
+        /// 强迫两张静态表重烘一次，好让它们的 marker 在验证窗口里出现。
+        ///
+        /// 手段是调 <c>feature.Create()</c>：它 dispose 掉旧的 <c>m_Luts</c> 再 new 一个，
+        /// 新实例的静态表是脏的，于是下一帧必然烘。
+        ///
+        /// 为什么是这一个手段：
+        ///  · 它**不写任何序列化字段**。改大气参数也能触发重烘，但那会把 RendererFeature
+        ///    资产标脏并留下一个需要撤销的改动 —— 量性能的工具不该改被量对象。
+        ///  · 它是引擎自己每次 shader 重编译都会走的那条路，不是为自检新开的后门。
+        ///  · 它在预热期（第 10 帧）跑完，离采样窗口起点还有 35 帧，重烘那一帧的
+        ///    尖峰不会进统计。
+        /// </summary>
+        static void TriggerStaticRebake()
+        {
+            var feature = VistaAtmosphereFeature.current;
+            if (feature == null) return;
+            feature.Create();
+            s_RebakeRequested = true;
+        }
+
+        /// <summary>
+        /// 主动制造一帧，让那五个「稳态里不该出现」的 pass 各出现一次。
+        /// </summary>
+        static void TriggerNameProbe()
+        {
+            var feature = VistaAtmosphereFeature.current;
+            if (feature == null) return;
+
+            // 记下这一刻的注入开关。四个探针都住在 froxel 那一段里，
+            // 关着的时候它们**不可能**出现 —— 那时「名字错」与「配置关着」
+            // 在读数上一模一样，报告必须把这一格报成不可判定，而不是报成失败。
+            var fog = feature.volumetricFog;
+            s_NameProbeInjectionOn = fog != null && fog.enableInjection;
+
+            var volume = feature.froxelVolume;
+            if (volume != null)
+            {
+                volume.probeRequested = true;
+                s_ProbeRequestSent = true;
+            }
+
+            // 只在 Off 档翻。已经开着的话不动它：那时调试 pass 本来就每帧在跑，
+            // 名字会被收割到，而稳态那一节会如实报「诊断开销漏进了每一帧」——
+            // 那是一个**真实**的读数，不该被这个工具伪造成 Off。
+            if (fog != null && fog.debugView == FroxelDebugView.Off)
+            {
+                s_DebugViewSaved = fog.debugView;
+                fog.debugView = k_NameProbeView;
+            }
+
+            // 「这段窗口里调试档是开着的」——**翻过**与**本来就开着**都算。
+            // 分成两个旗子是因为它们回答的是两个问题：s_DebugViewSaved 回答
+            // 「还欠不欠一次复位」，这个回答「第 14 格能不能判」。
+            s_NameProbeDebugOn = fog != null && fog.debugView != FroxelDebugView.Off;
+        }
+
+        /// <summary>
+        /// 把 <c>debugView</c> 放回去。<c>s_DebugViewSaved</c> 为 null = 本次没碰过，
+        /// 那就一个字节都不写 —— 写一个没动过的字段会把资产标脏。
+        /// </summary>
+        static void RestoreDebugView()
+        {
+            if (!s_DebugViewSaved.HasValue) return;
+            var feature = VistaAtmosphereFeature.current;
+            var fog = feature != null ? feature.volumetricFog : null;
+            if (fog != null)
+                fog.debugView = s_DebugViewSaved.Value;
+            s_DebugViewSaved = null;
+        }
+
+        /// <summary>
+        /// 把「至少出现过一次」这件事从环里收出来。只看 <c>Count</c>，不看 <c>Value</c>：
+        /// 一个耗时被舍入成 0 ns 的 pass 仍然是**出现过**的，用 Value &gt; 0 去判
+        /// 会让最便宜的那趟 pass 报成名字错。
+        /// </summary>
+        static void HarvestNames()
+        {
+            var list = new List<ProfilerRecorderSample>(k_NameProbeCapacity);
+            for (int i = 0; i < s_NameProbe.Length; ++i)
+            {
+                if (s_NameSeen[i]) continue;                 // 一次为真即定，不必再读
+                var r = s_NameProbe[i];
+                if (!r.Valid || r.Count <= 0) continue;
+
+                list.Clear();
+                r.CopyTo(list, false);
+                for (int k = 0; k < list.Count; ++k)
+                {
+                    if (list[k].Count <= 0) continue;        // 那一帧这个 marker 没出现
+                    s_NameSeen[i] = true;
+                    break;
+                }
+            }
         }
 
         struct Stat
         {
             public int count;                 // 有效帧数
             public double minMs, medMs, maxMs;
+            /// <summary>
+            /// 95 分位。加它不是为了多一个数好看，是因为 max 回答不了「阈值该摆哪儿」——
+            /// 300 帧里的 max 常常是某一次编辑器自己的抢占（资源导入、GC、窗口重绘），
+            /// 拿它定门会把门定在一个与这段代码无关的事件上。
+            /// min 是另一端的极值，回答「这条路径最快能有多快」，同样不能当预算。
+            /// 预算要拿一个**分位数**，这是 UE5 的 stat unit / Frostbite 的帧预算报表
+            /// 都在用的口径。
+            /// </summary>
+            public double p95Ms;
             public double occMin, occMax;     // 每帧同名 marker 的出现次数（Sample.Count）
             public bool valid;
         }
@@ -311,6 +835,11 @@ namespace Vista.Editor
             s.minMs = ms[0];
             s.medMs = ms[ms.Count / 2];
             s.maxMs = ms[ms.Count - 1];
+            // 最近秩法（nearest-rank），不插值：样本量只有几百，插值出来的那个数
+            // 落在两个真实观测之间，是一个**没有被观测到的**耗时。定预算时
+            // 「有一帧真的花了这么久」比「统计上大约这么久」更站得住。
+            int rank = (int)System.Math.Ceiling(0.95 * ms.Count) - 1;
+            s.p95Ms = ms[Mathf.Clamp(rank, 0, ms.Count - 1)];
             return s;
         }
 
@@ -322,10 +851,57 @@ namespace Vista.Editor
               .Append("　后端 ").Append(SystemInfo.graphicsDeviceType)
               .Append("　场景 ").AppendLine(UnityEngine.SceneManagement.SceneManager.GetActiveScene().name);
             sb.Append("　 采样 ").Append(k_SampleFrames).Append(" 帧（丢弃预热 ")
-              .Append(k_WarmupFrames).Append("，实际经过 ").Append(elapsedFrames).AppendLine(" 帧）");
+              .Append(k_WarmupFrames).Append("）×2 档（出货配置 + 旋钮响应测试），实际经过 ")
+              .Append(elapsedFrames).AppendLine(" 帧；正文数字**全部**来自出货配置那一档");
             sb.Append("　 本次 play 期间强制 Application.runInBackground=true（原值 ")
               .Append(s_RunInBackgroundSaved ? "true" : "false")
               .AppendLine("，退出即还原，不写 ProjectSettings）—— 失焦时 play 循环不停走，否则采样会卡死");
+
+            // ── 量纲与配置：任何一个亮度/耗时数字都要跟着这两行读 ──
+            //
+            // 曝光印出来是因为它**线性缩放画面里的一切亮度**。它不改耗时，但这份报告
+            // 会和亮度类报表（⑪ 系列、max(S)）放在一起看，而跨曝光比较那些数字是无意义的。
+            // 印「来源」而不只是数值：资产默认与场景覆盖差 10 档 EV 是常态，
+            // 只印一个 9 的话，「这是谁定的」得翻两个 Inspector 才知道。
+            var feature = VistaAtmosphereFeature.current;
+            if (feature != null)
+            {
+                sb.Append("　 EV100 ").Append(feature.ev100.ToString("F2"))
+                  .Append("（来源：").Append(feature.ev100IsOverridden
+                      ? "场景覆盖，资产默认 " + feature.ev100Asset.ToString("F2")
+                      : "资产默认，无场景覆盖")
+                  .Append("）　exposure ")
+                  .AppendLine(VistaAtmosphereViewData.ExposureFromEV100(feature.ev100).ToString("E4"));
+            }
+            else
+            {
+                sb.AppendLine("　 ⚠ VistaAtmosphereFeature.current 为 null —— 下面每一条「期望值」都取不到配置，"
+                            + "froxel 一节会整节报不可判定");
+            }
+
+            // froxel 的两个尺寸旋钮决定了注入/积分的线程数，也就是它们的成本。
+            // 不印的话，两次运行之间的差会被归因到代码，而实际上可能只是有人改了 divisor。
+            var fogCfg = feature != null ? feature.volumetricFog : null;
+            bool froxelExpected = fogCfg != null && fogCfg.enableInjection;
+            if (fogCfg != null)
+            {
+                // divisor 印 s_DivA（A 档采样启动那一刻记下的值），不印 fogCfg.screenDivisor：
+                // 报告是在旋钮复位之后打的，现场读虽然也是 A 档的值，但那只是"碰巧相等"——
+                // 一旦将来复位顺序变了，正文会跟着变成一句假话而没有任何提示。
+                // 让正文的配置与正文的数字来自同一次快照，是它们不会互相说谎的唯一保证。
+                int divA = s_DivA > 0 ? s_DivA : Mathf.Clamp(fogCfg.screenDivisor, 2, 16);
+                sb.Append("　 近层 froxel：enableInjection ").Append(froxelExpected ? "开" : "**关**")
+                  .Append("　screenDivisor ").Append(divA)
+                  .Append("　slices ").Append(fogCfg.sliceCount)
+                  .Append("　远边界 ").Append(fogCfg.depth.ToString("F1")).Append(" m");
+                var gameRes = UnityEditor.Handles.GetMainGameViewSize();
+                int vx = Mathf.Max(1, Mathf.CeilToInt(gameRes.x / divA));
+                int vy = Mathf.Max(1, Mathf.CeilToInt(gameRes.y / divA));
+                sb.Append("　→ 体约 ").Append(vx).Append("×").Append(vy).Append("×")
+                  .Append(fogCfg.sliceCount)
+                  .Append("（按 Game 视图 ").Append((int)gameRes.x).Append("×").Append((int)gameRes.y)
+                  .AppendLine(" 推算，仅供量级参考——实际尺寸由 pass 侧的渲染目标定）");
+            }
 
             int gpuUsable = 0, missing = 0, occUnstable = 0, staticLeak = 0;
             double steadyRawMin = 0.0, steadyPerRenderMin = 0.0, steadyPerRenderMed = 0.0;
@@ -337,12 +913,27 @@ namespace Vista.Editor
             Stat composite = default;
             int compositeMissing = 0, compositeCpuOnly = 0, compositeOccUnstable = 0;
 
+            // froxel 出货两趟：单模型，不并进上面那三个累加器（见 k_FroxelSteadyIdx ①）。
+            int froxelMissing = 0, froxelCpuOnly = 0, froxelOccUnstable = 0, froxelUnexpected = 0;
+            double froxelPerRenderMin = 0.0, froxelPerRenderMed = 0.0, froxelPerRenderP95 = 0.0;
+            bool froxelComplete = true;
+
+            // 自检/诊断五趟：期望零样本，方向与静态表相同。
+            int absentLeak = 0;
+
+            // 旋钮响应门的缺口计数。见「旋钮响应测试」一节的常量注释。
+            int responseGap = 0;
+
             for (int i = 0; i < k_PassNames.Length; ++i)
             {
-                Stat g = Read(s_Gpu[i]);
-                Stat c = Read(s_Cpu[i]);
+                // 读冻结下来的 A 档快照，不现场读环。B 档跑完之后环里装的是 B 档的样本，
+                // 现场读会让这份标着「screenDivisor 8」的正文悄悄变成 divisor 4 的数字。
+                Stat g = s_StatGpu != null ? s_StatGpu[i] : Read(s_Gpu[i]);
+                Stat c = s_StatCpu != null ? s_StatCpu[i] : Read(s_Cpu[i]);
                 bool isStatic = System.Array.IndexOf(k_StaticIdx, i) >= 0;
                 bool isComposite = System.Array.IndexOf(k_CompositeIdx, i) >= 0;
+                bool isFroxel = System.Array.IndexOf(k_FroxelSteadyIdx, i) >= 0;
+                bool isAbsent = System.Array.IndexOf(k_AbsentIdx, i) >= 0;
 
                 sb.Append("　　 ").Append(k_PassNames[i].PadRight(34));
 
@@ -405,11 +996,111 @@ namespace Vista.Editor
                     continue;
                 }
 
+                if (isFroxel)
+                {
+                    // 期望值**读配置**，不写死。enableInjection 关着的时候零样本是
+                    // 完全正确的状态，一道只看「每帧都该在」的门会在一个合法布景上红。
+                    if (!froxelExpected)
+                    {
+                        if (g.count == 0 && c.count == 0)
+                        {
+                            sb.Append("enableInjection 关着：0 个样本（**这是期望**）　"
+                                    + "→ 这一趟的耗时本次未测，不是「很便宜」");
+                        }
+                        else
+                        {
+                            froxelUnexpected++;
+                            sb.Append("**enableInjection 关着却在跑**：GPU min ")
+                              .Append(g.minMs.ToString("F3"))
+                              .Append(" ms　帧 ").Append(g.count).Append("/").Append(k_SampleFrames)
+                              .Append("　→ 关态没有真正关掉，白烧（画面上看不出来）");
+                        }
+                        froxelComplete = false;
+                        sb.AppendLine();
+                        continue;
+                    }
+
+                    if (g.count > 0)
+                    {
+                        sb.Append("GPU min ").Append(g.minMs.ToString("F3"))
+                          .Append("　中位 ").Append(g.medMs.ToString("F3"))
+                          .Append("　p95 ").Append(g.p95Ms.ToString("F3"))
+                          .Append("　max ").Append(g.maxMs.ToString("F3"))
+                          .Append(" ms　帧 ").Append(g.count).Append("/").Append(k_SampleFrames)
+                          .Append("　每帧出现 ").Append(g.occMin.ToString("F0"));
+
+                        if (g.occMax != g.occMin)
+                        {
+                            sb.Append("~").Append(g.occMax.ToString("F0")).Append(" ⚠不稳定");
+                            froxelOccUnstable++;
+                            froxelComplete = false;
+                        }
+                        else if (g.occMin > 1.0)
+                        {
+                            sb.Append("　单次 ").Append((g.minMs / g.occMin).ToString("F3")).Append(" ms");
+                        }
+
+                        // 这里按出现次数相除是合法的，理由与 LUT 那五个相同而与合成不同：
+                        // 近层体的尺寸由 screenDivisor 定，Scene 视图与 Game 视图各渲一次
+                        // 时两次的线程数一样。合成不能除是因为它的成本跟着各自的
+                        // 渲染目标分辨率走，两次根本不等价。
+                        double fdiv = (g.occMin == g.occMax && g.occMin >= 1.0) ? g.occMin : 1.0;
+                        froxelPerRenderMin += g.minMs / fdiv;
+                        froxelPerRenderMed += g.medMs / fdiv;
+                        froxelPerRenderP95 += g.p95Ms / fdiv;
+                    }
+                    else if (c.count > 0)
+                    {
+                        froxelCpuOnly++;
+                        froxelComplete = false;
+                        sb.Append("GPU 无值（valid=").Append(g.valid).Append("）　但 CPU marker 在：min ")
+                          .Append(c.minMs.ToString("F3")).Append(" ms　帧 ").Append(c.count)
+                          .Append("　→ pass 跑了，是 GPU recorder 取不到");
+                    }
+                    else
+                    {
+                        froxelMissing++;
+                        froxelComplete = false;
+                        sb.Append("**一个样本都没有**，而 enableInjection 是开着的（GPU valid=")
+                          .Append(g.valid).Append("，CPU valid=").Append(c.valid)
+                          .Append("）　→ pass 名走歧、或这一趟被运行期条件剪掉了"
+                                + "（体积无效 / 相机类型不符）");
+                    }
+                    sb.AppendLine();
+                    continue;
+                }
+
+                if (isAbsent)
+                {
+                    // 与静态表同一个方向：**有**样本才是 bug。
+                    // 这五趟是自检与诊断用的，稳态里出现意味着诊断开销漏进了每一帧，
+                    // 而画面上完全看不出来 —— 只有计时器能看见的那一类问题。
+                    if (g.count == 0 && c.count == 0)
+                    {
+                        sb.Append("稳态 0 个样本（**这是期望**）　→ ");
+                        sb.Append(i == 14
+                            ? "debugView=Off，整趟 pass 没被记录"
+                            : "probeRequested 只被 Editor 自检置、且 pass 自己当帧清掉");
+                    }
+                    else
+                    {
+                        absentLeak++;
+                        sb.Append("**稳态里在跑**：GPU min ").Append(g.minMs.ToString("F3"))
+                          .Append(" ms　帧 ").Append(g.count).Append("/").Append(k_SampleFrames)
+                          .Append(i == 14
+                              ? "　→ debugView 没回 Off，每帧多一次全屏 + 一次深度拷贝"
+                              : "　→ probeRequested 没被清，自检开销漏进了每一帧");
+                    }
+                    sb.AppendLine();
+                    continue;
+                }
+
                 if (g.count > 0)
                 {
                     gpuUsable++;
                     sb.Append("GPU min ").Append(g.minMs.ToString("F3"))
                       .Append("　中位 ").Append(g.medMs.ToString("F3"))
+                      .Append("　p95 ").Append(g.p95Ms.ToString("F3"))
                       .Append("　max ").Append(g.maxMs.ToString("F3"))
                       .Append(" ms　帧 ").Append(g.count).Append("/").Append(k_SampleFrames);
 
@@ -470,6 +1161,126 @@ namespace Vista.Editor
                 sb.AppendLine("　 除以出现次数的**前提**：LUT 尺寸与相机分辨率无关（256×64 / 32×32 / "
                             + "192×108 / 64²×7 / 32³ 全是定值），每帧只有一份大气参数，"
                             + "所以两次渲染做的是同样的工作量。若两个相机的工作量不同，这一步不合法。");
+
+            // ---- 近层 froxel 的两趟出货 pass（单模型，没有第二个模型可对） ----
+            //
+            // 这一节**刻意排在与模型 B 对账之前**，且自己不进那个和。
+            // 模型 B 只覆盖大气七表与 AP 合成；把 froxel 并进去，
+            // 0.170~0.198 ms 那个区间当场失效，而失效的方式是"看起来还能对"——
+            // 一个被污染的和会给两边都发一张假的合格证。
+            sb.AppendLine("　 近层 froxel 出货两趟（#21~#24 的全部每帧成本；**无第二个模型对账**）");
+            if (!froxelExpected)
+            {
+                sb.AppendLine("　　 enableInjection 关着 —— 本次没有测到这两趟的耗时。"
+                            + "报表上的 0 是「没测」，不是「不要钱」。");
+            }
+            else if (!froxelComplete)
+            {
+                sb.AppendLine("　　 有缺口（见上），小计不成立 —— 不印一个不完整的和。");
+            }
+            else
+            {
+                sb.Append("　　 单次小计　min ").Append(froxelPerRenderMin.ToString("F3"))
+                  .Append("　中位 ").Append(froxelPerRenderMed.ToString("F3"))
+                  .Append("　p95 ").Append(froxelPerRenderP95.ToString("F3")).AppendLine(" ms");
+                // 定预算要拿 p95，不是 min 也不是 max，理由见 Stat.p95Ms。
+                sb.Append("　　 这个数只回答「多少毫秒」，回答不了「对不对」——");
+                sb.AppendLine("它没有独立模型可对，唯一的验证手段是改一个已知的旋钮"
+                            + "（screenDivisor 减半，线程数 ×4）看它动不动 —— 下一节就是那道门。");
+            }
+
+            // ---- 旋钮响应：把上面那句话变成一道会红的门 ----
+            //
+            // 这一节回答的不是「多少毫秒」，而是「上面那个毫秒数到底测的是不是 froxel」。
+            // 它是本报告里唯一一条**因果**证据：把一个已知会改工作量的旋钮翻一档，
+            // 看读数动不动。没有它，注入/积分那两行就是两个无法被证伪的字符串。
+            sb.AppendLine("　 旋钮响应（screenDivisor 减半 ⇒ 体的 XY 各 ×2 ⇒ 线程数 ×4）");
+            if (s_ResponseSkipReason != null || s_StatGpuB == null || s_StatGpu == null)
+            {
+                // 不可判定必须是缺口，不能是通过 —— 一道翻不动旋钮的门若报绿，
+                // 它给上面那两行背的书和真跑过一遍一模一样，而实际上一个字都没验。
+                responseGap = 1;
+                sb.Append("　　 **不可判定**：")
+                  .AppendLine(s_ResponseSkipReason ?? "B 档读数缺失（本次没有跑到第二档）");
+                sb.AppendLine("　　 → 注入/积分那两行本次没有任何独立证据，不要拿它们去定预算。");
+            }
+            else
+            {
+                // 下标走 k_FroxelSteadyIdx，不写字面量 8/9：手抄的下标在有人往
+                // k_PassNames 中间插一趟 pass 的那天不会跟着改，那时这道门会安静地
+                // 去比另外两趟毫不相干的 pass，并且照样给出一个漂亮的比值。
+                int iInj = k_FroxelSteadyIdx[0], iInt = k_FroxelSteadyIdx[1];
+                Stat injA = s_StatGpu[iInj], injB = s_StatGpuB[iInj];
+                Stat intA = s_StatGpu[iInt], intB = s_StatGpuB[iInt];
+                Stat ctlA = s_StatGpu[k_ResponseControlIdx], ctlB = s_StatGpuB[k_ResponseControlIdx];
+
+                sb.Append("　　 A 档 screenDivisor ").Append(s_DivA)
+                  .Append("　→　B 档 ").Append(s_DivB)
+                  .Append("　（各自独立预热 ").Append(k_WarmupFrames)
+                  .Append(" 帧、采样 ").Append(k_SampleFrames).AppendLine(" 帧）");
+
+                // 一律用**中位数**比，不用 min 也不用 max：
+                // min 会被两档各自最幸运的那一帧主导（它对负载不敏感，正是这道门要看的东西），
+                // max 会被任意一次编辑器抖动主导。中位数在同配置下复现到 5% 以内（#27 实测），
+                // 这正是它能当比值分母的理由。
+                bool have = injA.count > 0 && injB.count > 0
+                         && intA.count > 0 && intB.count > 0
+                         && ctlA.count > 0 && ctlB.count > 0
+                         && injA.medMs > 0.0 && intA.medMs > 0.0 && ctlA.medMs > 0.0;
+                if (!have)
+                {
+                    responseGap = 1;
+                    sb.AppendLine("　　 **不可判定**：两档里至少有一档没采到注入/积分/对照的样本，比值算不出来。");
+                }
+                else
+                {
+                    double rInj = injB.medMs / injA.medMs;
+                    double rInt = intB.medMs / intA.medMs;
+                    double rCtl = ctlB.medMs / ctlA.medMs;
+
+                    sb.Append("　　 ").Append(k_PassNames[iInj].PadRight(30))
+                      .Append("中位 ").Append(injA.medMs.ToString("F3")).Append(" → ")
+                      .Append(injB.medMs.ToString("F3")).Append(" ms　比值 ")
+                      .AppendLine(rInj.ToString("F2"));
+                    sb.Append("　　 ").Append(k_PassNames[iInt].PadRight(30))
+                      .Append("中位 ").Append(intA.medMs.ToString("F3")).Append(" → ")
+                      .Append(intB.medMs.ToString("F3")).Append(" ms　比值 ")
+                      .AppendLine(rInt.ToString("F2"));
+                    sb.Append("　　 对照 ").Append(k_PassNames[k_ResponseControlIdx].PadRight(27))
+                      .Append("中位 ").Append(ctlA.medMs.ToString("F3")).Append(" → ")
+                      .Append(ctlB.medMs.ToString("F3")).Append(" ms　比值 ")
+                      .AppendLine(rCtl.ToString("F2"));
+
+                    bool injOk = rInj >= k_MinInjectionResponse;
+                    bool ctlOk = System.Math.Abs(rCtl - 1.0) <= k_ControlRatioTolerance;
+                    if (!injOk || !ctlOk) responseGap = 1;
+
+                    sb.Append("　　 判据：注入比值 ≥ ").Append(k_MinInjectionResponse.ToString("F2"))
+                      .Append(" —— ").Append(injOk ? "通过" : "**不通过**")
+                      .Append("；对照比值 |r−1| ≤ ").Append(k_ControlRatioTolerance.ToString("F2"))
+                      .Append(" —— ").AppendLine(ctlOk ? "通过" : "**不通过**");
+
+                    if (!ctlOk)
+                        sb.AppendLine("　　 → 对照项自己也变了，说明整机状态在两档之间变过"
+                                    + "（热降频、后台导资源、另一个 Editor 窗口在渲染）。"
+                                    + "这时注入项涨没涨都**不能**归因给旋钮，整节作废，重跑一次。");
+                    else if (!injOk)
+                        sb.AppendLine("　　 → 线程数翻了两番而耗时涨不到一半，"
+                                    + "说明这个读数被某个与 froxel 规模无关的常数项主导"
+                                    + "（派发固定开销、barrier、或者根本没接到这趟 pass 上）。"
+                                    + "在查清之前，上面那个「每帧成本」不能当作近层雾的成本引用。");
+
+                    // 为什么只有下界、没有上界：×4 是**线程数**比，不是时间比。
+                    // 占用率、缓存命中率、每趟派发的固定开销都会把它拉离 4，
+                    // 而我手上没有能定出上界的模型 —— 拿一个猜的上界当门，
+                    // 红起来的时候没人知道该修代码还是该改那个猜测。
+                    sb.AppendLine("　　 不设上界：×4 是线程数比不是时间比，占用率/缓存/固定开销都会让它偏离，"
+                                + "而定上界需要一个我现在没有的模型。这里只报数。");
+                    sb.Append("　　 积分项（比值 ").Append(rInt.ToString("F2"))
+                      .AppendLine("）只报不判：它读的是同一张表但写的是同一批像素，"
+                                + "线程数与 divisor 的关系不是简单的 ×4，没有可辩护的阈值。");
+                }
+            }
 
             // ---- 与模型 B 对账 ----
             // 只判**方向**，不判差值：两个模型量的不是同一件事，差多少没有先验。
@@ -631,6 +1442,89 @@ namespace Vista.Editor
                 }
             }
 
+            // ---- pass 名验证（预热期，与上面的采样窗口不重叠） ----
+            //
+            // 这一节回答的问题上面任何一行都回答不了：**这 15 个字符串拼对了吗**。
+            //
+            // 对「每帧都在跑」的那几趟，采样窗口本身就是验证：名字打错 → 零样本 → 那一行红。
+            // 但对静态表（烘完就不再跑）、四个自检探针、以及 Off 档的调试视图，
+            // 「零样本」恰恰是**正确**的稳态 —— 于是一个打错的名字与一份健康的管线
+            // 在报表上逐字相同。一个红不起来的红测，长得和一个通过了的红测一模一样。
+            //
+            // 所以预热期里主动制造一帧让它们各出现一次，只看「有没有出现过」，不看耗时。
+            sb.AppendLine("　 pass 名验证（预热期主动触发，只问有无、不问耗时）");
+            int nameGap = 0;
+            if (s_NameSeen == null)
+            {
+                nameGap++;
+                sb.AppendLine("　　 **整节没跑成** —— recorder 起不来（见上面的 warning）。"
+                            + "这 15 个名字本次一个都没有被验证过。");
+            }
+            else
+            {
+                if (!s_NameProbeTriggered)
+                {
+                    nameGap++;
+                    sb.AppendLine("　　 ⚠ 触发那一步没执行到（预热被提前打断？）—— "
+                                + "下面凡是靠触发才出现的格子都只能算不可判定。");
+                }
+
+                var namesOk = new System.Text.StringBuilder();
+                for (int i = 0; i < k_PassNames.Length; ++i)
+                {
+                    if (s_NameSeen[i]) { namesOk.Append(namesOk.Length > 0 ? "、" : "").Append(i); continue; }
+
+                    // 没抓到的才逐个点名，并且**先判它这次有没有机会出现**。
+                    // 顺序不能反：一个本来就不可能出现的 pass 报成「名字错」，
+                    // 会让人去改一个拼写正确的字符串。
+                    bool probeDependent = System.Array.IndexOf(k_AbsentIdx, i) >= 0 && i != 14;
+                    bool triggerDependent = probeDependent || i == 14;
+                    // 两张静态表只在「表脏了」的那一帧跑。play 的第一帧那次抢不到
+                    // （见 s_NameProbe 的注释），所以它们唯一的出场机会是主动重烘那一次。
+                    bool rebakeDependent = System.Array.IndexOf(k_StaticIdx, i) >= 0;
+                    string why = null;
+                    // 「触发压根没执行」排在最前面。放后面的话，那几个记录触发时状态的
+                    // 旗子全是初值 false，于是会打出「enableInjection 关着」——
+                    // 一个从来没被读过的状态被当成观测值报出去。
+                    if (triggerDependent && !s_NameProbeTriggered)
+                        why = "触发没执行到，这一格本次没有被观测";
+                    else if (probeDependent && !s_NameProbeInjectionOn)
+                        why = "触发时 enableInjection 关着，四个探针不在图里";
+                    else if (probeDependent && !s_ProbeRequestSent)
+                        why = "froxelVolume 取不到，probeRequested 没递进去";
+                    else if (i == 14 && !s_NameProbeDebugOn)
+                        why = "触发时 debugView 仍是 Off，这趟 pass 整个没被排入";
+                    else if ((i == 8 || i == 9) && !s_NameProbeInjectionOn)
+                        why = "enableInjection 关着，注入/积分本就不跑";
+                    else if (rebakeDependent && !s_RebakeTriggered)
+                        why = "重烘那一步没执行到（预热被提前打断？），静态表本次没有重跑过";
+                    else if (rebakeDependent && !s_RebakeRequested)
+                        why = "VistaAtmosphereFeature.current 取不到，重烘没发起，静态表本次不可能出现";
+
+                    if (why != null)
+                    {
+                        nameGap++;
+                        sb.Append("　　 [").Append(i).Append("] ").Append(k_PassNames[i])
+                          .Append("　**不可判定**：").AppendLine(why);
+                    }
+                    else
+                    {
+                        nameGap++;
+                        sb.Append("　　 [").Append(i).Append("] ").Append(k_PassNames[i])
+                          .AppendLine("　**一次都没出现**，而这次它本该出现　→ "
+                                    + "这个字符串与 AddComputePass/AddRasterRenderPass "
+                                    + "那边的字面量对不上（或那趟 pass 被运行期条件剪掉了）");
+                    }
+                }
+                sb.Append("　　 抓到：").AppendLine(namesOk.Length > 0 ? namesOk.ToString() : "（无）");
+                sb.AppendLine("　　 顺带验了三条只写在注释里的契约：「一次 probeRequested 只跑一帧」"
+                            + "（探针在稳态一节报 0）、「Off 档整趟 pass 不被记录」"
+                            + "（第 14 格在稳态一节报 0，在这一节报有）、"
+                            + "「静态表只在脏了那一帧跑」（0/1 在稳态一节报 0，"
+                            + "而这一节主动 Create() 之后报有）。"
+                            + "三条都是靠**两节读数方向相反**才成立的，缺一节就判不了。");
+            }
+
             sb.AppendLine("── 引用这些数字时必须一起给");
             sb.AppendLine("　 1) RenderGraph 的逐 pass marker 被 #if DEVELOPMENT_BUILD || UNITY_EDITOR 包着"
                         + "（core RenderGraph.cs:2868-2884）。**Release 构建里没有这些 marker**，"
@@ -650,13 +1544,32 @@ namespace Vista.Editor
             bool ok = missing == 0 && occUnstable == 0 && staticLeak == 0
                    && gpuUsable == k_SteadyIdx.Length && steadyComplete
                    && compositeMissing == 0 && compositeCpuOnly == 0
-                   && compositeOccUnstable == 0 && compositeJudged && compositeDirOk;
+                   && compositeOccUnstable == 0 && compositeJudged && compositeDirOk
+                   // froxel 两趟出货：与合成同一套四项（缺样本 / 仅 CPU / 出现次数不稳），
+                   // 外加一项只有它有的 —— 关着却在跑。那一项在画面上完全看不见，
+                   // 只有计时器能看见，所以它必须进门，不能只在正文里说一句。
+                   && froxelMissing == 0 && froxelCpuOnly == 0
+                   && froxelOccUnstable == 0 && froxelUnexpected == 0
+                   // 自检/诊断五趟泄漏到稳态。同上：看不见的成本。
+                   && absentLeak == 0
+                   // 名字没验成也算缺口。这一条是本次新增的门里最要紧的一道：
+                   // 没有它，一个打错的 pass 名会让上面那些「期望 0 个样本」的格子
+                   // 全部打钩，整份报告绿着交付一套根本没接上的读数。
+                   && nameGap == 0
+                   // 旋钮响应门。它与上面每一道门的性质都不同：那些判的是
+                   // 「读数自洽吗」，这一条判的是「读数与被测对象有因果关系吗」。
+                   // 前者全绿而这一条红，意味着一份内部完全一致、却测错了东西的报告。
+                   && responseGap == 0;
             if (ok) Debug.Log("[Vista] 模型 A 交叉验证完成  |  " + flat);
             else Debug.LogWarning($"[Vista] 模型 A 交叉验证有缺口（稳态缺样本 {missing}，GPU 可用 "
                                 + $"{gpuUsable}/{k_SteadyIdx.Length}，出现次数不稳 {occUnstable}，"
                                 + $"静态表泄漏 {staticLeak}；合成缺样本 {compositeMissing}，"
                                 + $"合成仅 CPU {compositeCpuOnly}，合成出现次数不稳 {compositeOccUnstable}，"
-                                + $"合成包线{(compositeJudged ? (compositeDirOk ? "通过" : "**方向反了**") : "**未判定**")}）"
+                                + $"合成包线{(compositeJudged ? (compositeDirOk ? "通过" : "**方向反了**") : "**未判定**")}；"
+                                + $"froxel 缺样本 {froxelMissing}，froxel 仅 CPU {froxelCpuOnly}，"
+                                + $"froxel 出现次数不稳 {froxelOccUnstable}，froxel 关着却在跑 {froxelUnexpected}；"
+                                + $"诊断 pass 泄漏进稳态 {absentLeak}；pass 名未验 {nameGap}；"
+                                + $"旋钮响应{(responseGap == 0 ? "通过" : "**未通过/不可判定**")}）"
                                 + "  |  " + flat);
         }
 
@@ -669,6 +1582,19 @@ namespace Vista.Editor
             EditorApplication.update -= Tick;
             Dispose(ref s_Gpu);
             Dispose(ref s_Cpu);
+
+            // 名字验证正常收摊是在预热期末尾（TickNameProbe）。这里是**被打断**那条路的兜底：
+            // 用户手停 play、看门狗超时中止，都会落到这里，而那时 debugView 还翻着。
+            // 漏掉这一句的症状是：一次中断过的验证会把 RendererFeature 资产留在
+            // debugView = IntegralRgb 上 —— 整个画面被调试视图覆盖，而且它**会被存盘**。
+            // 幂等：s_DebugViewSaved 为 null 时一个字节都不写。
+            RestoreDebugView();
+            // 同一条兜底，另一个旋钮：被打断时 screenDivisor 还停在测试值（减半）上，
+            // 而它同样**会被存盘** —— 症状是近层雾的分辨率悄悄翻了四倍，
+            // 下次有人量性能时得到一组比出货配置贵得多的数字，且没有任何线索指向这里。
+            RestoreDivisor();
+            Dispose(ref s_NameProbe);
+            s_NameProbeClosed = true;
         }
 
         static void Dispose(ref ProfilerRecorder[] arr)

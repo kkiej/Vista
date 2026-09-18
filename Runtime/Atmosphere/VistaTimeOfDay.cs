@@ -105,6 +105,25 @@ namespace Vista
                + "登记上可以让那条兜底指向同一盏灯，而不是 45° 的硬编码默认值。")]
         bool m_AssignRenderSettingsSun = true;
 
+        // ==================================================================== 曝光
+
+        [SerializeField]
+        [Tooltip("由这个场景决定曝光，而不是用 Vista Atmosphere feature 资产上的默认值。\n\n"
+               + "曝光是「相机怎么看这个场景」，不是「管线怎么渲染」——正午与夜景差 10 档 EV，"
+               + "而 feature 是资产、跨场景共享。把夜景的 EV100 存到资产上，"
+               + "等于让「打开过哪个场景」决定另一个场景的亮度基准。\n"
+               + "HDRP 的 Exposure 走 Volume、UE5 走 Post Process Volume，都是同一个形状：曝光住在场景里。")]
+        bool m_OverrideEV100 = false;
+
+        [SerializeField]
+        [Tooltip("这个场景的曝光值 (EV100)。\n"
+               + "15 = 晴天正午（Sunny 16）；12 ≈ 阴天；9 ≈ 日落后的蓝调时刻；"
+               + "5 ≈ 夜间户外有人造光。\n\n"
+               + "这个数**线性缩放画面里的一切亮度**，包括体积雾报表里的每一项。"
+               + "改它等于改所有亮度读数的量纲，跨曝光比较报表数字是无意义的。")]
+        [Range(5f, 20f)]
+        float m_EV100 = VistaAtmosphereViewData.k_DefaultEV100;
+
         // ==================================================================== 判据阈值
 
         /// <summary>
@@ -221,6 +240,17 @@ namespace Vista
         /// <summary>求透射率的参考高度，世界 Y (m)。</summary>
         public float referenceWorldY { get => m_ReferenceWorldY; set { m_ReferenceWorldY = value; Apply(); } }
 
+        /// <summary>由这个场景决定曝光，而不是用 feature 资产上的默认值。</summary>
+        public bool overrideEV100 { get => m_OverrideEV100; set { m_OverrideEV100 = value; Apply(); } }
+
+        /// <summary>
+        /// 这个场景的曝光值 (EV100)。只在 <see cref="overrideEV100"/> 为真时生效。
+        ///
+        /// 注意它**线性缩放画面里的一切亮度**，包括体积雾报表里的每一项 ——
+        /// 跨曝光比较报表数字是无意义的。
+        /// </summary>
+        public float ev100 { get => m_EV100; set { m_EV100 = value; Apply(); } }
+
         /// <summary>设置日期。</summary>
         public void SetDate(int year, int month, int day)
         {
@@ -250,6 +280,14 @@ namespace Vista
             // 自己也清一遍：组件被禁用而不是销毁时字段还在，下次 OnEnable 到 Apply 之间
             // 若有一帧渲染，读到的必须是「不生效」而不是禁用前那个分母。
             m_PublishedTRef = k_TRefInactive;
+
+            // 曝光覆盖也要清。它住在 **feature 资产实例**上，比这个场景活得长 ——
+            // 不清的话，从夜景切回正午场景会继承夜景的 EV100，而正午场景里
+            // 没有任何东西知道自己被覆盖了。这正是把曝光从资产挪到场景要消灭的那个 bug，
+            // 漏掉这一句等于把它原样搬了个家。
+            var feature = VistaAtmosphereFeature.current;
+            if (feature != null)
+                feature.SetEV100Override(null);
         }
 
         void Update() => Apply();
@@ -297,6 +335,15 @@ namespace Vista
             // 诊断旗子的时序错误比功能 bug 更坏：它让人去查一个不存在的问题。
             var feature = VistaAtmosphereFeature.current;
             m_AtmosphereMissing = feature == null;
+
+            // 曝光先推。三条理由决定了它必须在这个位置，而不是往下挪：
+            //   1. 下面 ComputeLightParams 要读 feature.ev100，推晚了这一帧的灯会用旧曝光，
+            //      症状是改曝光时灯与天空差一帧 —— 拖滑竿时看得见。
+            //   2. 它不该被 m_DriveColor / sun == null 这两条提前返回挡住：
+            //      没挂灯的场景照样要有正确的曝光，天空和雾都用它。
+            //   3. 组件禁用时要清（见 OnDisable）—— 覆盖住在资产实例上，比场景活得长。
+            if (feature != null)
+                feature.SetEV100Override(m_OverrideEV100 ? m_EV100 : (float?)null);
 
             var sun = ResolveSun();
             m_SunMissing = sun == null;

@@ -23,8 +23,10 @@ namespace Vista
         float m_GroundLevelWorldY = 0f;
 
         [SerializeField]
-        [Tooltip("摄影曝光值。15 = 晴天正午（Sunny 16）。整条管线共用这一个曝光，"
-               + "改这里等于改整个画面的亮度基准。")]
+        [Tooltip("摄影曝光值的**资产默认值**。15 = 晴天正午（Sunny 16）。\n\n"
+               + "这是一个资产级字段，会被所有场景共用。需要逐场景的曝光（夜景、"
+               + "黄昏对照布景）时不要改这里，改场景里 Vista Time Of Day 上的"
+               + "「覆盖曝光」——那条是逐场景的，见 VistaTimeOfDay.overrideEV100。")]
         [Range(5f, 20f)]
         float m_EV100 = VistaAtmosphereViewData.k_DefaultEV100;
 
@@ -55,8 +57,9 @@ namespace Vista
         [SerializeField]
         [Tooltip("近层体积雾（froxel 体）的分辨率与深度范围。介质参数在上面的 Fog 里 —— "
                + "近层与 AP LUT 共用同一份介质定义。\n"
-               + "注意：本节的开关产出注入表与积分表，但**最终画面还没有消费它们**"
-               + "（合成在 #25）。要看到这两张表，用本节的 Debug View 档位。")]
+               + "本节产出注入表与积分表，最终画面在 #25 起已经消费它们。\n"
+               + "Debug View 档位仍然有用：画面上的雾不对时，它把「表算错了」"
+               + "与「合成读错了」分开——这两种失效在最终画面上长得一模一样。")]
         VistaVolumetricFogSettings m_VolumetricFog = new VistaVolumetricFogSettings();
 
         VistaAtmosphereLuts m_Luts;
@@ -93,8 +96,45 @@ namespace Vista
         /// <summary>
         /// 整条管线共用的曝光值 (EV100)。场景侧算平行光强度要用同一个数 ——
         /// 天空走 GPU 的 <c>VISTA_EXPOSURE</c>，平行光走 CPU 的这个，两者必须同源。
+        ///
+        /// 有场景覆盖时返回覆盖值，否则返回资产上的默认值。
         /// </summary>
-        public float ev100 => m_EV100;
+        public float ev100 => m_EV100Override ?? m_EV100;
+
+        /// <summary>资产上的曝光默认值，不含场景覆盖。面板用它显示「被覆盖了」。</summary>
+        public float ev100Asset => m_EV100;
+
+        /// <summary>当前是否被场景覆盖。</summary>
+        public bool ev100IsOverridden => m_EV100Override.HasValue;
+
+        /// <summary>
+        /// 逐帧的曝光覆盖。**不序列化**：它属于场景，不属于渲染器资产。
+        ///
+        /// ── 为什么曝光要能逐场景覆盖 ──
+        ///
+        /// 曝光是「相机怎么看这个场景」，不是「管线怎么渲染」。正午与夜景差 10 档 EV，
+        /// 而资产是跨场景共享的 —— 把夜景的 EV100=5 存在资产上，等于让「打开哪个场景」
+        /// 决定另一个场景的正确性。更坏的是它**无声**：报表里每一个亮度数
+        /// （max(S)、局部灯源项、⑪ 系列）都随曝光线性缩放，忘了改回去，
+        /// 量出来的每个数都错一个常数倍，而没有任何判据会红。
+        ///
+        /// 这个形状与 HDRP（Exposure 走 Volume 组件）、UE5（走 Post Process Volume）
+        /// 一致：曝光住在场景里。资产上那个只是「没人覆盖时用什么」。
+        ///
+        /// 多个场景同时加载（additive）且各有一个覆盖时，最后写的那个生效 ——
+        /// 与 <c>RenderSettings.sun</c> 的语义相同，不额外发明一套优先级。
+        /// </summary>
+        float? m_EV100Override;
+
+        /// <summary>
+        /// 设置/清除场景曝光覆盖。传 null 表示回到资产默认值。
+        /// 由 <see cref="VistaTimeOfDay"/> 逐帧调用；域重载会把它清成 null，
+        /// 也就是「默认不覆盖」，这正是安全的那一侧。
+        /// </summary>
+        public void SetEV100Override(float? ev100Value)
+        {
+            m_EV100Override = ev100Value;
+        }
 
         /// <summary>世界空间中对应星球表面的 Y 值 (m)。求透射率要把海拔换成半径。</summary>
         public float groundLevelWorldY => m_GroundLevelWorldY;
@@ -248,8 +288,12 @@ namespace Vista
                 return;
 
             m_Luts.SetSkyViewResolution(m_SkyViewResolution.x, m_SkyViewResolution.y);
+            // 走属性 `ev100` 而不是字段 `m_EV100`：这里是曝光唯一喂进 GPU 的入口，
+            // 读裸字段会让场景覆盖对**画面**完全失效，而对 CPU 侧算的平行光强度生效
+            // （那条走 feature.ev100）—— 症状是天空/雾按资产曝光、物体按场景曝光，
+            // 两边差 2^ΔEV 倍，且没有任何报错。
             m_Pass.Setup(m_Luts, m_Parameters, m_AerialPerspective, m_Fog, m_SkyReflection,
-                         m_GroundLevelWorldY, m_EV100, m_VolumetricFog);
+                         m_GroundLevelWorldY, ev100, m_VolumetricFog);
             renderer.EnqueuePass(m_Pass);
 
             // 全屏合成（变体 A）。三个条件都必须在**排入之前**判掉，而不是排进去再在
