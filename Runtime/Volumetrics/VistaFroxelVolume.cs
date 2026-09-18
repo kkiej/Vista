@@ -424,6 +424,36 @@ namespace Vista
         }
 
         /// <summary>
+        /// 仅 Editor 归因：把逐 froxel 的主光阴影查询整个关掉（近层雾恒为全亮）。
+        ///
+        /// ── 为什么需要它 ──
+        /// #27 第 1 项的判据 β 量的是「板后的雾比缝里的雾暗」。但两块区域之间还有一个
+        /// **与阴影无关**的共有项（近层与 AP LUT 对这段路上有多少雾本身的分歧，
+        /// 探路读数上约 −0.29，是阴影项 −0.107 的 2.7 倍）。没有一个能把阴影单独拿掉的
+        /// 开关，β 就只是「两档不一样」，一个把阴影查询整个删掉的构建照样能通过它 ——
+        /// 「一个红不起来的红测，长得和一个通过了的红测一模一样」。
+        ///
+        /// ── 为什么是这一位，而不是新加一个 uniform ──
+        /// <c>_VistaFroxelCameraWS.w</c> 本来就是「阴影贴图绑没绑」，shader 里
+        /// <c>w &lt; 0.5</c> 那一支直接返回 1.0（VolumetricFog.compute:319）。
+        /// 按住这一位复用的是**已经在跑的那条路径**（关阴影 / 反射探针 / 自检走的就是它），
+        /// 而新开一个 debug 分支等于给热核加一条只有判据会走的代码 ——
+        /// 那条路上的行为没人替它担保。
+        ///
+        /// 顺带：探针的 SHADOWMAP 标志位读的是同一个 w，所以归因跑里
+        /// 「阴影确实被关了」在探针报表上是一个能读的数字，不是一句断言。
+        ///
+        /// ── 为什么不改灯 ──
+        /// 关掉 <c>Light.shadows</c> 或把 shadowStrength 置 0 会连**物体表面**的阴影
+        /// 一起关掉，而差分式 Froxel − AP 里有一项 L_surface·(T_f − T_a)。
+        /// 那样 γ 量到的收缩里混着表面受光的变化，归因就不干净了。
+        ///
+        /// 运行时永远不写它；判据必须在 <c>finally</c> 里复位。
+        /// 形状照 <c>VistaTimeOfDay.s_DebugTRefOverride</c>。
+        /// </summary>
+        public static bool s_DebugForceNoSunShadow;
+
+        /// <summary>
         /// #20 的注入派发：逐 froxel 求 (σ_s·J 预曝光, 灰度 σ_t)。
         ///
         /// <paramref name="cameraWS"/> / <paramref name="shadowmapBound"/> 打包进
@@ -450,6 +480,16 @@ namespace Vista
             where T : IVistaLutDispatcher
         {
             if (!isValid || !isAllocated) return;
+
+            // 见 s_DebugForceNoSunShadow 的注释。放在这里而不是让调用方传 false：
+            // 调用方（VistaAtmospherePass）算出的 shadowmapBound 是**事实**
+            // （URP 这一帧到底绑没绑），把调试意图混进那个事实里，
+            // 会让判据③「阴影图绑定」在归因跑里以为 URP 出了问题。
+            //
+            // 不加 #if UNITY_EDITOR：加了之后判据测的那份代码与出货的那份就不是同一份，
+            // 而这一条恰恰是「判据担保线上行为」的前提。代价是一次 uniform 分支预测，
+            // 与 s_DebugDistanceOutput 的取舍相同。
+            if (s_DebugForceNoSunShadow) shadowmapBound = false;
 
             dispatcher.SetGlobalVector(VistaShaderIDs._VistaFroxelCameraWS,
                 new Vector4(cameraWS.x, cameraWS.y, cameraWS.z, shadowmapBound ? 1f : 0f));
