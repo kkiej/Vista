@@ -46,20 +46,20 @@ namespace Vista.EditorTools
     static class VistaVolumetricFogState
     {
         // ---- 与 VolumetricFog.compute 的 VISTA_PROBE_* 逐一对应 ----
-        const int k_SlotShadowMin     = 0;
-        const int k_SlotShadowMax     = 1;
-        const int k_SlotFlags         = 2;
-        const int k_SlotCount         = 3;
-        const int k_SlotShadowedCount = 4;
-        const int k_SlotCamDriftMm    = 5;
+        internal const int k_SlotShadowMin     = 0;
+        internal const int k_SlotShadowMax     = 1;
+        internal const int k_SlotFlags         = 2;
+        internal const int k_SlotCount         = 3;
+        internal const int k_SlotShadowedCount = 4;
+        internal const int k_SlotCamDriftMm    = 5;
         const int k_SlotNonFinite     = 6;
         const int k_SlotInjectMax     = 7;
-        const int k_SlotShadowmapMin  = 8;
-        const int k_SlotShadowmapMax  = 9;
-        const int k_SlotShadowStrength = 10;
-        const int k_SlotSmWidth       = 11;
-        const int k_SlotSmHeight      = 12;
-        const int k_SlotUrpSizeZ      = 13;
+        internal const int k_SlotShadowmapMin  = 8;
+        internal const int k_SlotShadowmapMax  = 9;
+        internal const int k_SlotShadowStrength = 10;
+        internal const int k_SlotSmWidth       = 11;
+        internal const int k_SlotSmHeight      = 12;
+        internal const int k_SlotUrpSizeZ      = 13;
         // ---- #21 追加：真实帧里的积分表读数 ----
         // 这五格覆盖的是立即模式自检**覆盖不到**的两件事：RenderGraph 那条积分写入
         // 路径、以及真实雾（而不是合成介质）下 x = σ_t·Δ 的包络。
@@ -170,21 +170,21 @@ namespace Vista.EditorTools
         const int k_SlotJitRelHistBase     = 129;   // 129..144：rel 落进 [b/16, (b+1)/16) 的格数
         const int k_JitRelBuckets          = 16;
 
-        const int k_SlotTotal         = 145;
+        internal const int k_SlotTotal         = 145;
 
-        const uint k_FlagCascade   = 1u;
-        const uint k_FlagShadowmap = 2u;
-        const uint k_FlagScreen    = 4u;
-        const uint k_FlagSoft      = 8u;
-        const uint k_FlagRan       = 16u;
+        internal const uint k_FlagCascade   = 1u;
+        internal const uint k_FlagShadowmap = 2u;
+        internal const uint k_FlagScreen    = 4u;
+        internal const uint k_FlagSoft      = 8u;
+        internal const uint k_FlagRan       = 16u;
 
         // 探针网格（VISTA_PROBE_DIM_XY / _Z）。固定值，不跟体积分辨率走。
-        const int k_ProbeDimXY = 32;
-        const int k_ProbeDimZ  = 16;
-        const int k_ProbeCountExpected = k_ProbeDimXY * k_ProbeDimXY * k_ProbeDimZ;
+        internal const int k_ProbeDimXY = 32;
+        internal const int k_ProbeDimZ  = 16;
+        internal const int k_ProbeCountExpected = k_ProbeDimXY * k_ProbeDimXY * k_ProbeDimZ;
 
         // ---- 定点编码的反向缩放，与 shader 里的 VistaProbeFixed 调用一一对应 ----
-        const float k_ShadowScale   = 1.0e6f;
+        internal const float k_ShadowScale   = 1.0e6f;
         const float k_DriftScale    = 1.0e3f;   // 毫米
         const float k_InjectScale   = 1.0e3f;
         const float k_IntegralAlphaScale = 1.0e6f;
