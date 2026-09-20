@@ -246,6 +246,20 @@ namespace Vista.EditorTools
         }
 
         /// <summary>
+        /// 一趟扫描留下的原始像素。只有 ⑤c 用它：那一节要**绕开参考解**直接比两趟。
+        ///
+        /// 为什么非留不可：err = |L_N − L_ref|，两边都随 near 动。⑤b 的比值一旦反常，
+        /// 单看它分不出是被测档动了还是参考解动了 ——
+        /// 「一个非零的数回答不了它是从哪儿来的」。
+        /// </summary>
+        struct SweepPixels
+        {
+            public float[] reference;     // ref₀（N = k_RefSlices）
+            public float[][] tiers;       // 各档，与 k_Tiers 同序
+            public float denom;           // 这一趟的相对差分母下限
+        }
+
+        /// <summary>
         /// 哪一趟。**两道门的归属从这一个值推出来**，不由调用方分别给 ——
         /// 「Order 判 + Weber 判」和「两道都不判」这两种组合在这里表达不出来，
         /// 而第一版的毛病正是前者（Weber 对一个从不出货的配置恒红）。
@@ -398,7 +412,8 @@ namespace Vista.EditorTools
                 sb.AppendLine("② 抖动关（JitterMode.Off ⇒ 无抖动、无时间重投影）＝ 纯空间离散化");
                 vf.jitterMode = JitterMode.Off;
                 bool okOff = Sweep(sb, vf, cam, rt, tex, admitted, phi, nAdmit,
-                                   Pass.JitterOff, out var errOff, out float floorOff, out _);
+                                   Pass.JitterOff, out var errOff, out float floorOff, out _,
+                                   out var pxOff);
                 ok &= okOff;
 
                 sb.AppendLine();
@@ -406,7 +421,7 @@ namespace Vista.EditorTools
                 vf.jitterMode = JitterMode.Procedural;
                 vf.depthJitterAmount = 1f;
                 bool okOn = Sweep(sb, vf, cam, rt, tex, admitted, phi, nAdmit,
-                                  Pass.Shipping, out var errOn, out _, out _);
+                                  Pass.Shipping, out var errOn, out _, out _, out _);
                 ok &= okOn;
 
                 // ================================================ ④ 抖动盖住了多少
@@ -417,7 +432,7 @@ namespace Vista.EditorTools
                 sb.AppendLine();
                 ok &= NearClipSweep(sb, vf, volume, cam, rt, tex,
                                     admitted, phi, nAdmit, admitLen, minHandoff,
-                                    reads, errOff, floorOff);
+                                    reads, errOff, floorOff, pxOff);
 
                 // ================================================ ⑥ 成本：只写解析，不量
                 sb.AppendLine();
@@ -636,12 +651,14 @@ namespace Vista.EditorTools
         static bool Sweep(StringBuilder sb, VistaVolumetricFogSettings vf, Camera cam,
                           RenderTexture rt, Texture2D tex,
                           bool[] admitted, float[] phi, int nAdmit,
-                          Pass pass, out TierErr[] errs, out float floorOut, out bool usable)
+                          Pass pass, out TierErr[] errs, out float floorOut, out bool usable,
+                          out SweepPixels pxOut)
         {
             int K = k_Tiers.Length;
             errs = new TierErr[K];
             floorOut = 0f;
             usable = false;
+            pxOut = default;
             bool ok = true;
 
             var refs   = new float[K + 1][];
@@ -696,6 +713,11 @@ namespace Vista.EditorTools
             // ⑤ 那一节要拿它算比值的传播不确定度。传出去而不是在那边重算一遍：
             // 地板的口径（邻帧 vs 夹逼取大）是这把尺子的定义之一，「同一个量不留两份实现」。
             floorOut = floor;
+
+            // ⑤c 要拿原始像素**绕开参考解**直接比两趟。留在这里而不是在 ⑤c 里重渲一遍：
+            // 重渲会引入跑间漂移，而 ⑤c 判的正好是「两趟之间差了多少」—— 那等于
+            // 拿要测的量去污染尺子。
+            pxOut = new SweepPixels { reference = refs[0], tiers = tierPx, denom = denom };
 
             sb.AppendLine($"  参考解 N = {k_RefSlices}，**夹逼**（ref₀→16→ref₁→32→ref₂→64→ref₃→128→ref₄，"
                         + $"每档比两侧参考图的逐像素平均）；采纳集中位亮度 "
@@ -997,7 +1019,7 @@ namespace Vista.EditorTools
                                   bool[] admitted, float[] phi, int nAdmit,
                                   float admitLen, float minHandoffRig,
                                   List<TierRead> readsRig,
-                                  TierErr[] errRig, float floorRig)
+                                  TierErr[] errRig, float floorRig, SweepPixels pxRig)
         {
             float nearRig = cam.nearClipPlane;
             sb.AppendLine($"⑤ 出厂近裁剪面：相机 near {nearRig:F2} m → {k_ShippingNearClip:F2} m"
@@ -1067,7 +1089,7 @@ namespace Vista.EditorTools
                 vf.jitterMode = JitterMode.Off;
                 bool okShip = Sweep(sb, vf, cam, rt, tex, admitted, phi, nAdmit,
                                     Pass.JitterOff, out var errShip, out float floorShip,
-                                    out bool usableShip);
+                                    out bool usableShip, out var pxShip);
                 ok &= okShip;
 
                 // 注意这里**不是** `if (!okShip) return`。⑤a 的收敛阶判成什么，
@@ -1083,6 +1105,11 @@ namespace Vista.EditorTools
                 }
 
                 ok &= Scaling(sb, errRig, floorRig, errShip, floorShip, La, Lb);
+
+                // ⑤c 与 ⑤b 用的是同一批像素，但**不经过参考解**。它回答的是 ⑤b
+                // 回答不了的那半个问题，所以它排在 ⑤b 后面而不是替掉它。
+                ok &= CrossGeometry(sb, pxRig, pxShip, admitted, nAdmit,
+                                    floorRig, floorShip, rRig.nearM, rShip.nearM);
             }
             finally
             {
@@ -1155,6 +1182,147 @@ namespace Vista.EditorTools
                         + "说明误差里有一块不是来自切片密度。");
             return ok;
         }
+
+        /// <summary>
+        /// ⑤c：**不经过参考解**，直接拿两趟的同一档像素相减。
+        ///
+        /// 为什么 ⑤b 之后还要有这一节 —— ⑤b 判的是 <c>err = |L_N − L_ref|</c> 的比值，
+        /// 而这个量的**两个操作数都随 near 动**。比值一旦反常，单看它分不出
+        /// 「被测档动了」还是「参考解动了」——「一个非零的数回答不了它是从哪儿来的」。
+        ///
+        /// 这一节换一个估计量：<c>d(N) = p99 rel |L_N(near_a) − L_N(near_b)|</c>。
+        /// 它的好处是**物理差在里面不碍事**：
+        /// <code>
+        ///   L_N(near_X) = truth(near_X) + ε_X(N)
+        ///   d(N) →(N→∞) |truth(near_a) − truth(near_b)| = |Δ|   ← 少积近端那一段，是真差
+        /// </code>
+        /// 也就是说 d(N) 不该收敛到 0，它该收敛到 |Δ| —— 而 |Δ| 我们手上恰好有一个
+        /// 最细的估计：<c>d(ref) = p99 rel |L_256(near_a) − L_256(near_b)|</c>。
+        ///
+        /// 于是门是：<c>m(N) = |d(N) − d(ref)|</c> **逐档不增**。
+        /// 这句话里没有任何一个拍出来的阈值，也不预设收敛阶是几 ——
+        /// 它只要求「切片越密，两种几何下的图越互相同意」，
+        /// 这是任何一个会收敛的渲染器都必须满足的最弱陈述。
+        ///
+        /// 它怎么把异常分到某一边：
+        /// <list type="bullet">
+        /// <item>m(N) 单调且小，而 ⑤b 的比值在乱 ⇒ 各档的**图本身**在两种几何下收敛得好好的，
+        ///       乱的是 err 这个估计量（同几何内相减那一步）—— 指向参考解残差 / 切片相位。</item>
+        /// <item>m(N) 非单调，且反常的档与 ⑤b 反常的档对得上 ⇒ 乱的是**档自己的图**，
+        ///       那就不是估计量的毛病，是渲染的毛病。</item>
+        /// </list>
+        ///
+        /// 地板前提：d 是两张图之差，两趟各带自己的噪声 ⇒ σ = √(σ_a² + σ_b²)。
+        /// 某一步的两个 m 都埋在 σ 以下时**这一步不判** —— 否则判的是尺子自己的抖动。
+        /// （σ 用的是各趟的**夹逼地板**，量的是一趟之内的机器自变动；而 ② 与 ⑤a 之间
+        /// 隔了一整趟 ③，跑间漂移比它大 —— 所以 σ 是偏小的，这道门偏严，
+        /// 方向是「宁可红，不可假通过」。）
+        /// </summary>
+        static bool CrossGeometry(StringBuilder sb, SweepPixels a, SweepPixels b,
+                                  bool[] admitted, int nAdmit,
+                                  float floorA, float floorB,
+                                  float nearA, float nearB)
+        {
+            sb.AppendLine();
+            sb.AppendLine("  ⑤c 异常在哪一边：绕开参考解，直接比两趟的同一档像素");
+
+            int K = k_Tiers.Length;
+            float denom = a.denom;   // 分母用 rig 那一趟的，两边同一把尺子
+
+            float dRef = RelQuantile(a.reference, b.reference, admitted, denom, k_JudgedQuantile);
+            float fRef = DimmerFraction(a.reference, b.reference, admitted);
+
+            var d    = new float[K];
+            var frac = new float[K];
+            for (int k = 0; k < K; k++)
+            {
+                d[k]    = RelQuantile(a.tiers[k], b.tiers[k], admitted, denom, k_JudgedQuantile);
+                frac[k] = DimmerFraction(a.tiers[k], b.tiers[k], admitted);
+            }
+
+            // ---- ⓘ 量级锚：少积 [near_a, near_b] 这一段，均匀密度下该差多少 ----
+            // 沿光轴、密度沿程恒定时，一段的贡献 ∝ e^{−σx₀} − e^{−σx₁}。
+            // **这个模型在本布景下并不成立**（雾有 50 m 高度衰减，射线在 100 m 上
+            // 纵向跨 ±58 m），所以它只能当量级锚，不能当门 ——
+            // 拿一个不成立的模型去判一个成立的读数，是在给报表编一个结论。
+            double sig = 1.0 / k_MeanFreePathM;
+            double ea0 = System.Math.Exp(-sig * nearA);
+            double eb0 = System.Math.Exp(-sig * nearB);
+            double ed  = System.Math.Exp(-sig * k_BackdropZ);
+            double omitted = (ea0 - eb0) / (ea0 - ed);
+
+            sb.AppendLine($"     参考档 N = {k_RefSlices}：d(ref) = {Sci(dRef)}，"
+                        + $"出厂更暗的像素占 {fRef:P1}");
+            sb.AppendLine($"     ⓘ 均匀密度量级锚：少积 [{nearA:F2}, {nearB:F2}] m 段 ≈ "
+                        + $"{omitted:P3} 的在散射"
+                        + $"（σ = 1/{k_MeanFreePathM:F0} m⁻¹，幕布 {k_BackdropZ:F0} m，沿光轴）"
+                        + " —— 雾有高度衰减，这只是量级，不是门。");
+            sb.AppendLine("  ┌ N   ┬ d(N)     ┬ m(N)=|d−dRef| ┬ 出厂更暗占比 ┐");
+            for (int k = 0; k < K; k++)
+                sb.AppendLine($"  │ {k_Tiers[k],3} │ {S(d[k])} │ {S(Mathf.Abs(d[k] - dRef)),13} │"
+                            + $" {frac[k],11:P1} │");
+            sb.AppendLine("  └─────┴──────────┴───────────────┴─────────────┘");
+
+            // ---- 门：m(N) 逐档不增 ----
+            float sigma = Mathf.Sqrt(floorA * floorA + floorB * floorB);
+            sb.AppendLine($"     判这一步的前提：max(m) ≥ σ = √(σ_a²+σ_b²) = {Sci(sigma)}"
+                        + $"（σ_a {Sci(floorA)} / σ_b {Sci(floorB)}，各趟自己的夹逼地板）");
+
+            bool anyStep = false;
+            bool ok = true;
+            for (int k = 0; k + 1 < K; k++)
+            {
+                float m0 = Mathf.Abs(d[k]     - dRef);
+                float m1 = Mathf.Abs(d[k + 1] - dRef);
+                bool judged  = Mathf.Max(m0, m1) >= sigma;
+                bool shrinks = m1 <= m0;
+                anyStep |= judged;
+                if (judged) ok &= shrinks;
+
+                sb.AppendLine($"     {(judged ? Mk(shrinks) : "  ⓘ ")}"
+                            + $"{k_Tiers[k],3} → {k_Tiers[k + 1],3}："
+                            + $"m {Sci(m0)} → {Sci(m1)}"
+                            + (judged
+                                ? (shrinks ? "（在收敛）" : "（**变远了**：切片加密反而让两种几何更不同意）")
+                                : $"（两个 m 都在 σ 以下 ⇒ **这一步不判**）"));
+            }
+
+            if (!anyStep)
+            {
+                sb.AppendLine("     ✘ **没有任何一步的 m 高过地板 ⇒ 本节整体不判**（计入未通过）。"
+                            + "「不可判定必须是缺口，不能是通过」。");
+                ok = false;
+            }
+
+            // ---- ⓘ 同号占比怎么读 ----
+            sb.AppendLine("     ⓘ「出厂更暗占比」把两种来源分开：少积近端那一段对**每个**像素同号"
+                        + "（少了就是少了）⇒ 占比趋近 100%；"
+                        + "而离散化残差是两头都有的 ⇒ 占比趋近 50%。"
+                        + "占比随 N 往哪边走，就说明两趟的差里哪一种在变主导。");
+            sb.AppendLine("     ⓘ 这一节与 ⑤b 用的是**同一批像素**，但不经过参考解 —— "
+                        + "所以两者若给出不一致的结论，不一致本身就是读数："
+                        + "它说明乱的是 err 这个估计量，不是图。");
+            return ok;
+        }
+
+        /// <summary>
+        /// 采纳集里 <paramref name="b"/> 严格暗于 <paramref name="a"/> 的像素占比。
+        /// 逐位相同的像素**不计入任何一边**（分母也扣掉）：它们对「差是同号还是两头都有」
+        /// 这个问题没有贡献，塞进分母只会把占比往 50% 拉，制造一个不存在的「两头都有」。
+        /// </summary>
+        static float DimmerFraction(float[] a, float[] b, bool[] admitted)
+        {
+            int dim = 0, tot = 0;
+            for (int i = 0; i < admitted.Length; i++)
+            {
+                if (!admitted[i]) continue;
+                if (b[i] == a[i]) continue;
+                tot++;
+                if (b[i] < a[i]) dim++;
+            }
+            return tot > 0 ? (float)dim / tot : float.NaN;
+        }
+
 
         // ==================================================================== ⑥ 成本
 
