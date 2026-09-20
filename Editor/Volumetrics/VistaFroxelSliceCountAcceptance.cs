@@ -74,11 +74,36 @@ namespace Vista.EditorTools
     /// 阈值、分位数、收敛阶的接受带一个都没动：变的是尺子，不是门。
     ///
     /// ── 两趟：抖动关 / 出厂档 ──
-    /// 抖动关（<c>JitterMode.Off</c>，同时也关掉时间重投影）量的是**纯空间离散化**，
-    /// 上面那条收敛阶预测只在这一趟成立。出厂档（程序化抖动 + 重投影）里误差含
-    /// 随机残差，比值不该被要求落在解析带里 —— 那一趟只报比值、判 Weber。
+    /// 抖动关（<c>JitterMode.Off</c>，同时也关掉时间重投影）量的是**纯空间离散化**；
+    /// 出厂档（程序化抖动 + 重投影）是真正上线的那一档。
     /// 两趟一起跑是因为真正要回答的问题是「抖动帮我盖住了多少」，
     /// 而那个差决定 64 能不能降到 32（移动端那一档要用）。
+    ///
+    /// ── 哪一趟判哪道门（这一节在第三次跑之后重排过，得说清楚重排的理由）──
+    /// 收敛阶的解析预测**只在抖动关那一趟成立**（有随机残差时 err 不再是 C/N^p），
+    /// 所以 <see cref="Order"/> 只在 ② 判；Weber 判的是**上线那张画面看不看得出来**，
+    /// 而 ② 那个配置从不出货，所以 <see cref="Weber"/> 只在 ③ 判。
+    /// 第一版两道门都在两趟跑：于是 ② 的 Weber 对一个永远不会出货的配置报红 ——
+    /// 一个健康的出货版本也会让它**恒红**，而「一格恒红的判据不是判据」。
+    ///
+    /// 同一次重排还修了一处作用域错误：地板余量那道门原本只看**最细档**，
+    /// 却被当成 Weber 的硬前提 —— 而 Weber 只读**出厂档**，根本不碰最细档。
+    /// 注释给的理由（「三个比值里有两个用到它」）说的是收敛阶，代码却拿它卡了两道门，
+    /// 注释与代码不一致、且注释是对的。现在地板余量**逐门各看各读的那一档**：
+    /// Order 的前提是 err(最细) ≥ 地板×3，Weber 的前提是 err(出厂) ≥ 地板×3。
+    ///
+    /// **这次重排不是在放松。** 对 ③ 的净效果是更严格的那个方向：
+    /// 旧接线下 ③ 在最细档那一格红完就整趟返回，Weber 连算都没算；
+    /// 新接线下 Weber 有了自己的前提，而 err(出厂) 4.164e-03 同样落在
+    /// 地板 4.144e-03 的 3 倍以内 ⇒ **Weber 仍然不判**，这一项仍然停在「不可判定」。
+    /// 这一条必须写在这里：重排门的归属之后判定若立刻变绿，形状正是本项目反复
+    /// 警告的那一种，所以重排的正确性**不能**靠「跑出来是绿的」验证 ——
+    /// 它靠的是「每道门的前提只看它自己读的那一档」这条能独立论证的规则。
+    ///
+    /// 由此少了一道曾经想加的门：「地板 ≤ Weber 阈值」（尺子比阈值还吵就什么都证不了）。
+    /// 它是上面两条的**推论**而不是新信息 —— err(出厂) ≥ 3·地板 与
+    /// err(出厂)·4/3 ≤ 1% 同时成立时，地板必 ≤ 0.25%。
+    /// 「一个恒真的绿比一个红更贵」，所以它只入 ⓘ。
     ///
     /// ── 不在这里量毫秒 ──
     /// 近层的两趟 dispatch 是 O(N) 的线程数，256 片对 64 片解析上是 4×。
@@ -107,8 +132,15 @@ namespace Vista.EditorTools
         // ================================================================ 门
 
         /// <summary>
-        /// 参考解相邻两帧之间的自变动（地板）。<c>err(128)</c> 至少要高过它这么多倍，
-        /// 否则最小那一档的读数是噪声，而三个比值里有两个都用到它。
+        /// 一档的读数要高过本趟地板这么多倍，才算「这一档量到的是信号不是噪声」。
+        ///
+        /// **它是逐门的前提，不是一道全局门**：<see cref="Order"/> 拿它卡**最细档**
+        /// （三个比值里有两个用到最细档），<see cref="Weber"/> 拿它卡**出厂档**
+        /// （Weber 只读出厂档，不碰最细档）。第一版只卡最细档却同时当了两道门的前提，
+        /// 那是个作用域错误 —— 详见类头注「哪一趟判哪道门」。
+        ///
+        /// 不成立时对应的门**不判**（计入未通过），不是判过 ——
+        /// 「不可判定必须是缺口，不能是通过」。
         /// 3 倍沿用 ⑱ 的 <c>k_NoiseHeadroom</c> 口径（同一个尺子、同一套布景）。
         /// </summary>
         const float k_FloorHeadroom = 3f;
@@ -162,10 +194,11 @@ namespace Vista.EditorTools
 
             sb.AppendLine();
             sb.AppendLine(pass
-                ? "结论：**通过**。切片数旋钮真的改了体的形状；误差随 N 按**一阶**收敛"
-                + "（而不是不收敛、也不是二阶）；参考解自身的残差有独立估计；"
-                + "出厂档 64 片修正后的真误差落在 Weber 1% 以内。"
-                : "结论：**未通过**（或不可判定）。逐条看上面的 ✘ / ⓘ。");
+                ? "结论：**通过**。切片数旋钮真的改了体的形状；②（抖动关）里误差随 N 按"
+                + "**一阶**收敛（而不是不收敛、也不是二阶）；参考解自身的残差有独立估计；"
+                + "③（出厂档）里出厂 64 片的读数高出本趟地板 3 倍以上**且**修正后落在 Weber 1% 以内。"
+                : "结论：**未通过**（或不可判定）。逐条看上面的 ✘ / ⓘ。"
+                + "注意「不判」也计入未通过 ——「不可判定必须是缺口，不能是通过」。");
 
             if (pass) Debug.Log(sb.ToString());
             else      Debug.LogError(sb.ToString());
@@ -187,6 +220,19 @@ namespace Vista.EditorTools
             public int slices;
             public float p50, p90, p99, max;
             public float p99Lit, p99Edge, p99Dark;   // 按 φ 分箱，只入 ⓘ
+        }
+
+        /// <summary>
+        /// 哪一趟。**两道门的归属从这一个值推出来**，不由调用方分别给 ——
+        /// 「Order 判 + Weber 判」和「两道都不判」这两种组合在这里表达不出来，
+        /// 而第一版的毛病正是前者（Weber 对一个从不出货的配置恒红）。
+        /// </summary>
+        enum Pass
+        {
+            /// <summary>抖动关：解析收敛阶在这里成立，但这个配置不出货。</summary>
+            JitterOff,
+            /// <summary>出厂档：Weber 要判的就是这一张画面，但收敛阶预测在这里不成立。</summary>
+            Shipping,
         }
 
         static bool Acceptance(StringBuilder sb)
@@ -320,11 +366,15 @@ namespace Vista.EditorTools
                 tex = new Texture2D(k_RtSizeHi, k_RtSizeHi, TextureFormat.RGBAFloat, false, true);
 
                 // ================================================ ② 两趟
+                //
+                // 每一趟判哪道门由 Pass 一个值决定，而不是由调用方分别传两个 bool ——
+                // 后者表达得出「两道门都判」与「两道门都不判」这两种没有意义的组合，
+                // 而第一版的毛病恰恰就是前者。见类头注「哪一趟判哪道门」。
                 sb.AppendLine();
                 sb.AppendLine("② 抖动关（JitterMode.Off ⇒ 无抖动、无时间重投影）＝ 纯空间离散化");
                 vf.jitterMode = JitterMode.Off;
                 bool okOff = Sweep(sb, vf, cam, rt, tex, admitted, phi, nAdmit,
-                                   gateOrder: true, out var errOff);
+                                   Pass.JitterOff, out var errOff);
                 ok &= okOff;
 
                 sb.AppendLine();
@@ -332,7 +382,7 @@ namespace Vista.EditorTools
                 vf.jitterMode = JitterMode.Procedural;
                 vf.depthJitterAmount = 1f;
                 bool okOn = Sweep(sb, vf, cam, rt, tex, admitted, phi, nAdmit,
-                                  gateOrder: false, out var errOn);
+                                  Pass.Shipping, out var errOn);
                 ok &= okOn;
 
                 // ================================================ ④ 抖动盖住了多少
@@ -548,11 +598,13 @@ namespace Vista.EditorTools
         /// 旧口径的整趟漂移仍然算出来、以 ⓘ 印在报表上，因为
         /// **「夹逼买到了多少」本身是个需要被看见的读数** —— 若这两个数差不多，
         /// 说明漂移不是线性的，那这次改动没解决问题，报表必须能说出这件事。
+        /// （第三次跑的实际结果：② 买到了 5.35 倍，③ 只有 1.04 倍 —— 也就是
+        /// ③ 的地板根本不是漂移，是出厂配置自己的跑间随机性。这条自检响过一次。）
         /// </summary>
         static bool Sweep(StringBuilder sb, VistaVolumetricFogSettings vf, Camera cam,
                           RenderTexture rt, Texture2D tex,
                           bool[] admitted, float[] phi, int nAdmit,
-                          bool gateOrder, out TierErr[] errs)
+                          Pass pass, out TierErr[] errs)
         {
             int K = k_Tiers.Length;
             errs = new TierErr[K];
@@ -634,33 +686,68 @@ namespace Vista.EditorTools
                             + $"{S(e.max)} │ {S(e.p99Lit)} │ {S(e.p99Edge)} │ {S(e.p99Dark)} │");
             sb.AppendLine("  └─────┴──────────┴──────────┴──────────┴──────────┴──────────┴──────────┴──────────┘");
 
-            // ---- 地板与旋钮响应 ----
+            // ---- 门的归属：从 pass 推出来，不在这里各写一遍 ----
+            bool gateOrder = pass == Pass.JitterOff;   // 解析收敛阶只在纯空间离散化下成立
+            bool gateWeber = pass == Pass.Shipping;    // Weber 判的是上线那张画面
+            sb.AppendLine($"  本趟判：{(gateOrder ? "收敛阶（Weber 只报）" : "Weber（收敛阶只报）")}"
+                        + " —— 见类头注「哪一趟判哪道门」。");
+
+            int shipIdx = System.Array.IndexOf(k_Tiers, k_ShippingSlices);
             float errFinest = errs[errs.Length - 1].p99;
             float errCoarse = errs[0].p99;
+            float errShip   = errs[shipIdx].p99;
 
-            bool aboveFloor = errFinest >= floor * k_FloorHeadroom;
-            sb.AppendLine($"  {Mk(aboveFloor)}最细档 N = {k_Tiers[k_Tiers.Length - 1]} 的 p99 "
-                        + $"{Sci(errFinest)} ≥ 地板 {Sci(floor)} × {k_FloorHeadroom:F0} = "
-                        + $"{Sci(floor * k_FloorHeadroom)}"
-                        + "（不成立则最小那一档是噪声，而三个比值里有两个用到它）");
-            ok &= aboveFloor;
-
+            // ---- 旋钮响应：两道门共同的前提，所以两趟都判 ----
+            // 它防的不是「误差大」，是「五张图逐位相同」—— 那种失效下所有
+            //「≤」形状的门都会通过，包括 Weber。因此它必须先于一切。
             bool knobBites = errCoarse >= floor * k_KnobHeadroom;
             sb.AppendLine($"  {Mk(knobBites)}最粗档 N = {k_Tiers[0]} 的 p99 {Sci(errCoarse)} ≥ "
                         + $"地板 × {k_KnobHeadroom:F0} = {Sci(floor * k_KnobHeadroom)}"
                         + "（不成立则「切片数根本没改变画面」与「误差本来就很小」分不开）");
             ok &= knobBites;
-
-            // ---- 收敛阶 ----
-            if (!aboveFloor || !knobBites)
+            if (!knobBites)
             {
-                sb.AppendLine("  ⇒ 地板或旋钮响应不成立，**收敛阶不判**（比值的分母不可信）。");
+                sb.AppendLine("  ⇒ 旋钮响应不成立，**本趟下面全部不判**"
+                            + "（若五张图逐位相同，每一道「≤」形状的门都会无声通过）。");
                 return false;
             }
-            ok &= Order(sb, errs, gateOrder);
+
+            // ---- 地板余量：**逐门各看各读的那一档** ----
+            // 第一版只算最细档那一个，却同时当了 Order 与 Weber 的前提 ——
+            // 而 Weber 根本不读最细档。见类头注。
+            bool finestOverFloor = errFinest >= floor * k_FloorHeadroom;
+            bool shipOverFloor   = errShip   >= floor * k_FloorHeadroom;
+
+            sb.AppendLine($"  {(gateOrder ? Mk(finestOverFloor) : "  ⓘ ")}"
+                        + $"最细档 N = {k_Tiers[k_Tiers.Length - 1]} 的 p99 {Sci(errFinest)}"
+                        + $" ≥ 地板 × {k_FloorHeadroom:F0} = {Sci(floor * k_FloorHeadroom)}"
+                        + $"（收敛阶的前提，{(gateOrder ? "本趟判" : "本趟不判收敛阶，只报")}）");
+            sb.AppendLine($"  {(gateWeber ? Mk(shipOverFloor) : "  ⓘ ")}"
+                        + $"出厂档 N = {k_ShippingSlices} 的 p99 {Sci(errShip)}"
+                        + $" ≥ 地板 × {k_FloorHeadroom:F0} = {Sci(floor * k_FloorHeadroom)}"
+                        + $"（Weber 的前提，{(gateWeber ? "本趟判" : "本趟不判 Weber，只报")}）");
+            sb.AppendLine($"    ⓘ 地板占出厂档读数的 {(errShip > 0f ? floor / errShip : float.NaN):P1}"
+                        + " —— 这个比例越接近 100%，那一档量到的越是渲染器自己的噪声。");
+            sb.AppendLine($"    ⓘ 地板 {Sci(floor)} 是 Weber 阈值 {k_WeberThreshold:P1} 的 "
+                        + $"{floor / k_WeberThreshold:F2} 倍。**不单设一道门**："
+                        + "上面那条前提与 Weber 同时成立时它必然 ≤ 25%，"
+                        + "是推论不是新信息 ——「一个恒真的绿比一个红更贵」。");
+
+            // ---- 收敛阶 ----
+            if (gateOrder && !finestOverFloor)
+            {
+                ok = false;
+                Order(sb, errs, gate: false,
+                      whyNotGated: "最细档落在地板里，比值的分母不可信 ⇒ **不判**（计入未通过）");
+            }
+            else
+            {
+                ok &= Order(sb, errs, gateOrder,
+                            whyNotGated: "抖动档的误差含随机残差，解析收敛阶预测在这一趟不适用");
+            }
 
             // ---- Weber：出厂档，带参考解残差修正 ----
-            ok &= Weber(sb, errs);
+            ok &= Weber(sb, errs, gateWeber, shipOverFloor, floor);
             return ok;
         }
 
@@ -668,10 +755,15 @@ namespace Vista.EditorTools
 
         /// <summary>
         /// 观测比值 vs 三个假设。带子是三个假设的**几何中点**，没有可调常数。
+        ///
+        /// <paramref name="whyNotGated"/> 在不判时必须给出**这一次**不判的理由。
+        /// 不判有两种成因（这一趟是出厂档 / 最细档落在地板里），
+        /// 它们在报表上长得一模一样，而后一种要计入未通过、前一种不计 ——
+        /// 「一道只在失败时才留下痕迹的检查，与一道根本没跑的检查在报告上无法区分」。
         /// </summary>
-        static bool Order(StringBuilder sb, TierErr[] errs, bool gate)
+        static bool Order(StringBuilder sb, TierErr[] errs, bool gate, string whyNotGated)
         {
-            sb.AppendLine($"  收敛阶（{(gate ? "判" : "只报 —— 抖动档的误差含随机残差，解析预测不适用")}）：");
+            sb.AppendLine($"  收敛阶（{(gate ? "判" : "只报 —— " + whyNotGated)}）：");
             bool ok = true;
 
             for (int k = 0; k + 1 < errs.Length; k++)
@@ -706,7 +798,17 @@ namespace Vista.EditorTools
 
         // ==================================================================== Weber
 
-        static bool Weber(StringBuilder sb, TierErr[] errs)
+        /// <summary>
+        /// 出厂档的真误差 vs Weber 1%。
+        ///
+        /// <paramref name="gate"/> 只在出厂那一趟为真：抖动关那个配置从不出货，
+        /// 对它判 Weber 会让一个健康的出货版本**恒红**。
+        /// <paramref name="overFloor"/> 是这道门自己的前提 ——
+        /// 出厂档的读数必须高出本趟地板 <see cref="k_FloorHeadroom"/> 倍，
+        /// 否则那个「≤ 1%」只说明**出厂档与参考解在尺子的噪声里分不开**，
+        /// 不说明偏置小。那种情况下判成通过，就是拿噪声地板撑起一个结论。
+        /// </summary>
+        static bool Weber(StringBuilder sb, TierErr[] errs, bool gate, bool overFloor, float floor)
         {
             int idx = System.Array.IndexOf(k_Tiers, k_ShippingSlices);
             var e = errs[idx];
@@ -716,27 +818,57 @@ namespace Vista.EditorTools
             // 对 64 片是 ×4/3。不修正的话低估 25%，而低估的方向正好让这道门更容易过。
             double corr = (1.0 / k_ShippingSlices) / Pred(k_ShippingSlices, 1.0);
             float trueP99 = (float)(e.p99 * corr);
+            bool under = trueP99 <= k_WeberThreshold;
 
-            bool pass = trueP99 <= k_WeberThreshold;
-            sb.AppendLine($"  {Mk(pass)}出厂档 N = {k_ShippingSlices}：p99 {Sci(e.p99)} × "
+            string mark = !gate ? "  ⓘ " : (overFloor ? Mk(under) : "✘ ");
+            sb.AppendLine($"  {mark}出厂档 N = {k_ShippingSlices}：p99 {Sci(e.p99)} × "
                         + $"参考解残差修正 {corr:F4} = **{Sci(trueP99)}**，"
-                        + $"门 ≤ Weber {k_WeberThreshold:P1}");
+                        + $"门 ≤ Weber {k_WeberThreshold:P1}"
+                        + $" ⇒ {(under ? "在门内" : "超门")}");
+
+            if (!gate)
+            {
+                sb.AppendLine("    ⓘ **本趟不判 Weber**：这个配置（抖动关）从不出货，"
+                            + "对它判「上线画面看不看得出来」会让一个健康的出货版本恒红。"
+                            + "这一行仍然印出来，因为「不靠抖动时 64 片够不够」是一条"
+                            + "要写进移动端降档账里的独立读数。");
+            }
+            else if (!overFloor)
+            {
+                sb.AppendLine("    ✘ **不判**：出厂档的读数没有高出本趟地板 "
+                            + $"{k_FloorHeadroom:F0} 倍（见上面那一格）⇒ 上面那个"
+                            + $"「{(under ? "在门内" : "超门")}」量到的主要是渲染器自己的噪声，"
+                            + "不是离散化偏置。**不可判定必须是缺口，不能是通过**，计入未通过。");
+            }
+
             sb.AppendLine($"    ⓘ 同样修正下 max = {Sci((float)(e.max * corr))}"
                         + "（不判 ——「max 回答不了阈值该摆哪儿」）");
 
             // 顺带回答「能不能降档」。这不是门：「32 片够用」不是本判据的要求，
             // 把它写成门等于替移动端那一档先把结论定了。
+            //
+            // 但每一行都必须带上它自己与地板的关系。第四次跑的 ③ 里
+            // N = 32 修正后是 Weber 的 0.77 倍、读起来像「32 片就够了」，
+            // 而它 6.77e-03 同样落在地板 3.516e-03 的 3 倍以内 —— 那个 0.77
+            // 是噪声。一个由地板撑起来的数印成「也在 1% 以内」，
+            // 与出厂档那一格被判成通过是同一种错，只是它藏在 ⓘ 里。
             for (int k = 0; k < errs.Length; k++)
             {
                 if (k_Tiers[k] >= k_ShippingSlices) continue;
                 double c = (1.0 / k_Tiers[k]) / Pred(k_Tiers[k], 1.0);
                 float t = (float)(errs[k].p99 * c);
+                bool tierOverFloor = errs[k].p99 >= floor * k_FloorHeadroom;
                 sb.AppendLine($"    ⓘ N = {k_Tiers[k]}：修正后 p99 {Sci(t)}"
                             + $"（Weber 的 {t / k_WeberThreshold:F2} 倍）"
-                            + $" —— {(t <= k_WeberThreshold ? "也在 1% 以内" : "超出 1%")}"
-                            + "，移动端降档要用的就是这一行，但本判据不判它。");
+                            + $" —— {(t <= k_WeberThreshold ? "在 1% 以内" : "超出 1%")}"
+                            + (tierOverFloor
+                                ? "，且高出本趟地板 3 倍以上（这个数量到的是信号）"
+                                : $"，**但它没有高出本趟地板 3 倍（{Sci(errs[k].p99)} < "
+                                  + $"{Sci(floor * k_FloorHeadroom)}）⇒ 这一行是噪声，不能当降档依据**")
+                            + "。移动端降档要用的就是这一行，但本判据不判它。");
             }
-            return pass;
+
+            return !gate || (overFloor && under);
         }
 
         // ==================================================================== ④ 抖动盖住了多少
