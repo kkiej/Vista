@@ -95,6 +95,13 @@ namespace Vista.EditorTools
     /// 本判据只判**太阳**造成的光轴。局部灯（手电筒式光锥）在档 D 里**根本不存在**，
     /// 拿它做 A vs D 会得到一个近乎恒真的绿 ——「一个恒真的绿比一个红更贵」。
     /// 局部灯那一路的画质归 #30 与夜景布景，不在这里。
+    /// ── 为什么这个类有几个 internal 成员 ──
+    /// #27 第 4 项（切片数够不够，<c>VistaFroxelSliceCountAcceptance</c>）复用本类的
+    /// **布景几何**与 φ 计算，不是图省事：那一项要在「同一套几何」上比不同切片数，
+    /// 而这套几何的四条前提（幕布恒被照亮、侧墙整个在视锥外、φ 两侧分得开、
+    /// 首个命中是幕布）已经由 ⓪ 那一节判过了。另起一套等于把这四条重写一遍，
+    /// 而「同一个量不留两份实现」——两份几何走歧的那天，两项判据会各自自洽地说谎。
+    /// 反过来，**门与阈值一个都不共享**：那些是各自判据的事。
     /// </summary>
     static class VistaFogTierQualityAcceptance
     {
@@ -105,7 +112,7 @@ namespace Vista.EditorTools
 
         /// <summary>幕布所在的 z。100 m 远小于近层远边界（150 m）⇒ 整条光路都归近层管，
         /// 两档的差才是「近层 vs AP」而不是「近层 + AP 的某种混合 vs AP」。</summary>
-        const float k_BackdropZ = 100f;
+        internal const float k_BackdropZ = 100f;
 
         /// <summary>幕布边长。z = 100 处半视场 100·tan30° = 57.7 m，400 有 3.5 倍余量。</summary>
         const float k_BackdropSize = 400f;
@@ -137,7 +144,7 @@ namespace Vista.EditorTools
         // 这个问题在编译期没有任何人会问 —— 换个名字比留一条注释可靠。
 
         /// <summary>太阳仰角。见类注释：25° 那种低太阳的影子界面与视线近乎平行。</summary>
-        const float k_TierSunAltitudeDeg = 60f;
+        internal const float k_TierSunAltitudeDeg = 60f;
 
         /// <summary>
         /// 太阳方位角 75°。这个数被改过一次，改的原因值得记下来：
@@ -154,7 +161,7 @@ namespace Vista.EditorTools
         /// 不取 90°（z 分量恰好为 0，最干净）的理由与不取 0° 的是同一条：
         /// 那会让光轴与 froxel 网格的另一根轴完全对齐，判据于是对一类真实的采样错位免疫。
         /// </summary>
-        const float k_TierSunAzimuthDeg = 75f;
+        internal const float k_TierSunAzimuthDeg = 75f;
 
         // ================================================================ ROI 判定
 
@@ -193,7 +200,7 @@ namespace Vista.EditorTools
         /// historyTimeConstant 0.33 s ≈ 20 帧一个常数，64 帧 ≈ 3.2 个常数 ⇒ 残留 ~4%，
         /// 于是「上一张图是什么」不再进入读数。
         /// </summary>
-        const int k_SettleFramesTier = 64;
+        internal const int k_SettleFramesTier = 64;
 
         /// <summary>φ 的积分步数。192 步铺在 100 m 上 ⇒ 0.52 m/步，
         /// 远细于墙在画面上最窄处的投影（z = 60 处 2 m 宽）。</summary>
@@ -396,7 +403,7 @@ namespace Vista.EditorTools
         /// 一个看起来正常的读数 —— 这正是第 1 项的探路工具栽过的那两个跟头的形状。
         /// 所以它们在这里是**会失败的格子**，不是一段注释。
         /// </summary>
-        static bool VerifyRig(StringBuilder sb, VistaFroxelVolume volume, Camera cam, Vector3 toSun)
+        internal static bool VerifyRig(StringBuilder sb, VistaFroxelVolume volume, Camera cam, Vector3 toSun)
         {
             sb.AppendLine("⓪ 布景前提（不成立时下面三条门会给出看起来正常的假读数）");
 
@@ -535,7 +542,7 @@ namespace Vista.EditorTools
         /// 本判据的全部前提是「同一块幕布、同一段距离」。
         /// 用 z 当参数（相机沿 +z 看，dz ≡ 1），省掉一次归一化。
         /// </summary>
-        static bool PrimaryIsBackdrop(float a, float b)
+        internal static bool PrimaryIsBackdrop(float a, float b)
         {
             // 地面 y = 0（相机在 y = 2）
             if (b < 0f && (-k_CameraHeightM / b) < k_BackdropZ) return false;
@@ -575,7 +582,7 @@ namespace Vista.EditorTools
         /// 权重 e^(−t/mfp) 是雾自己的透射率：入散射被它压向近端，
         /// 按长度均分会把远端那段权重算高，算出来的 φ 就不再预测对比度。
         /// </summary>
-        static float ShadowedFraction(float a, float b, Vector3 toSun)
+        internal static float ShadowedFraction(float a, float b, Vector3 toSun)
         {
             float r = Mathf.Sqrt(1f + a * a + b * b);     // 每单位 z 对应的真实距离
             float dz = k_BackdropZ / k_PhiSteps;
@@ -822,7 +829,7 @@ namespace Vista.EditorTools
         /// 幕布 + 地面 + 一根高侧墙。与第 1 项那套布景**不共用**，理由见类注释。
         /// 名字带 Tier 前缀是为了不静默盖住 rig 里同签名的 Build。
         /// </summary>
-        static void BuildTierRig(Shader litShader, int layer, float groundLevelWorldY, RenderTexture rt,
+        internal static void BuildTierRig(Shader litShader, int layer, float groundLevelWorldY, RenderTexture rt,
                                  out GameObject root, out Camera cam, out Material mat, out Light sun)
         {
             root = new GameObject("Vista Fog Tier Quality Rig") { hideFlags = HideFlags.HideAndDontSave };
