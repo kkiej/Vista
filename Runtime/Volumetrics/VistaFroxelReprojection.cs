@@ -188,6 +188,31 @@ namespace Vista
         public string lastInvalidReason { get; private set; }
 
         /// <summary>
+        /// 本帧实际下发的历史权重 <c>w = exp(−Δt/τ)</c>；历史不可用时为 0。
+        ///
+        /// ---- 为什么要把一个算完就走的中间量记下来 ----
+        /// 判据⑯ 从画面自己量出 AR(1) 的一阶自相关 ρ₁，而理论上 ρ₁ == w。
+        /// 两个数来自**完全独立的两条路**（一条是 CPU 的 exp()，一条是 256² 个像素
+        /// 的时间序列），所以它们相等是一次真正的交叉验证：能同时抓到
+        /// 「τ 没接到 shader 上」与「滤波压根没跑」。若只印 ρ₁，
+        /// 「一个非零的数回答不了它是从哪儿来的」。
+        ///
+        /// 这两个只读记录**不改变任何行为**——值本来就已经算出来并下发了，
+        /// 这里只是留一份副本。「量性能的工具不该改被量对象」在这里成立。
+        /// </summary>
+        public float lastHistoryWeight { get; private set; }
+
+        /// <summary>
+        /// 本帧 clamp 之后实际用于 <c>exp(−Δt/τ)</c> 的 Δt（秒）；历史不可用时为 0。
+        ///
+        /// 记**clamp 之后**的值而不是入参：判据要复算 <c>exp(−Δt/τ)</c> 并与
+        /// <see cref="lastHistoryWeight"/> 对上，而 Editor 里手动 <c>cam.Render()</c> 的
+        /// <c>Time.unscaledDeltaTime</c> 完全可能落在 clamp 区间之外 ——
+        /// 那时用入参复算会得出一个对不上的数，并把它归因成「滤波有问题」。
+        /// </summary>
+        public float lastDeltaTime { get; private set; }
+
+        /// <summary>
         /// 丢弃历史。相机切换、体积重分配、模式改变之外，Editor 里域重载后也该调它。
         /// </summary>
         public void Invalidate(string reason)
@@ -195,6 +220,11 @@ namespace Vista
             m_PrevCapturedAtFrame = -1;
             m_PrevCameraId = 0;
             framesSinceValid = 0;
+            // 这两个也清零：失效之后它们是**陈旧**读数，而一个陈旧的 w 会让
+            // 判据⑯ 的交叉验证拿上一次的配置去对这一次的画面 —— 那种错配
+            // 在报表上长得像「τ 没接上」，归因会指向完全错误的地方。
+            lastHistoryWeight = 0f;
+            lastDeltaTime = 0f;
             lastInvalidReason = reason;
         }
 
@@ -247,6 +277,7 @@ namespace Vista
             else if (m_PrevCameraId != cameraId)             reason = "换了相机";
 
             float historyWeight = 0f;
+            float clampedDt = 0f;
             if (reason == null)
             {
                 // alpha = 新样本的权重 = 1 − exp(−Δt/τ)；历史权重 = 1 − alpha = exp(−Δt/τ)。
@@ -254,6 +285,7 @@ namespace Vista
                 float dt  = Mathf.Clamp(deltaTime, k_MinDeltaTime, k_MaxDeltaTime);
                 float tau = Mathf.Max(settings.historyTimeConstant, k_MinDeltaTime);
                 historyWeight = Mathf.Exp(-dt / tau);
+                clampedDt = dt;
                 framesSinceValid++;
             }
             else
@@ -261,6 +293,8 @@ namespace Vista
                 framesSinceValid = 0;
             }
 
+            lastHistoryWeight = historyWeight;
+            lastDeltaTime = clampedDt;
             lastInvalidReason = reason;
 
             Vector4 phase = Vector4.zero;
