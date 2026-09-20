@@ -181,6 +181,28 @@ namespace Vista.EditorTools
         /// </summary>
         const int k_RtSizeHi = 512;
 
+        /// <summary>
+        /// 出厂相机的近裁剪面（m）。froxel 体的近端**就是它**：
+        /// <c>VistaVolumetricFogSettings.Resolve</c> 拿 <c>Mathf.Max(0.01f, cameraNearPlane)</c>
+        /// 当体的 near，所以切片分布完全由 <c>ln(far / near)</c> 决定。
+        ///
+        /// 为什么它在这里出现：rig 的相机近裁剪面是 0.1（<c>VistaFroxelShadowRig.k_NearClip</c>），
+        /// 而出厂是 0.3 ⇒ 同样 far = 150 m 下 <c>ln(far/near)</c> 差 17.7%，
+        /// rig 比出厂**严 1.18 倍**。方向是对的（尺子比被担保的对象严），
+        /// 但这一项**并不通过** —— 而一把偏严的尺子只能撑起「通过」，撑不起「未通过」：
+        /// ② 报的那个 2.77% 完全可能是这 1.18 倍的产物。
+        /// 所以出厂几何必须有**自己的读数**，不能靠一句「方向是对的」推过去。
+        ///
+        /// 0.3 这个数来自 `Project-ARPG/Assets/Scenes/Demo.unity` 的唯一一台相机。
+        /// 它写死在这里、没有去读宿主场景 —— 那是刻意的：本 rig 自带相机、
+        /// 自带 layer、自带太阳，「与宿主场景无关」是它成立的前提，
+        /// 而 #27 第 1 项正是栽在「对宿主场景敏感却不检查也不打印」上。
+        /// 代价是这个数会过期，所以 ⑤ 那一节把两个近裁剪面**都打印出来**，
+        /// 并且判的是两者之间的**比值规律**而不是某个绝对值 ——
+        /// 数过期了比值仍然成立，过期的只有「这就是出厂那一档」这句话。
+        /// </summary>
+        const float k_ShippingNearClip = 0.3f;
+
         // ================================================================ 入口
 
         [MenuItem("Window/Vista/Acceptance: Froxel Slice Count (Quality)", priority = 138)]
@@ -212,6 +234,7 @@ namespace Vista.EditorTools
             public int depth;           // 体实际分到的片数
             public float handoff;       // 体实际的接手距离 (m)
             public float maxSegment;    // 最长一段的厚度 (m)
+            public float nearM, farM;   // 体的两端 (m) —— ⑤ 的 ln(far/near) 从这里来，不另算一遍
         }
 
         /// <summary>一趟（抖动关 / 出厂档）里每一档的误差分位数。</summary>
@@ -347,7 +370,8 @@ namespace Vista.EditorTools
                 // 顺序反过来（先定阈值再量 handoff）就得把 StoredDistance 的公式
                 // 在这里再写一遍 —— 那是第二份实现。
                 var reads = new List<TierRead>();
-                if (!ProbeTiers(sb, vf, volume, cam, reads))
+                if (!ProbeTiers(sb, vf, volume, cam, reads,
+                                "⓪ 旋钮响应：写下去的切片数与体实际分到的形状"))
                     return false;
 
                 float minHandoff = float.PositiveInfinity;
@@ -374,7 +398,7 @@ namespace Vista.EditorTools
                 sb.AppendLine("② 抖动关（JitterMode.Off ⇒ 无抖动、无时间重投影）＝ 纯空间离散化");
                 vf.jitterMode = JitterMode.Off;
                 bool okOff = Sweep(sb, vf, cam, rt, tex, admitted, phi, nAdmit,
-                                   Pass.JitterOff, out var errOff);
+                                   Pass.JitterOff, out var errOff, out float floorOff, out _);
                 ok &= okOff;
 
                 sb.AppendLine();
@@ -382,14 +406,20 @@ namespace Vista.EditorTools
                 vf.jitterMode = JitterMode.Procedural;
                 vf.depthJitterAmount = 1f;
                 bool okOn = Sweep(sb, vf, cam, rt, tex, admitted, phi, nAdmit,
-                                  Pass.Shipping, out var errOn);
+                                  Pass.Shipping, out var errOn, out _, out _);
                 ok &= okOn;
 
                 // ================================================ ④ 抖动盖住了多少
                 sb.AppendLine();
                 ok &= CompareJitter(sb, errOff, errOn, shipIdx);
 
-                // ================================================ ⑤ 成本：只写解析，不量
+                // ================================================ ⑤ 出厂近裁剪面：同一条规律的正交方向
+                sb.AppendLine();
+                ok &= NearClipSweep(sb, vf, volume, cam, rt, tex,
+                                    admitted, phi, nAdmit, admitLen, minHandoff,
+                                    reads, errOff, floorOff);
+
+                // ================================================ ⑥ 成本：只写解析，不量
                 sb.AppendLine();
                 Cost(sb, reads);
             }
@@ -422,9 +452,10 @@ namespace Vista.EditorTools
         /// 任何一环没生效，五张图就逐位相同，而本判据所有「≤」形状的门会**全部通过**。
         /// </summary>
         static bool ProbeTiers(StringBuilder sb, VistaVolumetricFogSettings vf,
-                               VistaFroxelVolume volume, Camera cam, List<TierRead> reads)
+                               VistaFroxelVolume volume, Camera cam, List<TierRead> reads,
+                               string head)
         {
-            sb.AppendLine("⓪ 旋钮响应：写下去的切片数与体实际分到的形状");
+            sb.AppendLine(head);
             bool all = true;
 
             var all_n = new List<int>(k_Tiers) { k_RefSlices };
@@ -453,6 +484,7 @@ namespace Vista.EditorTools
                 reads.Add(new TierRead
                 {
                     slices = n, depth = d.depth, handoff = d.handoffMeters, maxSegment = maxSeg,
+                    nearM = d.nearMeters, farM = d.farMeters,
                 });
 
                 sb.AppendLine($"  {Mk(hit)}体近端 {d.nearMeters:F2} m / 远边界 {d.farMeters:F1} m；"
@@ -604,10 +636,12 @@ namespace Vista.EditorTools
         static bool Sweep(StringBuilder sb, VistaVolumetricFogSettings vf, Camera cam,
                           RenderTexture rt, Texture2D tex,
                           bool[] admitted, float[] phi, int nAdmit,
-                          Pass pass, out TierErr[] errs)
+                          Pass pass, out TierErr[] errs, out float floorOut, out bool usable)
         {
             int K = k_Tiers.Length;
             errs = new TierErr[K];
+            floorOut = 0f;
+            usable = false;
             bool ok = true;
 
             var refs   = new float[K + 1][];
@@ -659,6 +693,9 @@ namespace Vista.EditorTools
             float driftWhole = RelQuantile(refs[0], refs[K], admitted, denom, k_JudgedQuantile);
 
             float floor = Mathf.Max(floorAdj, floorBracket);
+            // ⑤ 那一节要拿它算比值的传播不确定度。传出去而不是在那边重算一遍：
+            // 地板的口径（邻帧 vs 夹逼取大）是这把尺子的定义之一，「同一个量不留两份实现」。
+            floorOut = floor;
 
             sb.AppendLine($"  参考解 N = {k_RefSlices}，**夹逼**（ref₀→16→ref₁→32→ref₂→64→ref₃→128→ref₄，"
                         + $"每档比两侧参考图的逐像素平均）；采纳集中位亮度 "
@@ -711,6 +748,12 @@ namespace Vista.EditorTools
                             + "（若五张图逐位相同，每一道「≤」形状的门都会无声通过）。");
                 return false;
             }
+
+            // 到这里为止，这一趟的读数本身是**成立的**：五档图彼此不同、地板算得出来。
+            // 下面那几道门判成什么，与「这批读数能不能拿去给别的判据用」是两件事 ——
+            // ⑤b 要的是后者。把两者混成同一个 bool，就等于让 Order 的裁决决定
+            // Scaling 跑不跑，而那正是这个文件在 ②/③ 上刚修掉的那种接线。
+            usable = true;
 
             // ---- 地板余量：**逐门各看各读的那一档** ----
             // 第一版只算最细档那一个，却同时当了 Order 与 Weber 的前提 ——
@@ -902,11 +945,222 @@ namespace Vista.EditorTools
             return notWorse;
         }
 
-        // ==================================================================== ⑤ 成本
+        // ==================================================================== ⑤ 出厂近裁剪面
+
+        /// <summary>
+        /// 把相机近裁剪面从 rig 的 <c>k_NearClip</c> 换成出厂的
+        /// <see cref="k_ShippingNearClip"/>，再跑一遍抖动关那一趟。
+        ///
+        /// ── 为什么这一节值得多花一趟 ──
+        /// 它一次回答两个问题，而第二个比第一个值钱得多。
+        ///
+        /// **一、出厂几何下 ② 那条真失败还成不成立。**
+        /// froxel 体的近端就是相机近裁剪面（<c>VistaVolumetricFogSettings.Resolve</c>），
+        /// rig 用 0.1、出厂用 0.3 ⇒ rig 比出厂严。偏严的尺子只能撑起「通过」，
+        /// 撑不起「未通过」—— ② 报的 2.77% 完全可能是这个口径差的产物。
+        /// 所以出厂几何必须有自己的读数。
+        ///
+        /// **二、从一个正交方向再验一次「误差是一阶的」。**
+        /// 对数分布下第 k 片的相对厚度是 <c>Δ/t ≈ L/N</c>（<c>L = ln(far/near)</c>），
+        /// 也就是说**切片密度只通过 L/N 这一个组合进入误差**。
+        /// ② 判的是固定 L 下改 N，这一节判的是固定 N 下改 L ——
+        /// 同一个 <c>C·(L/N)^p</c> 的两个正交切面。
+        ///
+        /// 而且这个方向上**参考解残差自动对消**：两趟的参考解都是 256 片、
+        /// 都在各自的 near 上，于是
+        /// <code>
+        ///   err(N, L) = C·L^p·(1/N^p − 1/256^p)
+        ///   err(N, L_b) / err(N, L_a) = (L_b / L_a)^p        ← 与 N 无关，也与 C 无关
+        /// </code>
+        /// 三个假设因此各给一个**纯几何**的预测值，带子照旧取几何中点，
+        /// 一个可调常数都没有 —— 与 <see cref="Order"/> 完全同一套方法论。
+        ///
+        /// ── 为什么这道门需要一个比 <see cref="k_FloorHeadroom"/> 更紧的前提 ──
+        /// 一阶预测到最近那条带边的相对余量只有约 7.8%，而 <c>地板 × 3</c>
+        /// 对应的比值不确定度约 47% —— **用得上的前提在这里根本不够紧**。
+        /// 所以这一节自己算传播不确定度
+        /// <c>u = √((σ_a/e_a)² + (σ_b/e_b)²)</c>（σ 取各趟自己的地板），
+        /// 并要求 <c>u ≤ 到最近带边的相对余量</c>。
+        /// 这个余量是从带子本身算出来的，不是拍的：门与门的前提共用同一套几何中点。
+        /// 不满足的档位**不判**（计入未通过口径的「缺口」），只报。
+        ///
+        /// ── 采纳集为什么可以原样复用 ──
+        /// 近裁剪面变大 ⇒ L 变小 ⇒ 同样片数下接手距离**变大**，
+        /// 于是 <c>admitLen = 0.85 × minHandoff</c> 这条在 0.1 上算出来的界
+        /// 在 0.3 上更宽松（采纳集仍然整个落在纯近层区里）。
+        /// 这不是「应该没问题」——下面那一格会拿新探到的 handoff 把它判一次。
+        /// 复用同一张掩码是必须的：比值要成立，两趟必须量**同一撮像素**。
+        /// </summary>
+        static bool NearClipSweep(StringBuilder sb, VistaVolumetricFogSettings vf,
+                                  VistaFroxelVolume volume, Camera cam,
+                                  RenderTexture rt, Texture2D tex,
+                                  bool[] admitted, float[] phi, int nAdmit,
+                                  float admitLen, float minHandoffRig,
+                                  List<TierRead> readsRig,
+                                  TierErr[] errRig, float floorRig)
+        {
+            float nearRig = cam.nearClipPlane;
+            sb.AppendLine($"⑤ 出厂近裁剪面：相机 near {nearRig:F2} m → {k_ShippingNearClip:F2} m"
+                        + "（froxel 体的近端就是它）");
+
+            bool ok = true;
+            var readsShip = new List<TierRead>();
+
+            cam.nearClipPlane = k_ShippingNearClip;
+            try
+            {
+                // 重新探一遍形状：near 变了，ρ / 最长段 / 接手距离全都跟着变，
+                // 而下面那条采纳集的前提正是拿新的 handoff 判的。
+                if (!ProbeTiers(sb, vf, volume, cam, readsShip,
+                                "  ⓪' 出厂近裁剪面下重新探一遍形状（与 ⓪ 同一段代码，只有 near 不同）"))
+                {
+                    sb.AppendLine("  ⇒ 出厂近裁剪面下切片数没有生效，**本节不判**。");
+                    return false;
+                }
+
+                float minHandoffShip = float.PositiveInfinity;
+                foreach (var r in readsShip) minHandoffShip = Mathf.Min(minHandoffShip, r.handoff);
+                float admitLenShip = (1f - VistaFogSettings.k_HandoffBandFraction) * minHandoffShip;
+
+                bool maskStillValid = admitLen <= admitLenShip;
+                sb.AppendLine($"  {Mk(maskStillValid)}采纳集沿用 0.1 口径那一张："
+                            + $"admitLen {admitLen:F1} m ≤ 出厂口径的 {admitLenShip:F1} m"
+                            + $"（最小接手 {minHandoffRig:F1} → {minHandoffShip:F1} m）"
+                            + " —— 两趟必须量同一撮像素，比值才成立。");
+                ok &= maskStillValid;
+                if (!maskStillValid)
+                {
+                    sb.AppendLine("  ⇒ 复用的掩码在出厂几何下伸出了纯近层区，**本节不判**。");
+                    return false;
+                }
+
+                // ---- L 从体自己报的两端算，不在这里重写一遍几何 ----
+                //
+                // 比值能对消掉 C 与参考解残差的前提是**两趟的 far 完全相同**
+                // （err = C·L^p·(1/N^p − 1/256^p) 里只准 L 变）。far 由
+                // ResolveFarDistance(farDistanceMeters, maxShadowDistance) 给，
+                // 与 near 无关 —— 但「无关」是个可以被将来的改动推翻的性质，
+                // 所以这里判它，不是描述它。
+                var rRig  = readsRig .Find(r => r.slices == k_ShippingSlices);
+                var rShip = readsShip.Find(r => r.slices == k_ShippingSlices);
+
+                bool sameFar = Mathf.Abs(rShip.farM - rRig.farM) <= 1e-3f * Mathf.Max(1f, rRig.farM);
+                sb.AppendLine($"  {Mk(sameFar)}两趟的远边界相同：{rRig.farM:F3} m vs {rShip.farM:F3} m"
+                            + " —— 只准 near 变，far 一变 C 就不再对消，下面的比值失去意义。");
+                ok &= sameFar;
+                if (!sameFar)
+                {
+                    sb.AppendLine("  ⇒ 远边界跟着 near 动了，**比值不判**。");
+                    return false;
+                }
+
+                double La = System.Math.Log(rRig .farM / rRig .nearM);
+                double Lb = System.Math.Log(rShip.farM / rShip.nearM);
+
+                sb.AppendLine($"  ⓘ L = ln(far/near)：rig {La:F4}（near {rRig.nearM:F2} m）"
+                            + $" → 出厂 {Lb:F4}（near {rShip.nearM:F2} m），"
+                            + $"比值 {Lb / La:F5}（rig 比出厂严 {La / Lb:F3} 倍）。"
+                            + "切片密度只通过 L/N 这一个组合进入误差 ⇒ 这就是一阶预测值。");
+
+                sb.AppendLine();
+                sb.AppendLine("  ⑤a 出厂近裁剪面下的抖动关那一趟（与 ② 同配置，只有 near 不同）");
+                vf.jitterMode = JitterMode.Off;
+                bool okShip = Sweep(sb, vf, cam, rt, tex, admitted, phi, nAdmit,
+                                    Pass.JitterOff, out var errShip, out float floorShip,
+                                    out bool usableShip);
+                ok &= okShip;
+
+                // 注意这里**不是** `if (!okShip) return`。⑤a 的收敛阶判成什么，
+                // 与 ⑤b 能不能判是两件事：前者是同一批读数在 **N 方向**的比值，
+                // 后者是同一批读数在 **L 方向**的比值。⑤a 的阶一旦反常，⑤b 恰恰是
+                // 唯一能回答「这个反常是不是从 L/N 这个组合进来的」的读数 ——
+                // 此时把它关掉，等于把最该问的那个问题连同红一起丢了。
+                // 让一道门的裁决决定另一道门跑不跑，正是本文件在 ②/③ 上刚修掉的接线。
+                if (!usableShip)
+                {
+                    sb.AppendLine("  ⇒ 出厂几何这一趟的**读数本身**不成立（旋钮没响应），**比值不判**。");
+                    return false;
+                }
+
+                ok &= Scaling(sb, errRig, floorRig, errShip, floorShip, La, Lb);
+            }
+            finally
+            {
+                cam.nearClipPlane = nearRig;
+            }
+
+            return ok;
+        }
+
+        /// <summary>
+        /// 逐档比 <c>err(出厂 near) / err(rig near)</c> 与 <c>(L_b/L_a)^p</c>。
+        /// 带子是三个假设的几何中点（与 <see cref="Order"/> 同一套），
+        /// 前提是这一档的传播不确定度小于到最近带边的余量 —— 详见 <see cref="NearClipSweep"/>。
+        /// </summary>
+        static bool Scaling(StringBuilder sb, TierErr[] a, float floorA,
+                            TierErr[] b, float floorB, double La, double Lb)
+        {
+            double q  = Lb / La;
+            double p1 = q, p2 = q * q, p0 = 1.0;
+            double lo = System.Math.Sqrt(p1 * p2);   // 一阶 ↔ 二阶
+            double hi = System.Math.Sqrt(p0 * p1);   // 不收敛 ↔ 一阶
+
+            // 前提要多紧，由带子自己定：一阶预测到最近那条边的相对余量。
+            double margin = System.Math.Min((p1 - lo) / p1, (hi - p1) / p1);
+
+            sb.AppendLine();
+            sb.AppendLine($"  ⑤b 比值 err(出厂 near)/err(rig near) vs (L_b/L_a)^p"
+                        + $" —— 预测 一阶 {p1:F4} / 二阶 {p2:F4} / 不收敛 {p0:F4}"
+                        + $" ⇒ 带 [{lo:F4}, {hi:F4}]");
+            sb.AppendLine($"     判这一档的前提：传播不确定度 u ≤ 到最近带边的余量 {margin:P1}"
+                        + $"（u = √((σ_a/e_a)² + (σ_b/e_b)²)，σ 取各趟自己的地板 "
+                        + $"{Sci(floorA)} / {Sci(floorB)}）。"
+                        + $"**注意这里用不上 k_FloorHeadroom**：地板 × {k_FloorHeadroom:F0} "
+                        + "对应的 u 约 47%，比这条带子还宽 —— 那个前提在这一节根本不够紧。");
+
+            bool anyGated = false;
+            bool ok = true;
+            for (int k = 0; k < a.Length; k++)
+            {
+                double ea = a[k].p99, eb = b[k].p99;
+                double obs = ea > 0.0 ? eb / ea : double.NaN;
+                double u = (ea > 0.0 && eb > 0.0)
+                    ? System.Math.Sqrt((floorA / ea) * (floorA / ea) + (floorB / eb) * (floorB / eb))
+                    : double.PositiveInfinity;
+
+                bool tight  = u <= margin;
+                bool inBand = obs >= lo && obs <= hi;
+                anyGated |= tight;
+                if (tight) ok &= inBand;
+
+                sb.AppendLine($"     {(tight ? Mk(inBand) : "  ⓘ ")}N = {a[k].slices,3}："
+                            + $"{Sci(a[k].p99)} → {Sci(b[k].p99)}，比值 {obs:F4}"
+                            + $"，u = {u:P1}"
+                            + (tight
+                                ? (inBand ? "（在带内）" : "（**出带**）")
+                                : $"（u > 余量 {margin:P1} ⇒ **这一档不判**，"
+                                  + "读数被本趟地板糊住了，分不清三个假设）"));
+            }
+
+            if (!anyGated)
+            {
+                sb.AppendLine("     ✘ **没有任何一档的不确定度够小 ⇒ 本节整体不判**（计入未通过）。"
+                            + "「不可判定必须是缺口，不能是通过」。");
+                ok = false;
+            }
+
+            sb.AppendLine("     ⓘ 这个比值与 N 无关、也与常数 C 无关（参考解残差在两趟里同形对消），"
+                        + "所以它是对「误差是一阶的」这条结论的**正交**检验 —— "
+                        + "② 固定 L 改 N，这里固定 N 改 L。两者若给出不同的阶，"
+                        + "说明误差里有一块不是来自切片密度。");
+            return ok;
+        }
+
+        // ==================================================================== ⑥ 成本
 
         static void Cost(StringBuilder sb, List<TierRead> reads)
         {
-            sb.AppendLine("⑤ 成本（解析，**本判据不量毫秒**）");
+            sb.AppendLine("⑥ 成本（解析，**本判据不量毫秒**）");
             var baseRead = reads.Find(r => r.slices == k_ShippingSlices);
             foreach (var r in reads)
             {
