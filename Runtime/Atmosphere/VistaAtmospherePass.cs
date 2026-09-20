@@ -247,8 +247,20 @@ namespace Vista
             // 立方体面分辨率（如 256²）与主相机必然不同 —— 两者交替出现，就是每帧
             // Release() + Allocate() 三张 RGBA16F 3D 表。而反射探针本来也不需要近层雾：
             // 它烘的是天空的镜面反射，近处几十米的雾不进那张 cubemap。
+            //
+            // WantsNearLayer 那一项是后补的（#27 验收第 3 项查出来的）。在它之前，
+            // 档 D（AerialPerspective）下近层照跑一整套注入 + 积分，算完的表**没有任何
+            // 消费者** —— 下面 :490 那个 nearLayer 开关位是关的，AP 吃满雾。
+            // 实测白付 0.746 ms。
+            //
+            // 用 WantsNearLayer 而不是在这里把 `enabled && mode == Froxel` 再拼一遍：
+            // 那正是 UsesNearLayer 头注在防的走歧。而且方向是安全的 ——
+            // UsesNearLayer ⇒ WantsNearLayer，闸门只砍掉合成端本来就已经关掉的那些帧，
+            // 「近层认领了 [0,D] 的雾但采样端不去采」这种失效在这个形状下表达不出来。
+            // 判据⑱c（档 D 不该有光轴，期望值由镜像对称给出的精确 0）是它的回归护栏。
             bool froxelEnabled = m_VolumetricFog != null
                 && m_VolumetricFog.enableInjection
+                && m_FogSettings != null && m_FogSettings.WantsNearLayer
                 && m_Luts.froxelVolume != null && m_Luts.froxelVolume.isValid
                 && (cameraData.cameraType == CameraType.Game
                     || cameraData.cameraType == CameraType.SceneView);
@@ -485,8 +497,12 @@ namespace Vista
                 // 开关位与「雾怎么在两层之间分」**必须同一个谓词**（UsesNearLayer）：
                 // 走歧的后果是最坏的一种 —— 一边把 [0,D] 的雾判给了近层，
                 // 另一边却不去采近层的表，那段雾凭空消失，而两边各自看都自洽。
-                // 特别地，档 D（AerialPerspective）下 froxel 体可能仍然分配着，
-                // 但它不参与合成 —— 那正是档 D 的定义（雾全部并进 AP 的 march）。
+                //
+                // 档 D（AerialPerspective）下这里恒为 false —— 那正是档 D 的定义
+                // （雾全部并进 AP 的 march）。#27 验收第 3 项之前，档 D 下 froxel 体
+                // 仍然分配着、仍然每帧算完再丢掉；现在上面 :250 的闸门也看 WantsNearLayer 了，
+                // 于是「算了但不用」这个状态**不再存在**。两处走的是同一个谓词的两半，
+                // 不是两个碰巧一致的条件。
                 bool nearLayer = froxelEnabled && m_FogSettings != null
                     && m_FogSettings.UsesNearLayer(froxelDesc.handoffMeters);
                 data.froxelComposite = nearLayer

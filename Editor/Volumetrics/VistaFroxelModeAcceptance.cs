@@ -3,6 +3,7 @@ using UnityEditor;
 using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.Universal;
+using UnityEngine.SceneManagement;
 using static Vista.EditorTools.VistaFroxelShadowRig;
 
 namespace Vista.EditorTools
@@ -354,6 +355,26 @@ namespace Vista.EditorTools
             // 因为闸门（VistaAtmospherePass.cs 的 froxelEnabled）是按类型开的。
             bool camOk = cam.cameraType == CameraType.Game;
             sb.AppendLine($"  {Mark(camOk)}cameraType = {cam.cameraType}（闸门放行 Game / SceneView）");
+
+            // ---- 宿主场景：只打印，不判 ----
+            //
+            // 本布景是运行时搭的（自己的相机、自己的遮挡板、自己的太阳，
+            // cullingMask 只放自己那一层），所以「宿主场景无关」曾经是个合理假设。
+            // 它不成立：同一份代码在 Demo 里通过、在 Demo_Night 里三条门红两条，
+            // 而遮挡像素数逐位相同（20910/20992、6552/13312）—— 几何一格没动，
+            // 变的只有幅度。最硬的一格是缝内：那儿全程被太阳照到，开不开阴影查询
+            // 本该逐位相同，Demo 给 −2.7e-03（对称性要求的值），Demo_Night 给 −3.0。
+            //
+            // 已逐个 A/B 排除的：anisotropy、luminanceRejectStart、localLightMode、
+            // 场景的 EV100 覆盖、以及整份 Vista 代码与整份渲染器资产
+            // （两边都检出到八连绿那一刻的版本，照红）。
+            //
+            // 所以现在**写不出**一条正确的前提 —— 写了就是拍前提。
+            // 但「哪个场景开着」必须留在报表上：没有它，两份相反的读数
+            // 在报表上长得一模一样，而「一个非零的数回答不了它是从哪儿来的」。
+            // 查清之后这一行才该升格成门。
+            sb.AppendLine($"  ⓘ 宿主场景 = {SceneManager.GetActiveScene().name}"
+                        + "（本项对宿主场景敏感，成因未查清 —— 见 CHANGELOG 的这一条）");
 
             bool all = covered && sunOk && camOk;
             if (!all)

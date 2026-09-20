@@ -219,6 +219,21 @@ namespace Vista
         public const float k_HandoffBandFraction = 0.15f;
 
         /// <summary>
+        /// 配置层面要不要近层 —— <see cref="UsesNearLayer"/> 里**与这一帧无关**的那一半。
+        ///
+        /// 分出来是给 pass 的分配闸门用的：闸门必须在解出 handoff **之前**就决定要不要
+        /// 分配 froxel 体（handoff 是分配的产物，拿它当分配的前提是循环依赖），
+        /// 而它又不能自己把 <c>enabled &amp;&amp; mode == Froxel</c> 再拼一遍 ——
+        /// 那正是 <see cref="UsesNearLayer"/> 的头注在防的「两处各写一遍然后走歧」。
+        ///
+        /// 由此得到一条免费的保证：<c>UsesNearLayer ⇒ WantsNearLayer</c>。
+        /// 闸门只会砍掉 <c>WantsNearLayer</c> 为假的帧，而那些帧
+        /// <see cref="UsesNearLayer"/> 本来就是假的 ⇒ 分层与采样端不可能因此走歧。
+        /// 反过来写（闸门比合成**松**）才会出事，那种形状在这里表达不出来。
+        /// </summary>
+        public bool WantsNearLayer => enabled && mode == Mode.Froxel;
+
+        /// <summary>
         /// 这一帧到底有没有「近层」。<paramref name="handoffMeters"/> 是 pass 那边
         /// 解出来的接手距离（0 = froxel 体这一帧不存在）。
         ///
@@ -229,7 +244,7 @@ namespace Vista
         /// 另一边却不去采那张表 —— 那段雾**凭空消失**，而两边各自看都是自洽的。
         /// </summary>
         public bool UsesNearLayer(float handoffMeters)
-            => enabled && mode == Mode.Froxel && handoffMeters > 0f;
+            => WantsNearLayer && handoffMeters > 0f;
 
         /// <summary>
         /// x: 近层接手距离 D (km), y: 交接带宽度 (km), z: 1/交接带宽度 (1/km), w: 保留。
