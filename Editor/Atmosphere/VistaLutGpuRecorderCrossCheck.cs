@@ -3,6 +3,7 @@ using System.Text;
 using Unity.Profiling;
 using UnityEditor;
 using UnityEngine;
+using UnityEngine.Rendering.Universal;
 
 namespace Vista.Editor
 {
@@ -1164,8 +1165,28 @@ namespace Vista.Editor
                   .Append(s_WantsNearA.HasValue ? "" : "（**A 档快照缺失，取的是现场值**）")
                   .Append(" ⇒ 期望 ").Append(froxelExpected ? "这两趟每帧都在" : "这两趟零样本")
                   .Append("　screenDivisor ").Append(divA)
-                  .Append("　slices ").Append(fogCfg.sliceCount)
-                  .Append("　远边界 ").Append(fogCfg.depth.ToString("F1")).Append(" m");
+                  .Append("　slices ").Append(fogCfg.sliceCount);
+                // 这里曾经写的是 `fogCfg.depth`，而 depth 是**切片数**（Clamp(sliceCount,2,256)），
+                // 不是距离 —— 于是「slices 64」与「远边界 64.0 m」是同一个数印了两遍，
+                // 其中一遍挂了错的单位。它能活这么久，是因为 farDistanceMeters 的**旧默认值**
+                // 恰好也是 64：两个来源不同的数碰巧相等，报表就看不出不一致。
+                // 「一个非零的数回答不了它是从哪儿来的」—— 所以下面把来源一并印出来。
+                //
+                // 印两个数而不是一个：请求值来自资产，生效值还要被阴影距离夹一道
+                // （ResolveFarDistance 抽成 static 纯函数就是为了在这种地方能直接调）。
+                // 只印生效值的话，「美术填了 400、被夹到 150」会长得和「美术填了 150」一样。
+                // 已知不完整：URP 的 maxShadowDistance 还会被相机 farClipPlane 砍一刀，
+                // 这里拿不到那个相机，所以这个生效值是**上界**，正文如实这么写。
+                float farReq = fogCfg.farDistanceMeters;
+                float shadowDist = UniversalRenderPipeline.asset != null
+                    ? UniversalRenderPipeline.asset.shadowDistance : 0f;
+                float farEff = VistaVolumetricFogSettings.ResolveFarDistance(
+                    farReq, shadowDist, out string farClampNote);
+                sb.Append("　远边界 请求 ").Append(farReq.ToString("F1")).Append(" m");
+                if (farClampNote != null)
+                    sb.Append(" → 被 shadow distance ").Append(shadowDist.ToString("F1"))
+                      .Append(" m 夹到 ").Append(farEff.ToString("F1")).Append(" m");
+                sb.Append("（未计相机 farClipPlane 的那一刀，故为上界）");
                 var gameRes = UnityEditor.Handles.GetMainGameViewSize();
                 int vx = Mathf.Max(1, Mathf.CeilToInt(gameRes.x / divA));
                 int vy = Mathf.Max(1, Mathf.CeilToInt(gameRes.y / divA));
