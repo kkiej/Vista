@@ -124,10 +124,11 @@ namespace Vista.Editor
         ///    那个和就不再对应 0.170~0.198 ms 这个区间，对账当场失效 ——
         ///    与 k_CompositeIdx ② 是同一条理由。
         ///
-        /// ② **期望值依赖配置。** enableInjection 默认关着；关着的时候这两趟零样本是
+        /// ② **期望值依赖配置。** 闸门有两个配置操作数：<c>enableInjection</c>（默认关着）
+        ///    与 <c>fog.WantsNearLayer</c>（档位是不是 Froxel）。任一为假时这两趟零样本是
         ///    **完全正确**的状态。写死"每帧都该在"会在一个合法布景上红 ——
         ///    「一道只看配置、不看运行期剔除的门，会在一个完全合法的布景上红」。
-        ///    所以下面先读 feature.volumetricFog.enableInjection 再定期望。
+        ///    所以下面两个都读了再定期望（见 <c>froxelExpected</c>）。
         ///
         /// ③ **成本随屏幕分辨率变**（体的 XY = 屏幕 / screenDivisor），
         ///    与 LUT 那五个的定值口径不同，所以同样不能按出现次数相除。
@@ -220,9 +221,27 @@ namespace Vista.Editor
         /// 而实现若真的没关掉，比值会在 1.0 附近 —— 两种情形隔着三倍，不会误判。
         const double k_MaxNoInjectionResidual = 0.30;
 
-        /// 「切档省下的占近层总成本的比例」低于这个数时，报告要明说切档几乎没省钱。
-        /// 这是一条**只报不判**的线，理由写在档位对照那一节里。
-        const double k_ModeSavingNotable = 0.10;
+        /// 切到 AP 档必须省下的、占近层总成本（A − D）的**比例**下界。
+        ///
+        /// 这一行曾经是 0.10 的「只报不判」线：那时 <c>froxelEnabled</c> 不看 <c>fog.mode</c>，
+        /// AP 档下注入与积分照跑、产物直接扔掉，实测 C − D = 0.746 ms 全是白付的，
+        /// 占比 1% 上下。当时把它做成门等于一格恒红，而**一格恒红的判据不是判据**。
+        ///
+        /// <c>froxelEnabled</c> 挂上 <c>WantsNearLayer</c> 之后这一栏才有可能绿，
+        /// 门也就该跟着立起来 —— 那条改动的价值全部落在这一栏上，
+        /// 没有这道门，它明天被谁改回去，报告上不会有任何反应
+        /// （「一条只写在注释里的恒等式不会自己失败」）。
+        ///
+        /// 为什么是 0.90 而不是 1.00：理想值确实是 1.00（C 档两趟应当零样本，
+        /// 于是 C ≡ D）。但 A − C 与 A − D 是**两次独立采样的中位数之差**，
+        /// 三档之间隔着上千帧，比值天然带几个百分点的抖动；摆在 1.00 等于要求
+        /// 两次采样逐位相等，那会把一次正确的运行判红。
+        /// 而实现若退回旧行为，占比会掉到 0.10 以下 —— 两种情形隔着九倍，不会误判。
+        ///
+        /// 与 <see cref="k_MaxNoInjectionResidual"/> 的分工：那一道问「关掉注入是不是真的不跑了」
+        /// （D 相对 A），这一道问「切档是不是真的等于关掉注入」（C 相对 D）。
+        /// 前者塌了后者无意义，所以前者先判、红了这一道不再给结论。
+        const double k_MinModeSaving = 0.90;
 
         /// 翻给 debugView 的档位。选 IntegralRgb 而不是 SingleSlice：
         /// 后者要一个合法的切片下标，而那是另一个可能配错的量 ——
@@ -334,6 +353,19 @@ namespace Vista.Editor
         /// 打印发生在复位之后，现场读到的是被还原的值，正文会宣称一个与 B 档读数不符的配置。
         static int s_DivA, s_DivB;
 
+        /// A 档起采样那一刻的 <c>fog.WantsNearLayer</c>。理由与 <see cref="s_DivA"/> 逐字相同，
+        /// 但这一项更容易骗过人：报告打印发生在 <see cref="RestoreMode"/> 之后，
+        /// 现场读到的值与 A 档**碰巧相等**，于是「现场读」这条错路会一直看起来是对的，
+        /// 直到有谁调整了复位顺序 —— 那天正文会变成一句假话，而没有任何提示。
+        ///
+        /// 存的是**谓词本身**而不是 <c>mode</c>：这里要的就是 pass 侧闸门用的那个布尔，
+        /// 在这儿把 <c>enabled &amp;&amp; mode == Froxel</c> 再拼一遍就是第二份实现，
+        /// 而两份实现走歧的那天，尺子会站在错的那一边。
+        ///
+        /// 可空：null = 这一档压根没跑到（本次中止/读的是陈旧状态）。
+        /// 拿 false 当「没记到」会让**不可判定**在报表上长得和**期望零样本**一模一样。
+        static bool? s_WantsNearA;
+
         /// C/D 两档起采样那一刻读到的 divisor 与 A 档不符时记在这里。
         ///
         /// 为什么要专门留一个字段：C/D 是拿来**和 A 比**的，前提是除了那一个旋钮之外
@@ -426,6 +458,7 @@ namespace Vista.Editor
                 s_InjectionSaved = null;
                 s_DivA = 0;
                 s_DivB = 0;
+                s_WantsNearA = null;
                 s_DivMismatch = null;
                 s_StatGpu = null;
                 s_StatCpu = null;
@@ -571,6 +604,15 @@ namespace Vista.Editor
                     else if (div != s_DivA && s_DivMismatch == null)
                         s_DivMismatch = $"{(s_Phase == k_PhaseApMode ? "C" : "D")} 档起采样时 "
                                       + $"screenDivisor = {div}，而 A 档是 {s_DivA} —— 复位没生效";
+
+                    // 档位谓词只在 A 档记一次。C 档故意是另一个值（那正是本次要翻的旋钮），
+                    // 所以这里**不能**照抄上面 divisor 那种「其余档必须与 A 相同」的核对 ——
+                    // 那会把一次正确的 C 档运行判成配置不符。
+                    if (s_Phase == k_PhaseA)
+                    {
+                        var f = VistaAtmosphereFeature.current?.fog;
+                        s_WantsNearA = f != null ? f.WantsNearLayer : (bool?)null;
+                    }
                 }
 
                 s_Started = true;
@@ -709,17 +751,22 @@ namespace Vista.Editor
         /// 用户点名要的那份性能对照，也是任何一个接手这套雾的人第一个会问的问题。
         ///
         /// ── 为什么它单独成一档、而不是拿 D 档（注入关）去代表 AP 档 ──
-        /// 因为这两件事在本实现里**不是同一件事**，而这个差别正是本节要量的东西：
-        /// <c>VistaAtmospherePass.cs:250</c> 的 froxelEnabled 只看 enableInjection
-        /// 与相机类型，**根本不看 fog.mode**；mode 只在 :490 决定合成时采不采近层的表
-        /// （那一行的注释自己就写着「档 D 下 froxel 体可能仍然分配着，但它不参与合成」）。
-        /// 也就是说切到 AP 档之后，注入与积分照跑，产物直接扔掉。
-        /// 若拿 D 档冒充 AP 档，报出来的「切档省了 X 毫秒」是一个**在产品里拿不到**的数。
+        /// 因为「切档」与「关注入」是两条不同的路径，而它们**应当**给出同一个数 ——
+        /// 这一节量的就是这句「应当」。
         ///
-        /// 所以三档一起才能把话说全：
+        /// 这段历史值得留着：曾经这两件事在本实现里根本不是同一件事。
+        /// <c>froxelEnabled</c> 那时只看 <c>enableInjection</c> 与相机类型，
+        /// **不看 <c>fog.mode</c>**；mode 只决定合成时采不采近层的表。
+        /// 于是切到 AP 档之后注入与积分照跑，产物直接扔掉 —— 实测白付 0.746 ms。
+        /// 那时若拿 D 档冒充 AP 档，报出来的「切档省了 X 毫秒」是一个
+        /// **在产品里拿不到**的数。现在闸门挂上了 <c>WantsNearLayer</c>，C 应当塌到 D，
+        /// 但这一档仍不能并掉：它塌不塌正是下面那道「切档必须省下九成」在判的事，
+        /// 把它并掉等于把判据的两个操作数合成一个，那样它永远相等。
+        ///
+        /// 三个差各自回答一个问题：
         ///   A − C ＝ 切档**实际**省下的
         ///   A − D ＝ 近层这一整套一共值多少
-        ///   C − D ＝ 切了档还在白交的钱
+        ///   C − D ＝ 切了档还在白交的钱（现在应当 ≈ 0）
         ///
         /// ── 为什么先 RestoreDivisor ──
         /// C/D 是拿来和 A 比的。若还停在 B 档减半的 divisor 上，近层的线程数是 A 的四倍，
@@ -1087,7 +1134,22 @@ namespace Vista.Editor
             // froxel 的两个尺寸旋钮决定了注入/积分的线程数，也就是它们的成本。
             // 不印的话，两次运行之间的差会被归因到代码，而实际上可能只是有人改了 divisor。
             var fogCfg = feature != null ? feature.volumetricFog : null;
-            bool froxelExpected = fogCfg != null && fogCfg.enableInjection;
+
+            // 期望值必须与 pass 侧那个闸门**同形**。闸门现在是
+            //   enableInjection && fog.WantsNearLayer && 体有效 && 相机类型
+            // 前两项是配置，能在这里复现；后两项是运行期的，复现不了也不该复现
+            // （复现等于把被测逻辑抄一份到尺子里，那样尺子永远同意被测对象）。
+            //
+            // 为什么非补 WantsNearLayer 不可：少了它，出货配置一旦选 AerialPerspective，
+            // 这份报表就会要求两趟不该跑的 pass 交出样本，然后在一个完全合法的布景上红 ——
+            // 「一道只看配置、不看运行期剔除的门，会在一个完全合法的布景上红」。
+            //
+            // 读 s_WantsNearA（A 档起采样那一刻的快照）而不是现场读：见该字段的注释。
+            // 快照缺失时退回现场读，并在正文上标出来 —— 不静默：一个读数说不清
+            // 自己是从哪一档来的，就不该看起来和正常读数一样。
+            bool wantsNearLive = feature != null && feature.fog != null && feature.fog.WantsNearLayer;
+            bool wantsNear = s_WantsNearA ?? wantsNearLive;
+            bool froxelExpected = fogCfg != null && fogCfg.enableInjection && wantsNear;
             if (fogCfg != null)
             {
                 // divisor 印 s_DivA（A 档采样启动那一刻记下的值），不印 fogCfg.screenDivisor：
@@ -1095,7 +1157,12 @@ namespace Vista.Editor
                 // 一旦将来复位顺序变了，正文会跟着变成一句假话而没有任何提示。
                 // 让正文的配置与正文的数字来自同一次快照，是它们不会互相说谎的唯一保证。
                 int divA = s_DivA > 0 ? s_DivA : Mathf.Clamp(fogCfg.screenDivisor, 2, 16);
-                sb.Append("　 近层 froxel：enableInjection ").Append(froxelExpected ? "开" : "**关**")
+                // 两个操作数分开印。合成一个「开/关」的话，下面那几行「0 个样本是期望」
+                // 就说不清期望是谁给的 —— 而这正是本次要区分的两件事。
+                sb.Append("　 近层 froxel：enableInjection ").Append(fogCfg.enableInjection ? "开" : "**关**")
+                  .Append("　WantsNearLayer ").Append(wantsNear ? "真" : "**假**")
+                  .Append(s_WantsNearA.HasValue ? "" : "（**A 档快照缺失，取的是现场值**）")
+                  .Append(" ⇒ 期望 ").Append(froxelExpected ? "这两趟每帧都在" : "这两趟零样本")
                   .Append("　screenDivisor ").Append(divA)
                   .Append("　slices ").Append(fogCfg.sliceCount)
                   .Append("　远边界 ").Append(fogCfg.depth.ToString("F1")).Append(" m");
@@ -1206,19 +1273,26 @@ namespace Vista.Editor
 
                 if (isFroxel)
                 {
-                    // 期望值**读配置**，不写死。enableInjection 关着的时候零样本是
-                    // 完全正确的状态，一道只看「每帧都该在」的门会在一个合法布景上红。
+                    // 期望值**读配置**，不写死。闸门的两个配置操作数（enableInjection、
+                    // WantsNearLayer）任一为假时零样本都是完全正确的状态，
+                    // 一道只看「每帧都该在」的门会在一个合法布景上红。
                     if (!froxelExpected)
                     {
+                        bool injOn = fogCfg != null && fogCfg.enableInjection;
+                        string why = fogCfg == null
+                            ? "取不到 volumetricFog 配置"
+                            : !injOn
+                                ? (wantsNear ? "enableInjection 关着" : "enableInjection 关着且档位不是 Froxel")
+                                : "档位不是 Froxel（WantsNearLayer 假）";
                         if (g.count == 0 && c.count == 0)
                         {
-                            sb.Append("enableInjection 关着：0 个样本（**这是期望**）　"
+                            sb.Append(why).Append("：0 个样本（**这是期望**）　"
                                     + "→ 这一趟的耗时本次未测，不是「很便宜」");
                         }
                         else
                         {
                             froxelUnexpected++;
-                            sb.Append("**enableInjection 关着却在跑**：GPU min ")
+                            sb.Append("**").Append(why).Append("却在跑**：GPU min ")
                               .Append(g.minMs.ToString("F3"))
                               .Append(" ms　帧 ").Append(g.count).Append("/").Append(k_SampleFrames)
                               .Append("　→ 关态没有真正关掉，白烧（画面上看不出来）");
@@ -1269,7 +1343,7 @@ namespace Vista.Editor
                     {
                         froxelMissing++;
                         froxelComplete = false;
-                        sb.Append("**一个样本都没有**，而 enableInjection 是开着的（GPU valid=")
+                        sb.Append("**一个样本都没有**，而 enableInjection 开着、档位也是 Froxel（GPU valid=")
                           .Append(g.valid).Append("，CPU valid=").Append(c.valid)
                           .Append("）　→ pass 名走歧、或这一趟被运行期条件剪掉了"
                                 + "（体积无效 / 相机类型不符）");
@@ -1528,10 +1602,17 @@ namespace Vista.Editor
                     Stat injC = s_StatGpuC[iInj], intC = s_StatGpuC[iInt];
                     Stat injD = s_StatGpuD[iInj], intD = s_StatGpuD[iInt];
 
-                    // D 档期望零样本，所以**不能**要求 D 有样本 —— 那正好把健康状态判成缺口。
-                    // A/C 两档则必须有：它们是分母。
+                    // C/D 两档都**期望零样本**，所以不能要求它们有样本 ——
+                    // 那正好把健康状态判成缺口。本次就撞上了：闸门挂上 WantsNearLayer 之后
+                    // C 档真的不跑了，而旧的前提写着「C 必须有样本」，于是这一整节
+                    // 在改动生效的那一刻报了「不可判定」。**一个改对了就判不出来的判据
+                    // 不是这件事的判据。**
+                    //
+                    // 只有 A 档必须有样本：它是分母，也是这一节唯一的正向读数。
+                    // 把 C/D 的零样本读成 0 ms 是**有前提**的，前提是 pass 名验证那一节
+                    // 已经证明这两个名字拼对了、而且同一次运行的 A 档在这两个名字底下
+                    // 收到了几百个样本 —— 没有那两条，「零样本」与「名字打错」逐字相同。
                     bool have = injA.count > 0 && intA.count > 0
-                             && injC.count > 0 && intC.count > 0
                              && injA.medMs > 0.0 && intA.medMs > 0.0;
                     // ---- 整机状态漂移的对照项 ----
                     //
@@ -1560,7 +1641,8 @@ namespace Vista.Editor
                     if (!have)
                     {
                         modeGap = 1;
-                        sb.AppendLine("　　 **不可判定**：A 或 C 档没采到注入/积分的样本，差值算不出来。");
+                        sb.AppendLine("　　 **不可判定**：A 档没采到注入/积分的样本，分母算不出来。"
+                                    + "（C/D 两档零样本是期望，不算缺口。）");
                     }
                     else if (!ctlSteady)
                     {
@@ -1583,7 +1665,8 @@ namespace Vista.Editor
                         // 在报告上长得一模一样，而这两件事该做的下一步不同。
                         sb.Append("　　 （仅供参考，**不可引用**）近层合计 A ")
                           .Append((injA.medMs + intA.medMs).ToString("F3"))
-                          .Append("　C ").Append((injC.medMs + intC.medMs).ToString("F3"))
+                          .Append("　C ").Append(((injC.count > 0 ? injC.medMs : 0.0)
+                                                + (intC.count > 0 ? intC.medMs : 0.0)).ToString("F3"))
                           .Append("　D ").Append(((injD.count > 0 ? injD.medMs : 0.0)
                                                 + (intD.count > 0 ? intD.medMs : 0.0)).ToString("F3"))
                           .AppendLine(" ms");
@@ -1591,7 +1674,10 @@ namespace Vista.Editor
                     else
                     {
                         double nearA = injA.medMs + intA.medMs;
-                        double nearC = injC.medMs + intC.medMs;
+                        // C 档与 D 档同一个读法：没有样本就是这两趟没跑，成本 0 ms。
+                        // 前提与 nearD 那一行逐字相同，写在上面 have 的注释里。
+                        double nearC = (injC.count > 0 ? injC.medMs : 0.0)
+                                     + (intC.count > 0 ? intC.medMs : 0.0);
                         // D 档没有样本 ⇒ 这两趟没跑 ⇒ 成本就是 0。这里把「零样本」读成 0 ms
                         // 是**有前提**的：前提是上面那一节已经证明这两个名字拼对了
                         // （pass 名验证）。没有那一节，零样本与名字打错逐字相同。
@@ -1600,12 +1686,12 @@ namespace Vista.Editor
 
                         sb.Append("　　 ").Append(k_PassNames[iInj].PadRight(30))
                           .Append("中位 A ").Append(injA.medMs.ToString("F3"))
-                          .Append("　C ").Append(injC.medMs.ToString("F3"))
+                          .Append("　C ").Append(injC.count > 0 ? injC.medMs.ToString("F3") : "—（零样本）")
                           .Append("　D ").Append(injD.count > 0 ? injD.medMs.ToString("F3") : "—（零样本）")
                           .AppendLine(" ms");
                         sb.Append("　　 ").Append(k_PassNames[iInt].PadRight(30))
                           .Append("中位 A ").Append(intA.medMs.ToString("F3"))
-                          .Append("　C ").Append(intC.medMs.ToString("F3"))
+                          .Append("　C ").Append(intC.count > 0 ? intC.medMs.ToString("F3") : "—（零样本）")
                           .Append("　D ").Append(intD.count > 0 ? intD.medMs.ToString("F3") : "—（零样本）")
                           .AppendLine(" ms");
                         sb.Append("　　 近层合计　　　　　　　　　　　 A ").Append(nearA.ToString("F3"))
@@ -1634,27 +1720,39 @@ namespace Vista.Editor
 
                         if (totalNear > 1e-6)
                         {
+                            // ---- 门：切档必须省下九成 ----
+                            //
+                            // 判的不是「省了多少毫秒」而是「C 档是不是真的等于 D 档」：
+                            // 近层那几趟 pass 在 AP 档下应当**根本不进图**，于是 C ≡ D、占比 ≡ 1。
+                            // 旧实现里它是 1% 上下（注入照跑、产物扔掉），两种情形隔着九倍。
+                            //
+                            // 这道门与它上面那道是串的，不是并的：D/A 若没通过，
+                            // 「近层总价」这个分母本身就不可信，此时再判占比是拿一把
+                            // 已经知道不准的尺子去量第二件事。所以 injOff 红了这里不给结论。
                             double share = savedByMode / totalNear;
                             sb.Append("　　 切档省下的占近层总价 ").Append(share.ToString("P0"));
-                            if (share < k_ModeSavingNotable)
+
+                            if (!injOff)
                             {
-                                // 这不是一次意外，是照着代码写死的行为，所以这里指名道姓给出行号：
-                                // 一条说得出「在哪一行」的结论，读者可以三十秒内自己证伪。
-                                sb.AppendLine("　　←**切档几乎不省钱**");
-                                sb.AppendLine("　　 → 成因不是测量误差，是实现如此："
-                                            + "VistaAtmospherePass.cs:250 的 froxelEnabled 只看 "
-                                            + "enableInjection 与相机类型，**不看 fog.mode**；"
-                                            + "mode 只在 :490 决定合成时采不采近层的表。"
-                                            + "于是 AP 档下注入与积分照跑，产物直接扔掉。");
-                                sb.AppendLine("　　 → 这一栏**只报不判**：把它做成门的话它今天必红，"
-                                            + "而一格恒红的判据不是判据。要让它能绿，"
-                                            + "得先改运行期行为（把 froxelEnabled 也挂上 UsesNearLayer），"
-                                            + "那是一次会改画面与生命周期的改动，得单独立项讨论；"
-                                            + "改完之后这一栏连同一道「切档必须省下九成」的门一起补上。");
+                                sb.AppendLine("　　←**不判**（上一道门已红，分母不可信）");
                             }
                             else
                             {
-                                sb.AppendLine("　　（切档确实省下了大部分近层成本）");
+                                bool modeSaves = share >= k_MinModeSaving;
+                                if (!modeSaves) modeGap = 1;
+                                sb.Append("　　判据：≥ ").Append(k_MinModeSaving.ToString("P0"))
+                                  .Append(" —— ").AppendLine(modeSaves ? "通过" : "**不通过**");
+                                if (!modeSaves)
+                                {
+                                    // 指名道姓给出该去看哪一行：一条说得出「在哪一行」的结论，
+                                    // 读者可以三十秒内自己证伪。
+                                    sb.AppendLine("　　 → 切到 AP 档之后近层那几趟还在跑，产物却不参与合成 —— 白付。"
+                                                + "去看 VistaAtmospherePass.cs 里 froxelEnabled 的那个闸门："
+                                                + "它必须同时要求 m_FogSettings.WantsNearLayer，"
+                                                + "否则 mode 只在合成那一侧生效，dispatch 照发。");
+                                    sb.AppendLine("　　 → 这正是本门存在的理由：那条闸门是一行布尔，"
+                                                + "被谁顺手改回去时画面一帧都不会变。");
+                                }
                             }
                         }
                         else
