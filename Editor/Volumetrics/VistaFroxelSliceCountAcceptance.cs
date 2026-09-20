@@ -65,6 +65,14 @@ namespace Vista.EditorTools
     /// 第一版这份注释里写的是出厂相机的 123.5 m，跑出来才发现读的是 119.4 m：
     /// **一个非零的数回答不了它是从哪儿来的**，所以上面那一串改成了实测值。
     ///
+    /// ── 参考解夹逼每一档，地板用同一个估计量 ──
+    /// 第一版一趟只渲头尾两张参考图，四档全拿头一张去比 ⇒ 最后一档承担了整趟漂移，
+    /// 而那恰好是地板门盯着的那一档。出厂档那一趟就红在这里（详见 <c>Sweep</c> 的头注）。
+    /// 现在是 <c>ref₀ → 16 → ref₁ → 32 → ref₂ → 64 → ref₃ → 128 → ref₄</c>，
+    /// 每档比两侧参考图的逐像素平均，地板则拿**中间那张参考图**比它两侧的平均
+    /// —— 那个量的真值按构造恒为 0，时间间距与每一档的测量完全相同。
+    /// 阈值、分位数、收敛阶的接受带一个都没动：变的是尺子，不是门。
+    ///
     /// ── 两趟：抖动关 / 出厂档 ──
     /// 抖动关（<c>JitterMode.Off</c>，同时也关掉时间重投影）量的是**纯空间离散化**，
     /// 上面那条收敛阶预测只在这一趟成立。出厂档（程序化抖动 + 重投影）里误差含
@@ -516,52 +524,108 @@ namespace Vista.EditorTools
         // ==================================================================== ②③ 扫描
 
         /// <summary>
-        /// 一趟扫描：参考解 → 地板 → 四档 → 参考解重跑（漂移地板）。
+        /// 一趟扫描。参考解**夹逼**每一档：
+        /// <c>ref₀ → 16 → ref₁ → 32 → ref₂ → 64 → ref₃ → 128 → ref₄</c>，
+        /// 第 k 档比的是它两侧参考图的**逐像素平均** (ref_k + ref_{k+1})/2。
+        ///
+        /// ── 为什么改成夹逼（这一段是第一次跑之后补的，得说清楚它不是在松门）──
+        /// 第一版一趟只渲两张参考图（头一张、尾一张），四档全部拿**头一张**去比。
+        /// 于是 128 片（最后一档）承担了几乎整趟的机器漂移，而它恰好是
+        /// <see cref="k_FloorHeadroom"/> 那道门盯着的那一档 —— 出厂档那一趟就红在这里：
+        /// 最细档 p99 5.739e-03 &lt; 地板 4.877e-03 × 3，而地板里占大头的不是邻帧抖动
+        /// （2.057e-03）而是整趟漂移。三档读数全和地板同量级、且不单调（128 比 64 还差），
+        /// 于是收敛阶与 Weber 都判不了。
+        ///
+        /// **改的是估计量，不是门。** 阈值（×3）、判的分位数（p99）、收敛阶的接受带
+        /// 一个都没动。动的是两件事，而且两件必须一起动：
+        ///   ① 每一档与**时间上最近**的参考解比，线性漂移在两侧平均里一阶对消；
+        ///   ② 地板改用**同一个估计量**去量 —— 拿中间那张参考图 ref_j 当「被测档」，
+        ///      比它两侧的 ref_{j−1}、ref_{j+1} 的平均。那个量的真值**按构造恒为 0**，
+        ///      所以它报出来的全是尺子自己的抖动 + 残余漂移，时间间距还与
+        ///      每一档的测量完全相同。
+        /// 只做 ① 不做 ② 才是松门：那会拿一个旧口径的地板去卡一个新口径的误差。
+        ///
+        /// 旧口径的整趟漂移仍然算出来、以 ⓘ 印在报表上，因为
+        /// **「夹逼买到了多少」本身是个需要被看见的读数** —— 若这两个数差不多，
+        /// 说明漂移不是线性的，那这次改动没解决问题，报表必须能说出这件事。
         /// </summary>
         static bool Sweep(StringBuilder sb, VistaVolumetricFogSettings vf, Camera cam,
                           RenderTexture rt, Texture2D tex,
                           bool[] admitted, float[] phi, int nAdmit,
                           bool gateOrder, out TierErr[] errs)
         {
-            errs = new TierErr[k_Tiers.Length];
+            int K = k_Tiers.Length;
+            errs = new TierErr[K];
             bool ok = true;
 
-            vf.sliceCount = k_RefSlices;
-            float[] refImg = CaptureLuminance(cam, rt, tex, k_SettleFramesTier);
+            var refs   = new float[K + 1][];
+            var tierPx = new float[K][];
 
-            // 地板：什么都不改，只再渲一帧。「地板的定义是相邻两帧之间它自己动多少」，
+            vf.sliceCount = k_RefSlices;
+            refs[0] = CaptureLuminance(cam, rt, tex, k_SettleFramesTier);
+
+            // 邻帧地板：什么都不改，只再渲一帧。「地板的定义是相邻两帧之间它自己动多少」，
             // 给它也空转 64 帧量到的是另一个量（⑱ 同一条理由）。
+            // 它不是下面那道门的主地板，但保留着：它把「帧间抖动」与「跑间漂移」分开，
+            // 而这两者的比例正是 ⑱ 那笔漂移债要查的东西。
             float[] refNext = CaptureLuminance(cam, rt, tex, 1);
 
-            float denom = Mathf.Max(MedianOver(refImg, admitted, nAdmit) * k_DenomFloorFraction,
+            float denom = Mathf.Max(MedianOver(refs[0], admitted, nAdmit) * k_DenomFloorFraction,
                                     1e-12f);
-            float floorAdj = RelQuantile(refImg, refNext, admitted, denom, k_JudgedQuantile);
+            float floorAdj = RelQuantile(refs[0], refNext, admitted, denom, k_JudgedQuantile);
 
-            for (int k = 0; k < k_Tiers.Length; k++)
+            for (int k = 0; k < K; k++)
             {
                 vf.sliceCount = k_Tiers[k];
-                float[] img = CaptureLuminance(cam, rt, tex, k_SettleFramesTier);
-                errs[k] = Measure(k_Tiers[k], refImg, img, admitted, phi, denom);
+                tierPx[k] = CaptureLuminance(cam, rt, tex, k_SettleFramesTier);
+
+                vf.sliceCount = k_RefSlices;
+                refs[k + 1] = CaptureLuminance(cam, rt, tex, k_SettleFramesTier);
             }
 
-            // 漂移地板：整趟跑完之后把参考解原样再跑一次。
-            // 邻帧地板量不到「16 → 128 这四档之间机器自己漂了多少」，而每一档的
-            // err(N) 都是拿**这趟最开始**那张参考图去比的 —— 那段漂移全记在 err 上。
-            vf.sliceCount = k_RefSlices;
-            float[] refEnd = CaptureLuminance(cam, rt, tex, k_SettleFramesTier);
-            float floorDrift = RelQuantile(refImg, refEnd, admitted, denom, k_JudgedQuantile);
+            for (int k = 0; k < K; k++)
+                errs[k] = Measure(k_Tiers[k], Mid(refs[k], refs[k + 1]),
+                                  tierPx[k], admitted, phi, denom);
 
-            float floor = Mathf.Max(floorAdj, floorDrift);
+            // ---- 地板：同一个估计量，真值按构造恒为 0 ----
+            // ref_j 与它两侧参考图的平均之差。j 只能取内点 ⇒ K−1 个样本。
+            // 取**最大**而不是中位数：三个样本的中位数太脆，而取最大只会让门更难过
+            // —— 方向是「宁可不可判定，不可假通过」。这个偏保守的取法要说出来，
+            // 因为每一档的误差是单次抽样、地板却是三抽取大，两者口径本来就不完全对称。
+            float floorBracket = 0f;
+            var bracketSamples = new List<float>();
+            for (int j = 1; j < K; j++)
+            {
+                float f = RelQuantile(Mid(refs[j - 1], refs[j + 1]), refs[j],
+                                      admitted, denom, k_JudgedQuantile);
+                bracketSamples.Add(f);
+                floorBracket = Mathf.Max(floorBracket, f);
+            }
 
-            sb.AppendLine($"  参考解 N = {k_RefSlices}；采纳集中位亮度 "
-                        + $"{Sci(MedianOver(refImg, admitted, nAdmit))}，"
+            // 旧口径：头尾两张参考图之差。只入 ⓘ —— 它现在不卡任何东西，
+            // 但它是「夹逼买到了多少」的唯一读数。
+            float driftWhole = RelQuantile(refs[0], refs[K], admitted, denom, k_JudgedQuantile);
+
+            float floor = Mathf.Max(floorAdj, floorBracket);
+
+            sb.AppendLine($"  参考解 N = {k_RefSlices}，**夹逼**（ref₀→16→ref₁→32→ref₂→64→ref₃→128→ref₄，"
+                        + $"每档比两侧参考图的逐像素平均）；采纳集中位亮度 "
+                        + $"{Sci(MedianOver(refs[0], admitted, nAdmit))}，"
                         + $"相对差分母下限 {Sci(denom)}"
                         + $"（= 中位数 × {k_DenomFloorFraction:0.###e+00}）");
-            sb.AppendLine($"  地板 p99：邻帧 {Sci(floorAdj)}，整趟漂移 {Sci(floorDrift)}"
-                        + $" ⇒ 取大者 {Sci(floor)}"
-                        + (floorDrift > floorAdj
-                            ? "（漂移更大 —— 说明这趟里机器自己动得比邻帧抖动多）"
-                            : "（邻帧更大 —— 这趟没有可观测的单调漂移）"));
+
+            var bs = new StringBuilder();
+            for (int j = 0; j < bracketSamples.Count; j++)
+                bs.Append(j == 0 ? "" : ", ").Append(Sci(bracketSamples[j]));
+            sb.AppendLine($"  地板 p99：邻帧 {Sci(floorAdj)}；夹逼地板 {{{bs}}} ⇒ 取最大 {Sci(floorBracket)}"
+                        + $" ⇒ 本趟地板 {Sci(floor)}"
+                        + (floorBracket > floorAdj
+                            ? "（夹逼地板更大 —— 相邻区间里仍有机器自变动）"
+                            : "（邻帧更大 —— 相邻区间内没有可观测的残余漂移）"));
+            sb.AppendLine($"  ⓘ 旧口径「整趟漂移」（ref₀ vs ref₄）= {Sci(driftWhole)}，"
+                        + $"是夹逼地板的 {(floorBracket > 0f ? driftWhole / floorBracket : float.NaN):F2} 倍"
+                        + " —— 这个倍数就是夹逼买到的东西；若它 ≈ 1，说明漂移不是线性的，"
+                        + "这次改动没解决问题。");
 
             sb.AppendLine("  逐档 |L_N − L_ref| / max(L_ref, 下限) 的分位数：");
             sb.AppendLine("  ┌ N   ┬ p50      ┬ p90      ┬ p99      ┬ max      ┬ p99(亮)  ┬ p99(边界)┬ p99(暗)  ┐");
@@ -727,7 +791,12 @@ namespace Vista.EditorTools
 
         // ==================================================================== 统计
 
-        static TierErr Measure(int slices, float[] refImg, float[] img,
+        /// <summary>
+        /// 一档的误差分位数。<paramref name="refMid"/> 是**夹逼中点**
+        /// （这一档两侧参考图的逐像素平均），不是某一张参考图 —— 分子分母都用它，
+        /// 两处若走歧，相对误差的分母会来自另一个时刻，那是个查不出来的偏置。
+        /// </summary>
+        static TierErr Measure(int slices, float[] refMid, float[] img,
                                bool[] admitted, float[] phi, float denom)
         {
             var all  = new List<float>();
@@ -738,7 +807,7 @@ namespace Vista.EditorTools
             for (int i = 0; i < admitted.Length; i++)
             {
                 if (!admitted[i]) continue;
-                float rel = Mathf.Abs(img[i] - refImg[i]) / Mathf.Max(refImg[i], denom);
+                float rel = Mathf.Abs(img[i] - refMid[i]) / Mathf.Max(refMid[i], denom);
                 all.Add(rel);
                 if (phi[i] <= 0.1f) lit.Add(rel);
                 else if (phi[i] >= 0.6f) dark.Add(rel);
@@ -765,6 +834,21 @@ namespace Vista.EditorTools
         /// </summary>
         static float Pctl(List<float> v, float q)
             => v.Count == 0 ? float.NaN : Percentile(v.ToArray(), q);
+
+        /// <summary>
+        /// 两张参考图的逐像素平均 —— 夹逼估计量里「这一档该和谁比」的那个谁。
+        ///
+        /// 取平均而不是取更近的那一张：若漂移在这一段里近似线性，
+        /// 中点恰好落在被测档的采集时刻上，一阶项对消；取单张只能消掉零阶。
+        /// 副作用是参考侧的随机噪声被平均掉 √2 —— 这个副作用也进了地板的口径，
+        /// 因为地板用的是**同一个** <c>Mid</c>（见 <see cref="Sweep"/> 的头注 ②）。
+        /// </summary>
+        static float[] Mid(float[] a, float[] b)
+        {
+            var m = new float[a.Length];
+            for (int i = 0; i < a.Length; i++) m[i] = 0.5f * (a[i] + b[i]);
+            return m;
+        }
 
         static float RelQuantile(float[] a, float[] b, bool[] admitted, float denom, float q)
         {
